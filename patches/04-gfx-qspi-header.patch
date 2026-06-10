@@ -1,0 +1,15 @@
+--- a/src/databus/Arduino_ESP32QSPI.h
++++ b/src/databus/Arduino_ESP32QSPI.h
+@@ -72,6 +72,12 @@
+   spi_transaction_ext_t _spi_tran_ext;
+   spi_transaction_t *_spi_tran;
+ 
++  // LOCAL PATCH (ESP32-S3-WatchFace): a SECOND transaction struct so writePixels()
++  // can pipeline — keep transaction A in flight (DMA) while filling buffer B for
++  // transaction B. Each queued transaction's struct must stay alive until its
++  // get_trans_result returns, so the two chunks-in-flight need their own structs.
++  spi_transaction_ext_t _spi_tran_ext2;
++
+   union
+   {
+     uint8_t *_buffer;

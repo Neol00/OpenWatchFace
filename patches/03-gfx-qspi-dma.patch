@@ -1,0 +1,143 @@
+--- a/src/databus/Arduino_ESP32QSPI.cpp
++++ b/src/databus/Arduino_ESP32QSPI.cpp
+@@ -81,7 +81,9 @@
+       .input_delay_ns = 0,
+       .spics_io_num = -1, // avoid use system CS control
+       .flags = SPI_DEVICE_HALFDUPLEX,
+-      .queue_size = 1,
++      // LOCAL PATCH (ESP32-S3-WatchFace): 1 -> 2 so writePixels() can keep one DMA
++      // transaction in flight while the CPU converts the next chunk (pipelined flush).
++      .queue_size = 2,
+       .pre_cb = nullptr,
+       .post_cb = nullptr};
+   esp_err_t ret = spi_bus_add_device(ESP32QSPI_SPI_HOST, &devcfg, &_handle);
+@@ -91,12 +93,17 @@
+     return false;
+   }
+ 
+-  if (!_is_shared_interface)
+-  {
+-    spi_device_acquire_bus(_handle, portMAX_DELAY);
+-  }
++  // LOCAL PATCH (ESP32-S3-WatchFace): do NOT permanently acquire the bus.
++  // spi_device_acquire_bus() forbids the queued/interrupt API (spi_device_queue_trans)
++  // for its whole duration — only polling transactions are allowed while the bus is
++  // held. Our pipelined writePixels() uses the queued API, so the permanent acquire
++  // would break it. The CO5300 is the ONLY device on SPI2_HOST (touch/RTC/IMU/PMU are
++  // all on I2C), so there's nothing to arbitrate against — the acquire was a no-cost
++  // optimization we can simply drop. Polling transactions still work fine without it.
++  // (The original: `if (!_is_shared_interface) spi_device_acquire_bus(_handle, portMAX_DELAY);`)
+ 
+   memset(&_spi_tran_ext, 0, sizeof(_spi_tran_ext));
++  memset(&_spi_tran_ext2, 0, sizeof(_spi_tran_ext2));
+   _spi_tran = (spi_transaction_t *)&_spi_tran_ext;
+ 
+   _buffer = (uint8_t *)heap_caps_aligned_alloc(16, ESP32QSPI_MAX_PIXELS_AT_ONCE * 2, MALLOC_CAP_DMA);
+@@ -319,50 +326,94 @@
+   CS_HIGH();
+ }
+ 
++// LOCAL PATCH (ESP32-S3-WatchFace): PIPELINED flush.
++// The original here was fully serial per chunk: convert RGB565->panel bytes into one
++// DMA buffer, then spi_device_polling_start/end (CPU spins until the transfer is done),
++// repeat. On this command-driven CO5300 the QSPI push is the bottleneck and that spin
++// was pure idle wait. Now we PING-PONG the two pre-allocated DMA buffers and use the
++// queued (interrupt) API: queue chunk N's transfer (returns immediately, DMA runs in
++// the background), convert chunk N+1 into the OTHER buffer while N transmits, then
++// reap N's result before reusing its buffer. So the per-chunk CPU conversion overlaps
++// the previous chunk's transmission instead of waiting for it. Single CS bracket and
++// the same per-chunk flags/cmd/addr as before, so the panel sees an identical write.
++// Each in-flight chunk needs its own transaction struct (_spi_tran_ext / _spi_tran_ext2)
++// and its own DMA buffer (_buffer32 / _2nd_buffer32) — both must stay alive until that
++// chunk's get_trans_result returns.
+ void Arduino_ESP32QSPI::writePixels(uint16_t *data, uint32_t len)
+ {
+-
+   CS_LOW();
++
++  spi_transaction_ext_t *trans[2] = {&_spi_tran_ext, &_spi_tran_ext2};
++  uint32_t *bufs[2] = {_buffer32, _2nd_buffer32};
++
++  uint8_t slot = 0;          // which buffer/struct to fill+queue this iteration
++  bool in_flight = false;    // is there a previously-queued transaction to reap?
++  bool first_send = true;
+   uint32_t l, l2;
+   uint16_t p1, p2;
+-  bool first_send = true;
++
+   while (len)
+   {
+     l = (len > ESP32QSPI_MAX_PIXELS_AT_ONCE) ? ESP32QSPI_MAX_PIXELS_AT_ONCE : len;
+ 
++    spi_transaction_ext_t *t = trans[slot];
++    uint32_t *buf = bufs[slot];
++
+     if (first_send)
+     {
+-      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO;
+-      _spi_tran_ext.base.cmd = 0x32;
+-      _spi_tran_ext.base.addr = 0x003C00;
++      t->base.flags = SPI_TRANS_MODE_QIO;
++      t->base.cmd = 0x32;
++      t->base.addr = 0x003C00;
+       first_send = false;
+     }
+     else
+     {
+-      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+-                                 SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
++      t->base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
++                      SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+     }
++
++    // Convert this chunk into the slot's DMA buffer (CPU work; overlaps the OTHER
++    // slot's in-flight DMA transfer queued on the previous iteration).
+     l2 = l >> 1;
+     for (uint32_t i = 0; i < l2; ++i)
+     {
+       p1 = *data++;
+       p2 = *data++;
+-      MSB_32_16_16_SET(_buffer32[i], p1, p2);
++      MSB_32_16_16_SET(buf[i], p1, p2);
+     }
+     if (l & 1)
+     {
+       p1 = *data++;
+-      MSB_16_SET(_buffer16[l - 1], p1);
++      MSB_16_SET(((uint16_t *)buf)[l - 1], p1);
+     }
+ 
+-    _spi_tran_ext.base.tx_buffer = _buffer32;
+-    _spi_tran_ext.base.length = l << 4;
++    t->base.tx_buffer = buf;
++    t->base.length = l << 4;
+ 
+-    POLL_START();
+-    POLL_END();
++    // Hand this chunk to the DMA engine; returns immediately (does NOT wait).
++    spi_device_queue_trans(_handle, (spi_transaction_t *)t, portMAX_DELAY);
++
++    // Now reap the PREVIOUS chunk (queued last iteration), if any. By the time we
++    // get here its transfer has been running while we did the conversion above, so
++    // this wait is short-to-zero — that overlap is the whole win.
++    if (in_flight)
++    {
++      spi_transaction_t *done;
++      spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++    }
++    in_flight = true;
++    slot ^= 1;                 // ping-pong to the other buffer/struct
+ 
+     len -= l;
+   }
++
++  // Drain the last queued transaction before dropping CS.
++  if (in_flight)
++  {
++    spi_transaction_t *done;
++    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++  }
++
+   CS_HIGH();
+ }
+ 

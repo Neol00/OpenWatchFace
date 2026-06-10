@@ -1,0 +1,19 @@
+--- a/src/BLEDevice.cpp
++++ b/src/BLEDevice.cpp
+@@ -1125,6 +1125,16 @@
+ #endif
+ 
+ #if defined(CONFIG_NIMBLE_ENABLED)
++  // LOCAL PATCH (ESP32-S3-WatchFace): unregister the custom GAP event listener before
++  // tearing down the host. Stock deinit() leaves m_listener linked in NimBLE's static
++  // listener list; the next init()+setCustomGapHandler() re-registers the SAME static
++  // node, corrupting the list -> panic on the first GAP event after a BLE off->on
++  // cycle. Unregistering here (idempotent; harmless if it was never registered) makes
++  // the listener list clean for the next bring-up.
++  if (m_customGapHandler != nullptr) {
++    ble_gap_event_listener_unregister(&m_listener);
++    m_customGapHandler = nullptr;
++  }
+   nimble_port_stop();
+   nimble_port_deinit();
+ #endif

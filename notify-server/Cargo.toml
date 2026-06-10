@@ -1,0 +1,19 @@
+[package]
+name = "notify-server"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny notification queue for the ESP32-S3 watch. Phone POSTs, watch GETs (drains)."
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Smaller release binary (handy for small SBC / ARM64 targets).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
