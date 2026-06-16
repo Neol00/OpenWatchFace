@@ -47,7 +47,7 @@ media — all in a single Arduino translation unit on top of LVGL.
   - [1. Install the Arduino IDE](#1-install-the-arduino-ide)
   - [2. Place the bundled libraries](#2-place-the-bundled-libraries)
   - [3. Install the ESP32 core (Espressif Systems)](#3-install-the-esp32-core-espressif-systems)
-  - [4. Unzip the esp32-s3-libs.zip and install it](#4-unzip-the-esp32-s3-libszip-and-install-it)
+  - [4. Install esp32s3-libs](#4-install-esp32s3-libs)
   - [5. Apply the library patches](#5-apply-the-library-patches)
   - [6. Select your board (board.h + partition file)](#6-select-your-board-boardh--partition-file)
   - [7. Board settings & compile](#7-board-settings--compile)
@@ -94,7 +94,6 @@ Launch it once so it creates your sketchbook folder (the place your libraries li
 
 ### 2. Place the bundled libraries
 
-Unzip `libraries.zip` into a temporary location.
 Place the **contents** of `libraries/` folder into your Arduino
 **`libraries/`** folder, so the library folders and `lv_conf.h` land directly inside it.
 
@@ -150,9 +149,8 @@ This is also the step that puts the ESP32 core (with its `BLE` library) on disk 
 
 You'll point the patch step at that folder next.
 
-### 4. Unzip the esp32-s3-libs.zip and install it
+### 4. Install esp32s3-libs
 
-Unzip `esp32-s3-libs.zip` to a temporary location. 
 Delete the old directory
 
 **Windows**
@@ -165,7 +163,7 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\es
 rm -rf ~/.arduino15/packages/esp32/tools/esp32s3-libs
 ```
 
-place the unzipped `esp32-s3-libs` folder inside:
+place the `esp32s3-libs` directory inside:
  
 **Windows**
 ```powershell
