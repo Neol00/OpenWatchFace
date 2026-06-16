@@ -108,7 +108,7 @@ inside it — LVGL requires that):
 ├── Arduino_DriveBus/
 ├── SensorLib/
 ├── XPowersLib/
-└── Mylibrary/                    ← board pin map (pin_config.h)
+└── esp_lcd_touch_axs5106l
 ```
 
 **Windows** (PowerShell — adjust the source path to where you cloned this repo):
@@ -294,9 +294,9 @@ Then **Verify** (compile) and **Upload**.
   and an Android phone pushes time over BLE on every Gadgetbridge connect).
 - **Upload trouble?** Hold **BOOT**, tap **RST**, release **BOOT** → download mode, then
   upload again.
-- **microSD recommended:** format a card FAT32 and insert it for notification history,
-  WiFi credentials, and battery-health logging (the watch falls back to on-flash storage
-  without one — see [Storage](#storage-sd-card-vs-flash)).
+- **microSD recommended:** format a card FAT32 (Does not work if done in Windows) and insert it
+  for notification history, WiFi credentials, and battery-health logging (the watch falls back
+  to on-flash storage without one — see [Storage](#storage-sd-card-vs-flash)).
 
 ---
 
