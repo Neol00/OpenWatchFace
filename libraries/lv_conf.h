@@ -40,7 +40,18 @@
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
  */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM   /* PSRAM allocator in lv_psram_alloc.cpp — frees the 64 KB SRAM pool, lets caches grow into PSRAM */
+/* LOCAL PATCH (ESP32-S3-WatchFace): allocator is per-board. A board WITH PSRAM
+ * (S3-2.06) routes all LVGL allocations to PSRAM via the CUSTOM backend in
+ * lv_psram_alloc.cpp (frees the 64 KB SRAM pool, lets caches grow). A board with
+ * NO PSRAM (C6-1.47) MUST use the BUILTIN SRAM pool — the CUSTOM allocator there
+ * calls heap_caps_malloc(MALLOC_CAP_SPIRAM), which returns NULL with no PSRAM and
+ * crashes lv_init() (store fault at 0xc in lv_flex_init). board.h is included
+ * above (for LV_USE_OS), so BOARD_HAS_PSRAM is available here. */
+#if BOARD_HAS_PSRAM
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
+#else
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_BUILTIN
+#endif
 
 /** Possible values
  * - LV_STDLIB_BUILTIN:     LVGL's built in implementation
@@ -68,8 +79,16 @@
 #define LV_STDARG_INCLUDE       <stdarg.h>
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
-    /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-    #define LV_MEM_SIZE (64 * 1024U)          /**< [bytes] */
+    /** Size of memory available for `lv_malloc()` in bytes (>= 2kB).
+     * LOCAL PATCH (ESP32-S3-WatchFace): this branch is only taken on a board with
+     * NO PSRAM (the C6-1.47 — the S3 uses the CUSTOM/PSRAM allocator and never
+     * touches this pool). 64 KB was too small there: the watch face + the menu
+     * pager + a heavy app screen (e.g. Power, with charts + toggle rows) all share
+     * this one pool, and building an app screen on top would exhaust it ->
+     * lv_malloc returns NULL mid-build -> load fault in lv_obj_class_create_obj
+     * (the intermittent "crashes entering an app"). The C6 has 512 KB SRAM (~134 KB
+     * free at boot), so 96 KB is safe and gives ample headroom for screen churn. */
+    #define LV_MEM_SIZE (96 * 1024U)          /**< [bytes] */
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0
@@ -109,7 +128,18 @@
  * - LV_OS_MQX
  * - LV_OS_SDL2
  * - LV_OS_CUSTOM */
-#define LV_USE_OS   LV_OS_FREERTOS   /* enable threads so SW render can use both cores (was LV_OS_NONE) */
+/* LOCAL PATCH (ESP32-S3-WatchFace): OS layer is per-board. On a DUAL-CORE board
+ * (S3-2.06) enable FreeRTOS threads so the SW renderer can use both cores (the
+ * band-split fork). On a SINGLE-CORE board (C6-1.47) that's pointless and the
+ * LVGL FreeRTOS port pulls in FreeRTOS's "atomic.h" which isn't on that core's
+ * include path -> use LV_OS_NONE there. board.h resolves to the sketch folder
+ * (always on the Arduino include path). */
+#include "board.h"
+#if BOARD_DUAL_CORE
+#define LV_USE_OS   LV_OS_FREERTOS
+#else
+#define LV_USE_OS   LV_OS_NONE
+#endif
 
 #if LV_USE_OS == LV_OS_CUSTOM
     #define LV_OS_CUSTOM_INCLUDE <stdint.h>
@@ -145,7 +175,16 @@
  * and can't be drawn in chunks. */
 
 /** The target buffer size for simple layer chunks. */
+/* LOCAL PATCH (ESP32-S3-WatchFace): board-gated. A "simple layer" is allocated on
+ * demand the first time a widget with style_opa<255 or a non-normal blend mode
+ * renders. The full 256 KB target would instantly OOM a no-PSRAM board (C6, 512 KB
+ * SRAM). LVGL renders simple layers in CHUNKS, so a smaller target just means more
+ * passes, not a visual difference. PSRAM board (S3) keeps the big buffer. */
+#if BOARD_HAS_PSRAM
 #define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (256 * 1024)    /**< [bytes]*/
+#else
+#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (8 * 1024)      /**< [bytes] no-PSRAM: chunked */
+#endif
 
 /* Limit the max allocated memory for simple and transformed layers.
  * It should be at least `LV_DRAW_LAYER_SIMPLE_BUF_SIZE` sized but if transformed layers are also used
@@ -455,7 +494,16 @@
  *  If size is not set to 0, the decoder will fail to decode when the cache is full.
  *  If size is 0, the cache function is not enabled and the decoded memory will be
  *  released immediately after use. */
+/* LOCAL PATCH (ESP32-S3-WatchFace): board-gated. This is a GROWTH CEILING for the
+ * image-decoder cache, not a static allocation — but on a no-PSRAM board (C6) it is
+ * a landmine: the moment any app decodes an image the cache can grow toward 500 KB
+ * and OOM the 512 KB SRAM. Set to 0 there so decoded images are released
+ * immediately after use (no caching) instead of accumulating. PSRAM board keeps it. */
+#if BOARD_HAS_PSRAM
 #define LV_CACHE_DEF_SIZE       512000
+#else
+#define LV_CACHE_DEF_SIZE       0
+#endif
 
 /** Default number of image header cache entries. The cache is used to store the headers of images
  *  The main logic is like `LV_CACHE_DEF_SIZE` but for image headers. */

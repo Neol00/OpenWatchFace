@@ -15,7 +15,15 @@
 #include "lv_os_private.h"
 #if LV_USE_OS == LV_OS_FREERTOS
 
+/* LOCAL PATCH (ESP32-S3-WatchFace): ESP-IDF's FreeRTOS ships atomic.h under the
+ * freertos/ include prefix, not as a bare "atomic.h" on the include path, so the
+ * upstream `#include "atomic.h"` fails to resolve. Use the freertos/ path which is
+ * on the default include path for every chip (S3/C6/...). */
+#if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_ESP32)
+#include "freertos/atomic.h"
+#else
 #include "atomic.h"
+#endif
 
 #include "../tick/lv_tick.h"
 #include "../misc/lv_log.h"

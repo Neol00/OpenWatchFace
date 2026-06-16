@@ -1,17 +1,24 @@
-# ESP32-S3-WatchFace — a small "watch OS"
+# OpenWatchFace — a small "watch OS"
 
-A from-scratch smartwatch firmware for the **Waveshare ESP32-S3-Touch-AMOLED-2.06**.
-It is a real little OS in miniature: a watch face, an app launcher, a notification
-pipeline that pulls from an HTTPS server **and** from your phone over BLE (iOS via
-ANCS, Android via the Gadgetbridge app), deep-sleep power management with a timed
+A from-scratch smartwatch firmware for Waveshare ESP32 touch-display boards. It is a
+real little OS in miniature: a watch face, an app launcher, a notification pipeline
+that pulls from an HTTPS server **and** from your phone over BLE (iOS via ANCS,
+Android via the Gadgetbridge app), deep-sleep power management with a timed
 background-fetch wake, and a Player that mirrors and controls iPhone or Android
 media — all in a single Arduino translation unit on top of LVGL.
 
-> **Supported hardware:** the Waveshare **ESP32-S3-Touch-AMOLED-2.06** only, for now.
-> Every pin map, the CO5300 panel driver, the FT3168 touch controller, the PCF85063
-> RTC and the AXP2101 PMU are specific to this board. Porting to another board means
-> reworking `pin_config`, the display init and the rail/PMU code. There is no board
-> abstraction layer yet.
+> **Supported hardware:** two boards, selected at compile time via a small board
+> abstraction layer (`board.h` + `board_*.h`):
+> - **Waveshare ESP32-S3-Touch-AMOLED-2.06** — 410×502 CO5300 AMOLED, FT3168 touch,
+>   PCF85063 RTC, **AXP2101 PMU**, 8 MB PSRAM. The original/primary target.
+> - **Waveshare ESP32-C6-Touch-LCD-1.47** — 172×320 JD9853 LCD, AXS5106L touch,
+>   **no PMU** (battery sensed over an ADC divider), **no PSRAM**, 512 KB SRAM.
+>
+> The board layer abstracts the pin map, panel/touch drivers, clock/RTC, power
+> (PMU vs ADC) and screen geometry, so the same UI builds for both. UI layout that
+> diverges is gated on **screen geometry** (portrait/narrow), not on the chip. PSRAM-
+> only paths (the screen cache, big LVGL caches) compile out on the C6. Porting to a
+> further board means adding a `board_*.h` and its drivers.
 
 ---
 
@@ -40,9 +47,10 @@ media — all in a single Arduino translation unit on top of LVGL.
   - [1. Install the Arduino IDE](#1-install-the-arduino-ide)
   - [2. Place the bundled libraries](#2-place-the-bundled-libraries)
   - [3. Install the ESP32 core (Espressif Systems)](#3-install-the-esp32-core-espressif-systems)
-  - [4. Install esp32-s3-lib](#4-install-esp32-s3-lib)
+  - [4. Unzip the esp32-s3-libs.zip and install it](#4-unzip-the-esp32-s3-libszip-and-install-it)
   - [5. Apply the library patches](#5-apply-the-library-patches)
-  - [6. Board settings & compile](#6-board-settings--compile)
+  - [6. Select your board (board.h + partition file)](#6-select-your-board-boardh--partition-file)
+  - [7. Board settings & compile](#7-board-settings--compile)
 - [Hardware](#hardware)
 - [Architecture overview](#architecture-overview)
 - [Deep sleep & the timed wake](#deep-sleep--the-timed-wake)
@@ -63,8 +71,10 @@ media — all in a single Arduino translation unit on top of LVGL.
 
 ## Installation
 
-Full build guide, start to finish. The hardware is the Waveshare
-**ESP32-S3-Touch-AMOLED-2.06** and nothing else (see the supported-hardware note above).
+Full build guide, start to finish. It targets the Waveshare
+**ESP32-S3-Touch-AMOLED-2.06** (the primary board); the **ESP32-C6-Touch-LCD-1.47** is
+also supported — pick its board entry and matching settings instead (see the
+supported-hardware note above). The steps below show the S3.
 
 This repo ships the **exact library versions** the firmware was built against, in
 `libraries/`, so you don't hunt for versions — you copy them into place and
@@ -84,6 +94,7 @@ Launch it once so it creates your sketchbook folder (the place your libraries li
 
 ### 2. Place the bundled libraries
 
+Unzip `libraries.zip` into a temporary location.
 Place the **contents** of `libraries/` folder into your Arduino
 **`libraries/`** folder, so the library folders and `lv_conf.h` land directly inside it.
 
@@ -139,8 +150,9 @@ This is also the step that puts the ESP32 core (with its `BLE` library) on disk 
 
 You'll point the patch step at that folder next.
 
-### 4. Install esp32-s3-lib
- 
+### 4. Unzip the esp32-s3-libs.zip and install it
+
+Unzip `esp32-s3-libs.zip` to a temporary location. 
 Delete the old directory
 
 **Windows**
@@ -153,7 +165,7 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\es
 rm -rf ~/.arduino15/packages/esp32/tools/esp32s3-libs
 ```
 
-place the directory included in this repo `esp32-s3-libs` inside:
+place the unzipped `esp32-s3-libs` folder inside:
  
 **Windows**
 ```powershell
@@ -198,11 +210,53 @@ After patching, **clear the Arduino build cache** so the patched libraries recom
 - **Windows:** delete `%LOCALAPPDATA%\arduino\sketches\*`
 - **Linux:** delete `~/.cache/arduino/sketches/*`
 
-### 6. Board settings & compile
+### 6. Select your board (board.h + partition file)
 
-Open **`ESP32-S3-WatchFace/ESP32-S3-WatchFace.ino`** in the Arduino IDE. The **exact
+Two things in the sketch folder must match the board you're flashing:
+
+**a) Pick the board in `board.h`.** Open `OpenWatchFace/board.h` and set the
+`BOARD_SELECT` line to your board:
+
+```c
+#define BOARD_SELECT  BOARD_ID_S3_206   // <-- change to your board
+//   BOARD_ID_S3_206  — Waveshare ESP32-S3-Touch-AMOLED-2.06
+//   BOARD_ID_C6_147  — Waveshare ESP32-C6-Touch-LCD-1.47
+```
+
+Everything else (pin map, drivers, PSRAM/PMU feature flags, screen geometry) follows
+from that one line.
+
+**b) Put the right partition table in place.** The sketch builds against
+`partitions.csv`, but the per-board table ships under a board-specific name. **Copy the
+one for your board and rename the copy to `partitions.csv`** (overwrite the existing
+one), in the `OpenWatchFace/` folder:
+
+| Board | Copy this file | → rename to |
+|---|---|---|
+| S3-2.06 | `partitions_s3_32mb.csv` | `partitions.csv` |
+| C6-1.47 | `partitions_c6_8mb.csv`  | `partitions.csv` |
+
+**Windows** (PowerShell — S3 shown; use the C6 source for the C6):
+```powershell
+Copy-Item -Force ".\OpenWatchFace\partitions_s3_32mb.csv" ".\OpenWatchFace\partitions.csv"
+```
+
+**Linux** (bash):
+```bash
+cp -f ./OpenWatchFace/partitions_s3_32mb.csv ./OpenWatchFace/partitions.csv
+```
+
+> Both `board.h` **and** the partition file must match the same board — a mismatch
+> (e.g. the S3's 32 MB table on the C6's 8 MB flash) fails to flash or boots to a
+> black screen.
+
+### 7. Board settings & compile
+
+Open **`OpenWatchFace/OpenWatchFace.ino`** in the Arduino IDE. The **exact
 board settings are documented in a comment block at the very top of that file** — set
-**Tools →** to match it. As of this writing that is:
+**Tools →** to match it. For the **S3** that is:
+
+**S3 — ESP32-S3-Touch-AMOLED-2.06:**
 
 | Setting | Value |
 |---|---|
@@ -215,6 +269,20 @@ board settings are documented in a comment block at the very top of that file** 
 | Partition | **Custom** (uses `partitions.csv` in the sketch folder) |
 | PSRAM | **Enabled** |
 | Upload Mode | **UART0 / Hardware CDC** |
+
+**C6 — ESP32-C6-Touch-LCD-1.47:**
+
+There's no dedicated board entry for this one, so use the generic **ESP32C6 Dev Module**:
+
+| Setting | Value |
+|---|---|
+| Board | **ESP32C6 Dev Module** |
+| Erase All Flash Before Sketch Upload | **Enabled** (first flash only) |
+| Flash Size | **8MB** |
+| Partition Scheme | **Custom** (uses `partitions.csv` in the sketch folder) |
+
+> Leave the other ESP32C6 Dev Module options at their defaults. The C6 is single-core
+> with no PSRAM, so there are no Core / PSRAM settings to set.
 
 > The **top-of-file comment in the .ino is the source of truth** — if it ever differs
 > from this table, follow the file. The custom partition is required: `app0` must stay
@@ -236,6 +304,8 @@ Then **Verify** (compile) and **Upload**.
 
 ## Hardware
 
+### S3 — ESP32-S3-Touch-AMOLED-2.06 (primary)
+
 | Part | Chip | Bus | Notes |
 |------|------|-----|-------|
 | MCU | ESP32-S3R8 | — | dual-core LX7, 8 MB OPI PSRAM, 512 KB internal SRAM, 32 MB flash |
@@ -244,6 +314,21 @@ Then **Verify** (compile) and **Upload**.
 | RTC | PCF85063 | I²C | battery-backed; keeps time across power loss |
 | IMU | QMI8658 | I²C | shared bus |
 | PMU / charger | AXP2101 | I²C | per-rail LDO control; drives deep-sleep power gating |
+
+### C6 — ESP32-C6-Touch-LCD-1.47
+
+| Part | Chip | Bus | Notes |
+|------|------|-----|-------|
+| MCU | ESP32-C6 | — | single-core RISC-V, **no PSRAM**, 512 KB SRAM |
+| Display | JD9853 LCD 172×320 | SPI | narrow-screen UI layout |
+| Touch | AXS5106L capacitive | I²C | shared bus (release-debounced — see note) |
+| RTC | PCF85063 | I²C | battery-backed |
+| Battery | — | ADC | **no PMU**: charge state/voltage sensed on an ADC divider |
+
+> On the C6 the AXS5106L can briefly report finger-up mid-touch; touch input is
+> release-debounced in the read callback so it doesn't fire spurious double-taps.
+> With no PSRAM, the line framebuffer is sized for internal SRAM and the PSRAM-only
+> render paths are compiled out.
 
 ---
 
@@ -342,28 +427,33 @@ The awake/asleep durations from these checks feed a duty-cycle learner
 (`calib_note_awake_ms` / `calib_note_sleep_s`) used to estimate the sleep-floor
 current shown in the Power app.
 
-### Peripheral-rail gating (the AXP2101 dance)
-Deep sleep alone still leaves peripheral rails powered. To squeeze further, the watch
-can cut individual AXP2101 LDOs before sleeping — but cutting the *wrong* one is
-dangerous: the rail feeding the shared I²C pull-ups or the RTC must never be cut, or
-the watch can't talk to the PMU to bring it back (a bus deadlock on wake).
+### Peripheral-rail gating (the AXP2101 dance — S3 only)
+This applies to the **S3** (the C6 has no PMU; it instead latches the backlight/reset
+GPIOs low under a GPIO hold before sleeping, since a C6 wake is a full RST reboot).
 
-So rails are classified at **runtime** by a crash-safe probe (`rails_probe()`):
-- Each candidate LDO is journaled to NVS, disabled, and the bus is checked
-  (PMU **and** RTC must still ACK). Pass → `SAFE`; fail or a frozen bus → `UNSAFE`.
-- The journal means a probe that *freezes* the bus is detected on the next cold
-  power-cycle and that rail is permanently marked `UNSAFE`.
-- Cutting a SAFE rail is still **opt-in per rail** (Appmenu → Power), because a rail
-  can pass the bus test yet still power the *display* — cutting it would blank the
-  screen on wake. The validated default cut set for this board is the instant-wake
-  sensor/codec rails (`ALDO3`, `BLDO1`, `BLDO2`); the display rails are left on.
-- On boot, `rails_restore()` unconditionally brings **every** rail back up (one at a
-  time, to avoid an inrush brownout) before the RTC read and display init, so the
-  watch always recovers to full power no matter what a previous sleep left latched.
+Deep sleep alone still leaves the S3's peripheral rails powered. To squeeze further,
+the watch cuts AXP2101 LDOs before sleeping — but cutting the *wrong* one is dangerous:
+**ALDO1 supplies the PCF85063 RTC and the shared I²C bus.** Cut it and, on wake, the
+PMU's own I²C dies and the RTC stops answering — the watch can't bring itself back.
 
-> **Recovery if you opt into a bad rail (blank on wake):** cold power-cycle (PWR off,
-> then on) → screen returns → enable Caffeine so it won't sleep → Settings → Power →
-> toggle that rail back off.
+So **ALDO1 is hard-protected and never cut** (`RAIL_NEVER_CUT_MASK`); it isn't even
+listed in the Power app's rail toggles. **Every other rail is enabled (cut) by
+default** — the validated win is cutting the sensor/codec/display rails together and
+restoring them carefully on wake:
+- On wake, `rails_restore()` brings each cut rail back up **one at a time** (off→on with
+  per-rail settle), never all at once: re-enabling the slower rails (ALDO2/ALDO4)
+  simultaneously draws enough inrush to sag VSYS and brown out the PMU's own I²C. The
+  AXP2101's enable-bit readback can also *lie* right after a deep-sleep cut (reads "on"
+  while the LDO output has collapsed), so the restore force-cycles each rail rather than
+  trusting the bit.
+- Boot bring-up is resilient: `board_power_begin()` and the RTC probe retry (re-running
+  `rails_restore()` between tries), and a missing RTC is non-fatal — the watch continues
+  rather than hanging.
+- The Power app shows how many rails are being cut ("Cutting X of 5" — five, because
+  the protected ALDO1 is excluded from the count).
+
+> **Recovery (blank/odd on wake):** cold power-cycle (PWR off, then on) → the watch
+> always boots stock with every rail restored.
 
 ---
 
@@ -466,7 +556,8 @@ What works with an Android phone today:
 
 **Setup:** install Gadgetbridge on the phone you have to use F-droid, the app does not
 exist on the play store. scan for the watch in discovery from inside the Gadgetbridge app
-list, and pick **"Bangle.js"** as the device type (long-press the ESP32-S3-WatchFace then click
+list, and pick **"Bangle.js"** as the device type (long-press the watch entry — it
+advertises under its board name, e.g. "Waveshare ESP32-S3-Touch-AMOLED-2.06" — then click
 on "Add test device" then "Select device" and select "Bangle.js" in the list, then press ok).
 
 ---
@@ -501,6 +592,10 @@ truth the Notifications app and bell read.
 Two **opt-in, compile-time** tuning knobs sit behind self-test "canaries" that
 auto-revert before instability can corrupt anything. **Both default OFF**, so the
 stock build is byte-for-byte the known-good baseline.
+
+> **Scope:** overclocking is **S3-only**. Undervolting exists on both boards but uses
+> a different mechanism per chip (S3 trims the on-die LDO `dig_dbias`; the C6, which has
+> no AXP2101, trims the PMU's `hp_dbias` instead). The descriptions below are the S3.
 
 ### Overclocking (`overclock.h`)
 
@@ -582,7 +677,7 @@ back/menu key (clock → menu → app → back out). Current apps:
 | **WiFi & BLE** | 📶 | Toggle radios, saved WiFi networks, BLE pairing (shows the pair code), bonded phones |
 | **Player** | 🎵 | Now-playing (iPhone via AMS, Android via Gadgetbridge): track/artist + transport controls |
 | **Find Phone** | 📞 | Ring the phone (Gadgetbridge on Android, or a companion app) |
-| **Files** | 💾 | Browse the SD card / flash FAT storage |
+| **Files** | 💾 | Browse the SD card / flash FAT storage; view, move and delete files |
 | **About** | 📋 | Live spec sheet: chip/flash/PSRAM, per-pool SRAM & PSRAM free, SD usage, battery health, and auto-reported library versions |
 
 A pull-down **quick shade** (`quick_shade.h`) over the watch face gives one-drag access

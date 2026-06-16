@@ -1,0 +1,24 @@
+# partitions_c6_8mb.csv — custom 8 MB layout for the ESP32-C6-Touch-LCD-1.47.
+#
+# Total flash on the C6-1.47 = 8 MB (0x800000). The S3-2.06 uses the 32 MB
+# partitions.csv in this folder; this is the C6 equivalent. SELECT IT in the IDE:
+# Tools > Partition Scheme can't point at an arbitrary file, so either
+#   (a) set the board's "Partition Scheme" to "Custom" and ensure the IDE picks
+#       up this file (rename to partitions.csv per build), OR
+#   (b) add a build.partitions entry — see board_ws_c6_touch_lcd_147.h notes.
+#
+# CRITICAL — the same fixed-offset rules as the 32 MB table apply (or BLACK
+# SCREEN): partition table at 0x8000, boot_app0 at 0xe000 (so otadata at 0xe000),
+# the app .bin at 0x10000 (so app0 starts at exactly 0x10000). NVS stays 20 KB.
+#
+# Sizing: the compiled app is ~2.15 MB, so 2 MB slots are TOO SMALL. Dual 3 MB
+# OTA slots give ~40% headroom and keep OTA possible; the rest is on-flash FAT.
+# app partitions start on a 64 KB (0x10000) boundary; nothing exceeds 0x800000.
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x300000,
+app1,       app,  ota_1,    0x310000,  0x300000,
+ffat,       data, fat,      0x610000,  0x1E0000,
+coredump,   data, coredump, 0x7F0000,  0x10000,

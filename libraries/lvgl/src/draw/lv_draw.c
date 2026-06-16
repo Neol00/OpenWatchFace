@@ -39,8 +39,12 @@
 static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id);
 static void cleanup_task(lv_draw_task_t * t, lv_display_t * disp);
 /* ESP32-S3-WatchFace LOCAL PATCH: band-split parallel rendering — see the
- * implementation above is_independent() for the full story. */
+ * implementation above is_independent() for the full story. Only built when the
+ * OS layer is on (dual-core S3-2.06); a single-core no-OS board (C6-1.47) never
+ * calls it, so guarding the definition avoids an unused-function warning. */
+#if LV_USE_OS
 static lv_draw_task_t * band_split_task(lv_draw_task_t * t);
+#endif
 static inline size_t get_draw_dsc_size(lv_draw_task_type_t type);
 static lv_draw_task_t * get_first_available_task(lv_layer_t * layer);
 
@@ -161,8 +165,18 @@ void lv_draw_finalize_task_creation(lv_layer_t * layer, lv_draw_task_t * t)
     /* ESP32-S3-WatchFace LOCAL PATCH: split big fill/border/arc/label tasks into
      * two independent clip halves BEFORE evaluation/dispatch, so both SW render
      * workers can paint one task in parallel. Must happen before any dispatch:
-     * once a worker may hold the task its clip can no longer be shrunk safely. */
+     * once a worker may hold the task its clip can no longer be shrunk safely.
+     * GATED ON LV_USE_OS: the split exists only to feed a SECOND render worker,
+     * which requires the OS/thread layer. On a single-core, no-OS board (C6-1.47,
+     * LV_USE_OS == LV_OS_NONE) there is no second worker, and running the split
+     * without the worker-dispatch machinery (also LV_USE_OS-gated below) corrupts
+     * the cloned draw task -> store-fault in lv_draw_label's memcpy. So with no OS
+     * we skip the split entirely and use stock LVGL draw. */
+#if LV_USE_OS
     lv_draw_task_t * t_split = band_split_task(t);
+#else
+    lv_draw_task_t * t_split = NULL;
+#endif
 
     lv_draw_global_info_t * info = &_draw_info;
 
@@ -680,6 +694,7 @@ void lv_draw_layer_finish_drop_shadow(lv_layer_t * drop_shadow_layer, const lv_d
  *  - NOT split: IMAGE (raw blits are bandwidth-bound like fills = no gain, and
  *    decoded sources would decode twice), BOX_SHADOW (each half would redo the
  *    full blur), LINE (dsc heap ownership), LAYER (blend ordering). */
+#if LV_USE_OS
 static lv_draw_task_t * band_split_task(lv_draw_task_t * t)
 {
     /* NOTE: _draw_info.unit_cnt counts registered draw UNITS and the sw renderer
@@ -765,6 +780,7 @@ static lv_draw_task_t * band_split_task(lv_draw_task_t * t)
     t->next = c;
     return c;
 }
+#endif  /* LV_USE_OS — band_split_task */
 
 static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id)
 {
