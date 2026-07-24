@@ -62,7 +62,7 @@
 #define BOARD_BATT_CAL_NUM  4760
 #define BOARD_BATT_CAL_DEN  1000
 #define BOARD_HAS_RTC_PCF85063    1   /* PCF85063A @0x51 on the shared I2C bus (Wire/tkl_i2c) */
-#define BOARD_HAS_AUDIO_ES8311    0   /* not this board (that's the S3 watch's external ES8311) */
+#define BOARD_HAS_AUDIO_ES8311    0
 #define BOARD_HAS_AUDIO_PWM       0
 /* T5 internal codec (analog AUDLP/AUDLN) -> NS4150B Class-D amp -> speaker (H2).
  * Output via the TuyaOpen low-level tkl_ao API; amp enable (NS4150B CTRL) on IO28,
@@ -74,10 +74,7 @@
  * so a motor is added via a low-side NPN switch (or a ready-made coin-motor driver module)
  * on IO14. IO14 is electrically free and the pad physically closest to a GND pad, so a 2-pin
  * header (IO14 + GND) lets the vibrator plug in/out. Active HIGH: GPIO HIGH -> transistor on
- * -> motor runs. A base->GND pull-down (10K, on the driver) holds it OFF while IO14 floats at
- * boot/reset/deep sleep — which matters because the Tuya build's gpio_hold_* are no-ops (the
- * platform retains pads / cold-boots), so the OFF state is enforced in HARDWARE, not by a hold.
- * Driver is board-neutral over pinMode/digitalWrite (TuyaOpen Arduino core) — see haptics.h. */
+ * -> motor runs. */
 #define BOARD_HAS_HAPTICS         1
 #define HAPTICS_MOTOR_GPIO        14  /* NPN base via 1K (or driver-module signal in); active HIGH */
 #define HAPTICS_ACTIVE_HIGH       1

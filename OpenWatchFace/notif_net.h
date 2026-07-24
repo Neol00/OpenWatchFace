@@ -30,6 +30,42 @@
 #include <HTTPClient.h>
 #endif
 #include "notify_ca.h"          // pinned Let's Encrypt root (validates the server cert)
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
+#include "esp_heap_caps.h"      // heap_caps_get_free_size — WiFi-vs-BLE coexistence guard below
+#endif
+
+/* WiFi+BLE coexistence SRAM floor. Bringing the WiFi driver up (WiFi.mode(WIFI_STA)
+ * + WiFi.begin) needs some INTERNAL SRAM the BT controller can't share. When BLE is
+ * already up and internal SRAM is too tight, the WiFi init fails AND the ESP-IDF
+ * WiFi/NVS teardown then leaks a little internal RAM per attempt (the "Failed to
+ * deinit Wi-Fi 0x3001" / "init nvs failed ret=101" in the logs — an upstream IDF
+ * bug, not ours). The killer is that wifi_connect() runs on a SCHEDULE, so a single
+ * user "enable WiFi" turns into an unbounded retry storm that bleeds the leak until
+ * an ISR alloc asserts and the watch crashes.
+ *
+ * So we REFUSE to bring WiFi up when free internal SRAM is below this floor AND BLE
+ * is holding memory — the mirror of ble_begin()'s BLE_MIN_FREE_INTERNAL guard. The
+ * scheduled retries then become cheap no-ops instead of a crash spiral.
+ *
+ * HOW MUCH WiFi ACTUALLY NEEDS IS PER-BOARD, so this is a board-overridable default
+ * keyed on PSRAM, NOT one constant:
+ *   - PSRAM boards (S3-2.06/1.8/1.47): the custom libs route WiFi + BLE buffers
+ *     mostly to PSRAM, so WiFi's INTERNAL-SRAM need is small (~10 KB measured on the
+ *     S3). A big floor here would wrongly block a coexistence that fits fine, so the
+ *     floor is low — just a guard against a genuinely starved heap.
+ *   - No-PSRAM boards (C6): WiFi AND BLE buffers both come from internal SRAM, so the
+ *     two together are genuinely tight and the floor must be higher.
+ * A board header can #define WIFI_MIN_FREE_INTERNAL before this to pin an exact value
+ * (measure with the [ble]/[wifi] free-SRAM breadcrumbs if you tune it). */
+#ifndef WIFI_MIN_FREE_INTERNAL
+#if BOARD_HAS_PSRAM
+#define WIFI_MIN_FREE_INTERNAL (16 * 1024)   /* WiFi ~10 KB internal here; small margin */
+#else
+#define WIFI_MIN_FREE_INTERNAL (40 * 1024)   /* no PSRAM: WiFi+BLE both in internal SRAM */
+#endif
+#endif
 
 /* ---- core-0 task handshake flags (loop <-> net task) ---- */
 static TaskHandle_t   s_net_task        = nullptr;
@@ -72,6 +108,41 @@ static bool json_find_string(const String &src, int from, const char *key,
 static bool wifi_connect(void) {
   if (!s_wifi_enabled) return false;     // never bring up the radio if wifi is disabled
   if (WiFi.status() == WL_CONNECTED) return true;
+
+  // WiFi+BLE coexistence guard (see WIFI_MIN_FREE_INTERNAL above). If BLE is up and
+  // internal SRAM is below the floor, bringing WiFi up would fail-and-leak, and since
+  // this runs on a schedule that leak would repeat until the watch crashes. Refuse
+  // the bring-up instead: a scheduled no-op, no radio touched, nothing leaked. This
+  // does NOT drop an already-connected WiFi (handled by the WL_CONNECTED check above)
+  // — it only blocks a NEW init while BLE holds the memory. Turning BLE off (or the
+  // next reboot) frees the SRAM and WiFi comes back on its own. Rate-limit the log so
+  // the ~scheduled retries don't spam the console.
+  {
+    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (free_int < WIFI_MIN_FREE_INTERNAL) {
+      // Refuse + advise. If BLE is the thing holding the SRAM, tell the user to turn
+      // it off (that frees it and WiFi comes back on its own). Otherwise the heap is
+      // just too full/fragmented, so a reboot is the fix. The toast is set here (core
+      // 0 net task) and rendered by ble_ui_tick() on the loop — same one-shot flag
+      // pattern the other toasts use; a volatile enum write is safe cross-core.
+      bool ble_up = ble_is_up();
+      // Rate-limit the log + toast so the ~scheduled retries don't spam. First refusal
+      // always fires (s_last starts unset); thereafter at most once per 5 s.
+      static bool     s_wifi_refused_once = false;
+      static uint32_t s_last_wifi_refused_ms = 0;
+      uint32_t now = millis();
+      if (!s_wifi_refused_once || (uint32_t)(now - s_last_wifi_refused_ms) > 5000) {
+        s_wifi_refused_once = true;
+        s_last_wifi_refused_ms = now;
+        USBSerial.printf("[wifi] REFUSED: %u KB internal free < %u KB (%s). WiFi bring-up "
+                         "now would fail+leak.\n",
+                         (unsigned)(free_int / 1024), (unsigned)(WIFI_MIN_FREE_INTERNAL / 1024),
+                         ble_up ? "BLE is up" : "heap too full");
+        s_ble_toast = ble_up ? BLE_TOAST_WIFI_OOM_BLE : BLE_TOAST_WIFI_OOM_BOOT;
+      }
+      return false;
+    }
+  }
 
   // Snapshot the saved-network list under the store mutex, then connect from the
   // copy. This runs on core 0 and each attempt can block for seconds, so we must

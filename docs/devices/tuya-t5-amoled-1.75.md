@@ -10,7 +10,7 @@
 | Power | **No PMU** — battery sensed over an ADC divider (ETA6098 charger) |
 | Audio | Internal codec via `tdl_audio` (amp/codec gated off between sounds) |
 | Storage | microSD via the TuyaOpen filesystem (`tkl_fs`) |
-| Haptics | Vibration motor (GPIO14) |
+| Haptics | Optional — driver GPIO wired (IO14), but **no motor fitted by default** (see below) |
 | BLE | Tuya's own NimBLE inside `libtuyaos.a` — **not** the ESP32 NimBLE path |
 
 > **This is not an ESP32 / Arduino-ESP32 build.** The T5-E1 is a Tuya BK7258 chip, so it
@@ -165,8 +165,8 @@ All of these are compile-time and live in the sketch folder.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `HAPTICS_INTENSITY_PCT` | `40` | Vibration strength. The T5 supports amplitude control, unlike the ESP boards' length-only buzz. |
-| `HAPTICS_CLICK_MS` | `28` | Button-tick length. Lower if too hard, raise if too faint; floor ~20 ms or a coin ERM never spins up. |
+| `HAPTICS_CLICK_MS` | `28` | Button-tick length — the **real** strength knob (buzz is length-only). Lower if too hard, raise if too faint; floor ~20 ms or a coin ERM never spins up. Only matters if you fit a motor (see below). |
+| `HAPTICS_INTENSITY_PCT` | `40` | **Reserved / not wired up.** IO14 has no hardware PWM on the T5 and the software-PWM attempt was reverted, so the motor runs at full strength regardless. Left in place for when amplitude control is redone; tune `HAPTICS_CLICK_MS` instead. |
 
 ### CPU & PSRAM clock / voltage (T5-specific)
 
@@ -204,5 +204,34 @@ voltage directly:
 - **No PMU.** Battery is sensed on an ADC divider (BAT_ADC, via `tkl_adc`), not an
   AXP2101 — so the PMU-based deep-sleep rail gating does not apply; the T5 sleeps via its
   own SDK path.
-- **Haptics with amplitude.** Unlike the ESP boards (length-only buzz), the T5 supports
-  intensity, so `HAPTICS_INTENSITY_PCT` is a real knob.
+- **Haptics are a wiring mod, not built in** (same as the S3-1.47) — see below.
+
+---
+
+### Optional: add a haptic motor
+
+The stock T5 board has **no vibration motor**, but the firmware's haptics are set up
+for one (enabled by default, `BOARD_HAS_HAPTICS 1`) — you just wire the motor. The
+driver GPIO is **IO14**, which is electrically free and sits right next to a GND pad, so
+a 2-pin header (IO14 + GND) lets a vibrator plug in and out. This is the **same mod** as
+the S3-1.47.
+
+The design is a coin ERM motor switched low-side by a **2N3904 NPN transistor**:
+
+- **IO14 → transistor base**, through a **1K resistor** (see the resistor note below).
+- **Transistor collector → motor −**; **motor + → your 3V3 / battery rail**.
+- **Transistor emitter → GND**.
+
+It is active HIGH: IO14 HIGH turns the transistor on and the motor runs. IO14 is
+electrically free and sits next to a GND pad, so a 2-pin header (IO14 + GND) lets the
+vibrator plug in and out.
+
+> **The 1K base resistor is optional but recommended.** You *can* drive the base straight
+> from IO14 with no resistor — it will not damage anything — but the motor then gets the
+> full drive and the haptic feedback feels **too aggressive**. The 1K in series tames it
+> to a pleasant tap. If you skip it and it is too strong, either add the resistor or lower
+> `HAPTICS_CLICK_MS` in the board header.
+
+There is no working amplitude control on this board (see the `HAPTICS_INTENSITY_PCT` note
+above), so the motor runs at full strength; **`HAPTICS_CLICK_MS`** is the knob for the
+feel — lower if too hard, raise if too faint, floor ~20 ms.

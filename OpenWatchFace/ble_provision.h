@@ -109,7 +109,15 @@ static volatile bool        s_ble_findwatch_req = false; // phone wrote find-wat
 /* Result toast: set by a NimBLE callback, shown by the loop. PAIRED fires once when
  * a phone finishes pairing; SAVED/DUP/FULL report a WiFi-provisioning write. */
 enum BleToast { BLE_TOAST_NONE = 0, BLE_TOAST_PAIRED, BLE_TOAST_SAVED, BLE_TOAST_DUP, BLE_TOAST_FULL,
-                BLE_TOAST_FORGETFAIL };   // bond delete failed (shown instead of rebuilding the list)
+                BLE_TOAST_FORGETFAIL,     // bond delete failed (shown instead of rebuilding the list)
+                // Low-internal-SRAM radio-bring-up refusals (see the *_MIN_FREE_INTERNAL guards).
+                // The advice differs by what ELSE is enabled: if the OTHER radio is holding the
+                // memory, tell the user to turn it off first; if nothing else is on, the heap is
+                // just fragmented/full, so a reboot is the fix.
+                BLE_TOAST_WIFI_OOM_BLE,   // WiFi refused, BLE is up   -> "turn off BLE first"
+                BLE_TOAST_WIFI_OOM_BOOT,  // WiFi refused, BLE is off  -> "try a reboot"
+                BLE_TOAST_BLE_OOM_WIFI,   // BLE refused,  WiFi is on  -> "turn off WiFi first"
+                BLE_TOAST_BLE_OOM_BOOT }; // BLE refused,  WiFi is off -> "try a reboot"
 static volatile BleToast    s_ble_toast      = BLE_TOAST_NONE;
 static volatile bool        s_ble_pairing    = false;   // a passkey was shown -> this is a real pairing (not a bonded reconnect)
 static char                 s_ble_toast_ssid[WIFI_SSID_MAX] = "";
@@ -284,12 +292,29 @@ static bool ble_take_dirty(void) { bool d = s_ble_dirty; s_ble_dirty = false; re
  * list immediately, without leaving and re-entering the screen. */
 static bool ble_take_bond_dirty(void) { bool d = s_ble_bond_dirty; s_ble_bond_dirty = false; return d; }
 
-/* Minimum free INTERNAL SRAM to attempt a BLE bring-up. The NimBLE controller +
- * host need ~45 KB of internal heap; if init can't get it, the controller never
- * syncs and BLEDevice::init()'s unbounded `while(!m_synced)` busy-wait trips the
- * task WDT (observed: enable with ~35 KB free -> WDT reset). Refusing below this
- * floor turns that crash into a loud log + BLE staying off. */
-#define BLE_MIN_FREE_INTERNAL (55 * 1024)
+/* Minimum free INTERNAL SRAM to attempt a BLE bring-up. If init can't get enough
+ * internal heap, the controller never syncs and BLEDevice::init()'s unbounded
+ * `while(!m_synced)` busy-wait trips the task WDT (observed: enable with ~35 KB free
+ * -> WDT reset). Refusing below this floor turns that crash into a loud log + BLE
+ * staying off.
+ *
+ * HOW MUCH BLE ACTUALLY NEEDS IS PER-BOARD, so this is a board-overridable default,
+ * NOT one constant — the same lesson as WIFI_MIN_FREE_INTERNAL in notif_net.h:
+ *   - PSRAM boards (S3): the custom libs route NimBLE host allocations to PSRAM, so
+ *     the controller+host need only ~40 KB INTERNAL SRAM (measured). The old flat
+ *     55 KB wrongly refused a valid enable that had e.g. 54 KB free. 44 KB = the
+ *     ~40 KB need + a small margin.
+ *   - No-PSRAM boards (C6): the host allocations are internal too, so it needs a bit
+ *     more — keep the conservative 55 KB there.
+ * A board header can #define BLE_MIN_FREE_INTERNAL before this to pin an exact value
+ * (measure with the "[ble] begin: N KB internal free" breadcrumb if you tune it). */
+#ifndef BLE_MIN_FREE_INTERNAL
+#if BOARD_HAS_PSRAM
+#define BLE_MIN_FREE_INTERNAL (44 * 1024)   /* ~40 KB need + margin; host in PSRAM */
+#else
+#define BLE_MIN_FREE_INTERNAL (55 * 1024)   /* no PSRAM: host internal too */
+#endif
+#endif
 
 /* Bring up the BLE peripheral (idempotent). */
 static void ble_begin(void) {
@@ -304,6 +329,10 @@ static void ble_begin(void) {
     USBSerial.printf("[ble] REFUSED: %u KB internal free < %u KB needed for controller+host "
                      "(init would WDT in while(!m_synced))\n",
                      (unsigned)(free_int / 1024), (unsigned)(BLE_MIN_FREE_INTERNAL / 1024));
+    // Surface it to the user (bottom-of-screen toast, rendered by ble_ui_tick on the
+    // loop). If WiFi is the thing holding the SRAM, advise turning it off; otherwise
+    // the heap is just too full, so advise a reboot.
+    s_ble_toast = settings_get_wifi_enabled() ? BLE_TOAST_BLE_OOM_WIFI : BLE_TOAST_BLE_OOM_BOOT;
     return;                                   // s_ble_up stays false; ble_is_up() reports truth
   }
 
@@ -778,6 +807,14 @@ static void ble_ui_tick(void) {
       col = 0xFF9F0A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Already saved\n%s", s_ble_toast_ssid);
     } else if (r == BLE_TOAST_FORGETFAIL) {
       col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Couldn't forget phone\nTry again");
+    } else if (r == BLE_TOAST_WIFI_OOM_BLE) {
+      col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start WiFi - low RAM\nTurn off BLE first");
+    } else if (r == BLE_TOAST_WIFI_OOM_BOOT) {
+      col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start WiFi - low RAM\nTry a reboot");
+    } else if (r == BLE_TOAST_BLE_OOM_WIFI) {
+      col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start BLE - low RAM\nTurn off WiFi first");
+    } else if (r == BLE_TOAST_BLE_OOM_BOOT) {
+      col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start BLE - low RAM\nTry a reboot");
     } else {
       col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Network list full");
     }

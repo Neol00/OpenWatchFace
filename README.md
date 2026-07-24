@@ -1,26 +1,12 @@
 # OpenWatchFace — a small "watch OS"
 
-A from-scratch smartwatch firmware for Waveshare ESP32 touch-display boards. It is a
-real little OS in miniature: a watch face, an app launcher, a notification pipeline
+A from-scratch smartwatch firmware for mostly Waveshare with other future planned touch-display boards. 
+It is a real little OS in miniature: a watch face, an app launcher, a notification pipeline
 that pulls from an HTTPS server **and** from your phone over BLE (iOS via ANCS,
 Android via the Gadgetbridge app), deep-sleep power management with a timed
 background-fetch wake, and a Player that mirrors and controls iPhone or Android
 media — all in a single Arduino translation unit on top of LVGL.
 
-> **Supported hardware:** several devices, selected at compile time via a small board
-> abstraction layer (`board.h` + `board_*.h`). Full list and per-device install guides:
-> **[docs/devices/](docs/devices/README.md)**. The main targets:
-> - **Waveshare ESP32-S3-Touch-AMOLED-2.06** — 410×502 CO5300 AMOLED, FT3168 touch,
->   PCF85063 RTC, **AXP2101 PMU**, 8 MB PSRAM. The original/primary target.
-> - **Waveshare ESP32-S3-Touch-AMOLED-1.8** — 368×448 **SH8601** AMOLED, FT3168 touch,
->   PCF85063 RTC, **AXP2101 PMU**, QMI8658 IMU, ES8311 audio, 8 MB PSRAM / 16 MB flash.
->   Very close sibling of the 2.06 (same SoC and I2C peripherals); the panel driver,
->   the resolution and the ES8311 pin map are what differ. **Hardware V1** — Waveshare
->   also ships a **V2** of this board with a CO5300 panel instead; see the note at the
->   top of `board_ws_s3_touch_amoled_18.h` for the one-line switch.
-> - **Waveshare ESP32-C6-Touch-LCD-1.47** — 172×320 JD9853 LCD, AXS5106L touch,
->   **no PMU** (battery sensed over an ADC divider), **no PSRAM**, 512 KB SRAM.
->
 > The board layer abstracts the pin map, panel/touch drivers, clock/RTC, power
 > (PMU vs ADC) and screen geometry, so the same UI builds for both. UI layout that
 > diverges is gated on **screen geometry** (portrait/narrow), not on the chip. PSRAM-
