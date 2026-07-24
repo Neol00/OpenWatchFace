@@ -31,13 +31,28 @@
  *  stays in sleep_power.h.
  * ========================================================================== */
 #pragma once
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_sleep.h"     // maps deep sleep onto tkl_cpu_sleep_mode_set + tkl_wakeup
+#include "tuya/compat/driver/gpio.h"   // gpio_hold_* no-ops (T5 retains pads / wake via tkl_wakeup)
+#if BOARD_WAKE_USE_EXT0
+#include "tuya/compat/driver/rtc_io.h"
+#endif
+#else
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #if BOARD_WAKE_USE_EXT0
 #include <driver/rtc_io.h>
 #endif
+#endif
 
-/* Pre-sleep peripheral isolation. C6-1.47 ONLY (no PMU to cut rails): in deep
+/* Pre-sleep peripheral isolation. Two per-board blocks:
+ *
+ * FT3168 + AXP2101 boards: put the touch controller into its lowest RECOVERABLE
+ * power mode (+ latch TP_RESET where one exists) — it sits on the never-cut
+ * ALDO1 rail, so the PMU rail-cut can't reach it. Which mode depends on whether
+ * the board has a reset line to wake it with; see the block comment inside.
+ *
+ * C6-1.47 (no PMU to cut rails): in deep
  * sleep the SoC releases its GPIOs to their default (floating) state unless they
  * are explicitly held. On this board the PWM backlight enable (LCD_BL) and the
  * LCD/touch RESET lines then FLOAT — a floating backlight-enable lets the
@@ -51,6 +66,76 @@
  * is revived only by the hardware RST button (a cold boot that re-inits the
  * panel), holding the controllers in reset while asleep is correct. */
 static inline void board_isolate_peripherals_for_sleep(void) {
+#if BOARD_TOUCH_FT3168 && BOARD_HAS_PMU_AXP2101
+  /* S3-2.06: the FT3168 lives on ALDO1 — the ONE rail that can never be cut in
+   * sleep (it also feeds the RTC + I2C pull-ups) — so unlike every other
+   * peripheral it is NOT powered down by rails_cut_for_sleep(). Left alone it
+   * keeps scanning in MONITOR mode all night (mA-scale: the S3-2.06 sleep-drain
+   * offender). Two-step shutdown:
+   *   1) a low-power mode command (reg 0xA5) — WHICH one depends on the board's
+   *      ability to wake the chip again; see the mode selection immediately below.
+   *   2) drive TP_RESET LOW and LATCH it through deep sleep, so the controller
+   *      is pinned in reset instead of floating (a floating reset into a powered
+   *      chip leaks and can even restart its scan engine) — only where such a
+   *      line exists. */
+  /* WHICH low-power mode depends on whether we can WAKE the chip afterwards.
+   *
+   *   HIBERNATE (0x03) is the deepest (~uA) but it is a ONE-WAY door: the FT3x68
+   *   stops clocking its I2C slave, so it does NOT answer further transactions.
+   *   The ONLY exit is a hardware reset PULSE on TP_RESET.
+   *
+   *   MONITOR (0x01) is the gesture/low-power scan mode: much lower than ACTIVE,
+   *   and critically the chip STAYS ADDRESSABLE, so it comes back on its own /
+   *   on the next I2C access with no reset line needed.
+   *
+   * So a board with TP_RESET hibernates (2.06 — board_release_sleep_isolation()
+   * pulses it on wake), and a board WITHOUT one (S3-1.8) must NOT hibernate: it
+   * would sleep fine but wake with a permanently dead touch panel (display OK,
+   * touch gone — observed). It uses MONITOR instead and accepts the higher idle
+   * draw, because there is no way to revive a hibernated chip without the pin. */
+#ifdef TP_RESET
+  const uint8_t ft_pmode = 0x03;          // hibernate; woken by the reset pulse
+  const char   *ft_pname = "hibernate";
+#else
+  const uint8_t ft_pmode = 0x01;          // monitor; self-recoverable over I2C
+  const char   *ft_pname = "monitor (no TP_RESET to wake a hibernate)";
+#endif
+  /* VERIFIED write: the ACK was previously discarded — a silent NAK meant the
+   * controller kept scanning in ACTIVE mode all night (mA on ALDO1). Retry a few
+   * times and LOG the outcome so a failed shutdown is visible on the wire. */
+  uint8_t ft_rc = 255;
+  for (int t = 0; t < 3; t++) {
+    Wire.beginTransmission(FT3168_DEVICE_ADDRESS);
+    Wire.write(0xA5);               // PMODE register
+    Wire.write(ft_pmode);
+    ft_rc = Wire.endTransmission();
+    if (ft_rc == 0) break;
+    delay(5);
+  }
+  USBSerial.printf("[sleep] FT3168 %s %s (i2c rc=%u)\n",
+                   ft_pname, ft_rc == 0 ? "ACKed" : "FAILED", (unsigned)ft_rc);
+  delay(2);
+  /* Hold TP_RESET HIGH (INACTIVE) through sleep — NOT low. Reset is active-LOW and
+   * OVERRIDES hibernate: a chip with reset asserted isn't hibernating, it's held in
+   * its reset state (POR + internal regulator active, current unspecified — the
+   * suspected residual ALDO1 drain). Held HIGH the line can't float AND the chip
+   * stays in the ~uA hibernate it just entered. Wake-up needs a real LOW->HIGH
+   * reset PULSE now — board_release_sleep_isolation() provides it.
+   *
+   * #ifdef TP_RESET: the S3-1.8 has the same FT3168 on the same never-cut rail but
+   * breaks out NO touch reset line — so there is nothing to latch here, and (see
+   * the mode selection above) it was put into MONITOR rather than HIBERNATE
+   * precisely because it has no way to be pulsed back to life. */
+#ifdef TP_RESET
+  gpio_hold_dis((gpio_num_t)TP_RESET);
+  pinMode(TP_RESET, OUTPUT);
+  digitalWrite(TP_RESET, HIGH);
+  gpio_hold_en((gpio_num_t)TP_RESET);
+#endif
+#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
+  gpio_deep_sleep_hold_en();        // S3: arm the global switch so the hold survives deep sleep
+#endif
+#endif
 #if defined(LCD_BL) && BOARD_HAS_BACKLIGHT_PWM && !BOARD_HAS_PMU_AXP2101
   // Backlight OFF: active-high enable -> drive LOW, then latch through sleep.
   gpio_hold_dis((gpio_num_t)LCD_BL);
@@ -88,8 +173,28 @@ static inline void board_isolate_peripherals_for_sleep(void) {
  * drive these pins again. A C6 RST press is a full chip reset that clears holds
  * on its own, but an RTC-TIMER deep-sleep wake is NOT a reset — the holds survive
  * it and would keep the backlight/controllers pinned OFF, blocking gfx->begin().
- * So release them unconditionally early in setup(). C6-gated; no-op on the S3. */
+ * So release them unconditionally early in setup(). On the S3-2.06 this also
+ * releases the TP_RESET hold and gives the hibernated FT3168 its wake-up reset
+ * edge (LOW-held all sleep -> driven HIGH here). */
 static inline void board_release_sleep_isolation(void) {
+#if BOARD_TOUCH_FT3168 && BOARD_HAS_PMU_AXP2101
+  /* Undo the pre-sleep touch shutdown. An EXT0/timer deep-sleep wake is NOT a
+   * reset, so the TP_RESET hold survives it — release it, then give the FT3168 a
+   * real LOW->HIGH reset PULSE. (The line was held HIGH through sleep so the chip
+   * stayed in hibernate — see isolate above — so the wake edge must be generated
+   * here: assert LOW ~5 ms, release HIGH.) The chip needs ~200 ms to boot, which
+   * the display init between here and the touch begin() more than covers; if
+   * begin() still misses, its existing retry path pulses TP_RESET again.
+   * Skipped where no reset line is broken out (S3-1.8) — nothing was held there,
+   * so there is nothing to release and no edge to generate. */
+#ifdef TP_RESET
+  gpio_hold_dis((gpio_num_t)TP_RESET);
+  pinMode(TP_RESET, OUTPUT);
+  digitalWrite(TP_RESET, LOW);
+  delay(5);
+  digitalWrite(TP_RESET, HIGH);
+#endif
+#endif
 #if defined(LCD_BL) && BOARD_HAS_BACKLIGHT_PWM && !BOARD_HAS_PMU_AXP2101
   gpio_hold_dis((gpio_num_t)LCD_BL);
 #ifdef LCD_RESET
@@ -121,8 +226,19 @@ static void board_wake_arm_button(void) {
   rtc_gpio_pulldown_dis((gpio_num_t)BOOT_BTN_GPIO);
   rtc_gpio_hold_en((gpio_num_t)BOOT_BTN_GPIO);                // keep pull in sleep
   esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BTN_GPIO, 0); // wake on LOW (press)
+#elif defined(BOARD_WAKE_GPIO)
+  // C6 HARDWARE MOD: the BOOT button is wired in parallel to BOARD_WAKE_GPIO (GPIO7), which
+  // IS in the deep-sleep wake mask (GPIO0..7). Arm a GPIO deep-sleep wake on it, wake-on-LOW
+  // (BOOT is active-LOW). A press now wakes the watch from deep sleep WITHOUT a reset, so RTC
+  // memory (the step counter) survives — same as the S3's EXT0 path.
+  gpio_pullup_en((gpio_num_t)BOARD_WAKE_GPIO);                // idle HIGH
+  gpio_pulldown_dis((gpio_num_t)BOARD_WAKE_GPIO);
+  esp_err_t e = esp_deep_sleep_enable_gpio_wakeup(1ULL << BOARD_WAKE_GPIO,
+                                                  ESP_GPIO_WAKEUP_GPIO_LOW);
+  USBSerial.printf("[wake] C6 GPIO%d deep-sleep wake arm -> %s\n", BOARD_WAKE_GPIO,
+                   e == ESP_OK ? "OK" : esp_err_to_name(e));
 #endif
-  // C6: no GPIO wake armed — the hardware RST button cold-boots it from sleep.
+  // (No-op on a C6 without BOARD_WAKE_GPIO: relies on the hardware RST button.)
 }
 
 /* Was THIS boot woken by a button press? On EXT0 boards that's the EXT0 cause.
@@ -132,6 +248,8 @@ static void board_wake_arm_button(void) {
 static bool board_woke_from_button(void) {
 #if BOARD_WAKE_USE_EXT0
   return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
+#elif defined(BOARD_WAKE_GPIO)
+  return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;   // C6 GPIO7 hardware-mod wake
 #else
   return false;
 #endif

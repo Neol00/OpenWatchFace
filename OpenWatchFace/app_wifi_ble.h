@@ -15,6 +15,11 @@
  * ========================================================================== */
 #pragma once
 #include <lvgl.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
+#include "esp_heap_caps.h"   // internal-SRAM breadcrumbs (chasing the entry-time alloc)
+#endif
 
 static void wifi_sw_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
@@ -76,6 +81,11 @@ static void ble_sw_cb(lv_event_t *e) {
 
   settings_set_ble_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
   ble_apply_enabled();   // bring the BLE peripheral up/down to match the switch
+  // ble_begin() can REFUSE (internal-SRAM OOM guard: bringing the stack up without
+  // enough free heap would WDT). Sync the persisted toggle to the radio's REAL
+  // state so the switch can't show ON while BLE is down (and so the next boot
+  // doesn't retry a bring-up that just failed).
+  if (settings_get_ble_enabled() && !ble_is_up()) settings_set_ble_enabled(false);
   // ble_begin()/ble_end() are synchronous, so s_ble_up + the bond store are valid
   // now. Rebuild the screen so the "Paired phones" section reflects the new state
   // instantly (otherwise it only refreshes on next screen entry).
@@ -432,6 +442,12 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
 }
 
 static void app_open_wifi_ble(void) {
+  // DIAG breadcrumbs (S3-2.06 SRAM chase): entering this screen was observed to cost
+  // ~45 KB of internal heap that persists after leaving — enough to make a later BLE
+  // enable refuse/WDT. Log free-internal before and after the build to bisect it.
+  USBSerial.printf("[wb] enter: internal free=%uKB largest=%uKB\n",
+                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
   app_screen_begin("WiFi & BLE");
 
   // Scrollable column holding the toggles, and the saved-network list,
@@ -443,10 +459,26 @@ static void app_open_wifi_ble(void) {
   lv_obj_set_height(list, (int)screenHeight - UI_PX(84));
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, UI_PX(124));
   lv_obj_set_style_pad_all(list, UI_PX(4), 0);
+#elif BOARD_SCREEN_ROUND
+  // ROUND (T5 466): the S3 path below hardcodes a 360-px list, but the inner rows are
+  // UI_PX(320) wide — on the 466 panel UI_PX(320) scales to ~364 px, WIDER than the 360
+  // list content box, so the list overflowed horizontally (sideways scroll) and the
+  // over-wide rows pushed left off the edge (the "black bar" covering elements). Size the
+  // list to the SCALED row width + padding so rows fit exactly, and lock scrolling to
+  // vertical only.
+  lv_obj_set_width(list, UI_PX(320) + UI_PX(16));   // row width + side padding lane
+  lv_obj_set_height(list, (int)screenHeight - UI_PX(96));
+  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, UI_PX(84));
+  lv_obj_set_style_pad_all(list, UI_PX(4), 0);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);          // no sideways scroll
 #else
-  // S3-2.06: ORIGINAL fixed geometry (toggle rows use fixed pixel offsets tuned to
-  // this width; rescaling clipped their names into the switch).
-  lv_obj_set_size(list, 360, 400);          // runs to the screen bottom (BOOT = back)
+  // S3-2.06: ORIGINAL fixed WIDTH (toggle rows use fixed pixel offsets tuned to this
+  // width; rescaling clipped their names into the switch). The HEIGHT is derived:
+  // a fixed 400 px from y=84 needs 484 px of screen — fine on the 502-px 2.06,
+  // but it overhung the 448-px S3-1.8 so the last row could never scroll clear.
+  // Same 18 px bottom margin the 2.06 had (502-84-400 = 18).
+  lv_obj_set_width(list, 360);              // runs to the screen bottom (BOOT = back)
+  lv_obj_set_height(list, (int)screenHeight - 84 - 18);
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 84);
   lv_obj_set_style_pad_all(list, 4, 0);
 #endif
@@ -457,10 +489,13 @@ static void app_open_wifi_ble(void) {
   lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_row(list, UI_PX(10), 0);
+  // Empty scroll runway at the end of the list so the LAST row clears the bottom
+  // bezel when scrolled fully down (scaled, not the old flat 28 px — that was a
+  // 2.06 constant and left the final row clipping on the shorter S3-1.8).
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_pad_bottom(list, UI_PX(78), 0);
 #else
-  lv_obj_set_style_pad_bottom(list, 28, 0);
+  lv_obj_set_style_pad_bottom(list, UI_PX(56), 0);
 #endif
 
   settings_toggle_row(list, LV_SYMBOL_WIFI, "WiFi", settings_get_wifi_enabled(),
@@ -537,4 +572,8 @@ static void app_open_wifi_ble(void) {
   if (s_wb_timer) { lv_timer_del(s_wb_timer); s_wb_timer = nullptr; }
   s_wb_timer = lv_timer_create(wb_poll_cb, 400, nullptr);
   lv_obj_add_event_cb(app_scr, wb_cleanup_cb, LV_EVENT_DELETE, nullptr);
+
+  USBSerial.printf("[wb] built: internal free=%uKB largest=%uKB\n",
+                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
 }

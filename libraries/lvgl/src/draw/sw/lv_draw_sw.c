@@ -446,15 +446,21 @@ static void render_thread_cb(void * ptr)
  * by lv_draw_task_type_t. Read + reset from the sketch's serial profiler to see
  * WHERE frame time goes (fill vs label vs image vs layer-blend). Updated from
  * both render workers without locking — a lost sample under a race is fine for
- * diagnostics. Costs two esp_timer reads per task; zero when nobody reads it. */
+ * diagnostics. Costs two esp_timer reads per task; zero when nobody reads it.
+ * ESP-only: esp_timer.h is an ESP-IDF header. On other platforms (e.g. Tuya T5)
+ * the whole profiler compiles out. Gate every use on ESP_PLATFORM. */
+#if defined(ESP_PLATFORM)
 #include "esp_timer.h"
 uint32_t g_lv_draw_type_us[20];
 uint32_t g_lv_draw_type_cnt[20];
+#endif
 
 static void execute_drawing(lv_draw_task_t * t)
 {
     LV_PROFILER_DRAW_BEGIN;
+#if defined(ESP_PLATFORM)
     uint32_t watch_t0 = (uint32_t)esp_timer_get_time(); /* LOCAL PATCH */
+#endif
     /*Render the draw task*/
     switch(t->type) {
         case LV_DRAW_TASK_TYPE_FILL:
@@ -503,12 +509,14 @@ static void execute_drawing(lv_draw_task_t * t)
     }
 
     /* LOCAL PATCH: accumulate render time per task type (see above) */
+#if defined(ESP_PLATFORM)
     {
         uint32_t watch_ty = (uint32_t)t->type;
         if(watch_ty >= 20) watch_ty = 19;
         g_lv_draw_type_us[watch_ty] += (uint32_t)esp_timer_get_time() - watch_t0;
         g_lv_draw_type_cnt[watch_ty]++;
     }
+#endif
 
     LV_PROFILER_DRAW_END;
 }

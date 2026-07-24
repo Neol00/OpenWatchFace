@@ -481,7 +481,9 @@ void lv_draw_label_iterate_characters(lv_draw_task_t * t, const lv_draw_label_ds
             }
 
             /* ESP32-S3-WatchFace LOCAL PATCH: time the per-character glyph-dsc
-             * lookup (slot 16 of g_lv_draw_type_us — a SUBSET of "label"). */
+             * lookup (slot 16 of g_lv_draw_type_us — a SUBSET of "label").
+             * ESP-only (esp_timer); elsewhere just do the lookup untimed. */
+#if defined(ESP_PLATFORM)
             {
                 extern uint32_t g_lv_draw_type_us[20];
                 extern uint32_t g_lv_draw_type_cnt[20];
@@ -491,6 +493,9 @@ void lv_draw_label_iterate_characters(lv_draw_task_t * t, const lv_draw_label_ds
                 g_lv_draw_type_us[16] += (uint32_t)esp_timer_get_time() - watch_t0;
                 g_lv_draw_type_cnt[16]++;
             }
+#else
+            lv_font_get_glyph_dsc(font, &glyph_dsc, letter, letter_next);
+#endif
             letter_w = lv_text_is_marker(letter) ? 0 : glyph_dsc.adv_w;
 
             /*Always set the bg_coordinates for placeholder drawing*/

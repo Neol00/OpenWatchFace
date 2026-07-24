@@ -38,9 +38,18 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/FS.h"
+#include "tuya/compat/FFat.h"
+#else
 #include <FS.h>
 #include <FFat.h>
+#endif
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
 #include "esp_heap_caps.h"   // heap_caps_malloc — view/line buffers live in PSRAM
+#endif
 #include "sd_card.h"
 #include "storage_fs.h"
 

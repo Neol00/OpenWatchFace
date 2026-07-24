@@ -21,10 +21,31 @@
  * ========================================================================== */
 #pragma once
 #include <lvgl.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/FS.h"
+#include "tuya/compat/FFat.h"
+#else
 #include <FS.h>
 #include <FFat.h>
+#endif
 #include "sd_card.h"         // board-neutral SD: sd_mount/sd_fs/sd_total_bytes (not SD_MMC)
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
 #include "esp_heap_caps.h"   // heap_caps_malloc — read big files into PSRAM, not SRAM
+#endif
+
+/* Capability flags for the file I/O buffers. Boards WITH PSRAM (the S3) keep their
+ * read buffers off the tight internal SRAM heap. Boards WITHOUT PSRAM (the C6) must
+ * NOT pass MALLOC_CAP_SPIRAM — caps are AND'd, so requiring SPIRAM on a chip that has
+ * none makes every allocation fail (the "(out of memory)" you saw opening a file).
+ * MALLOC_CAP_DEFAULT lands in internal SRAM, which has plenty of room for an 8 KB
+ * head / 4 KB copy chunk. */
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM
+#define FM_BUF_CAPS  (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define FM_BUF_CAPS  (MALLOC_CAP_DEFAULT | MALLOC_CAP_8BIT)
+#endif
 
 /* ---- navigation state (which volume + directory we're looking at) ----
  * s_fm_vol: -1 = at the volume-chooser root (list Flash + SD); 0 = Flash; 1 = SD.
@@ -132,7 +153,7 @@ static bool fm_copy_file(fs::FS &src_fs, const char *src,
   File out = dst_fs.open(dst, FILE_WRITE);       // truncates/creates
   if (!out) { in.close(); return false; }
   const size_t CHUNK = 4096;
-  uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, FM_BUF_CAPS);
   if (!buf) { in.close(); out.close(); return false; }
   bool ok = true;
   for (;;) {
@@ -330,9 +351,12 @@ static bool fm_boot_back(void) {
  * deletable files) an X. `tap_ud` is a plain integer index (cast through void*); NO
  * heap allocation is involved, so rows need no free/DELETE bookkeeping. Pass nullptr
  * tap for static rows (the SD "(none)" placeholder). */
+/* `mdi`: when true, `symbol` is a UTF-8 Material Design Icons glyph and the icon is
+ * drawn in the icons22 MDI font (used for the volume rows); when false it's a built-in
+ * LV_SYMBOL_* in montserrat_20 (dir/file rows). */
 static lv_obj_t *fm_row(lv_obj_t *list, const char *symbol, uint32_t icon_rgb,
                         const char *name, const char *size, lv_event_cb_t tap,
-                        void *tap_ud) {
+                        void *tap_ud, bool mdi = false) {
   lv_obj_t *row = lv_obj_create(list);
   lv_obj_remove_style_all(row);
   lv_obj_set_width(row, UI_PX(330));
@@ -340,7 +364,9 @@ static lv_obj_t *fm_row(lv_obj_t *list, const char *symbol, uint32_t icon_rgb,
   // Tall enough for a name line on top + a row of big buttons underneath.
   lv_obj_set_height(row, size ? UI_PX(180) : UI_PX(96));
 #else
-  lv_obj_set_height(row, UI_PX(52));
+  // Volume rows (mdi icon, no size) are a touch taller so the 22px MDI glyph sits
+  // comfortably; dir/file rows keep the compact 52px.
+  lv_obj_set_height(row, mdi ? UI_PX(58) : UI_PX(52));
 #endif
   lv_obj_set_style_bg_color(row, lv_color_hex(0x1A1A1A), 0);
   lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -353,7 +379,7 @@ static lv_obj_t *fm_row(lv_obj_t *list, const char *symbol, uint32_t icon_rgb,
   }
 
   lv_obj_t *ic = lv_label_create(row);
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ic, mdi ? &icons22 : &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(icon_rgb)), 0);
   lv_label_set_text(ic, symbol);
 #if BOARD_SCREEN_NARROW
@@ -608,7 +634,7 @@ static void app_open_file_view(void) {
   // Read a head into a PSRAM buffer (the watch has ~7 MB free PSRAM; internal SRAM is
   // tight and was where the heap was corrupting). +1 for the NUL terminator.
   size_t cap = FM_VIEW_MAX;
-  char *buf = (char *)heap_caps_malloc(cap + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  char *buf = (char *)heap_caps_malloc(cap + 1, FM_BUF_CAPS);
   if (!buf) { f.close(); lv_textarea_set_text(body, "(out of memory)"); return; }
   size_t got = f.read((uint8_t *)buf, cap);
   bool truncated = (f.size() > (uint32_t)got);
@@ -818,20 +844,28 @@ static void app_open_files(void) {
   lv_obj_set_style_pad_row(list, UI_PX(8), 0);
   lv_obj_set_scroll_dir(list, LV_DIR_VER);
 
-  // ---- ROOT: the volume chooser (Flash always; SD when mounted) ----
+  // ---- ROOT: the volume chooser (Flash when present; SD when mounted) ----
   if (s_fm_vol < 0) {
-    fm_row(list, LV_SYMBOL_DRIVE, 0xFF9F0A, "Flash (FFat)", nullptr,
-           fm_pick_vol_cb, (void *)(intptr_t)0);
+    char uf[5], us[5];   // MDI glyph buffers (mini-disk / mini-sd)
+#if BOARD_HAS_FFAT
+    // Flash (FFat) volume — only on boards that actually have an on-flash FAT partition.
+    // The T5 has none (BOARD_HAS_FFAT=0), so this row is hidden there (it would just fail
+    // to mount). SD is the only browsable volume on that board.
+    fm_row(list, mdi_utf8(MDI_MINI_DISK, uf), 0xFF9F0A, "Flash (FFat)", nullptr,
+           fm_pick_vol_cb, (void *)(intptr_t)0, true);
+#else
+    (void)uf;
+#endif
     if (sd_mount())
-      fm_row(list, LV_SYMBOL_SD_CARD, 0x33A0FF, "SD Card", nullptr,
-             fm_pick_vol_cb, (void *)(intptr_t)1);
+      fm_row(list, mdi_utf8(MDI_MINI_SD, us), 0x33A0FF, "SD Card", nullptr,
+             fm_pick_vol_cb, (void *)(intptr_t)1, true);
     else
       // Greyed "no card" row IS tappable: it opens the format prompt, so a card
       // Windows wrote in a layout the ESP32 can't mount can be reformatted on-
       // device (destructive, confirmed). If truly no card is inserted, the format
       // simply fails (no card responds) and we return to this list.
-      fm_row(list, LV_SYMBOL_SD_CARD, 0x555555, "SD Card (tap to format)",
-             nullptr, fm_sd_format_request_cb, nullptr);
+      fm_row(list, mdi_utf8(MDI_MINI_SD, us), 0x555555, "SD Card (tap to format)",
+             nullptr, fm_sd_format_request_cb, nullptr, true);
     return;
   }
 

@@ -13,7 +13,11 @@
  *  on store_fs()). Header-only; compiled into the .ino TU.
  * ========================================================================== */
 #pragma once
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/Preferences.h"
+#else
 #include <Preferences.h>
+#endif
 #include <time.h>          // localtime_r/mktime — alarm-clock wall-time math
 
 /* --- timer state (persisted in the shared "watch" NVS namespace) --- */
@@ -47,6 +51,11 @@ typedef struct {
 
 static AlmClk   s_almcs[ALMC_MAX];
 static uint8_t  s_almc_n      = 0;
+static bool     s_almc_loaded = false;   // true once almclk_load() has run this boot. Until
+                                         // then s_almcs[] is empty and the only valid target is
+                                         // the NVS "almc_tgt" restored by timer_load(); rearm
+                                         // must NOT overwrite it from the empty list (that wiped
+                                         // armed alarms -> no ring + the value flip-flopping).
 static uint32_t s_almc_master = 0;      // earliest enabled target (persisted)
 
 static void timer_save(void) {
@@ -145,9 +154,24 @@ static void timer_cancel(void) {
  * rearm, so the deep-sleep wake decision (which runs before storage mounts) can
  * test it cheaply; the full boot then loads the CSV and rings the right alarm. */
 
-/* Next epoch at which alarm `a` should ring (0 = never: disabled, clock unset,
- * or repeat with no weekday selected). Walks day by day through localtime/mktime
- * so the TZ/DST rules give the true wall-clock HH:MM, same as rtc_now_epoch(). */
+/* How recently-passed an alarm time may still count as "due now" at a deep-sleep WAKE
+ * (vs. being rolled to tomorrow). Used ONLY by the wake-due test (almclk_load /
+ * almclk_is_due), never by the plain "next future occurrence" math below — so it cannot
+ * desync the editor's "Rings in". 90s covers boot latency + a missed minute tick. */
+#define ALMC_GRACE_S  90
+
+/* How long PAST an alarm's HH:MM it may still ring (covers deep-sleep wake + full-UI boot
+ * latency before the deferred alarm load runs). Wide enough not to drop a ring, but far
+ * short of an hour so it never fires at a clearly-wrong time. The wall-clock HH:MM is still
+ * checked, so this only ever rings the CORRECT alarm, just possibly a few minutes late. */
+#define ALMC_FIRE_WINDOW_S  300
+
+/* Next epoch at which alarm `a` should ring: the STRICTLY-NEXT future occurrence of its
+ * HH:MM (0 = never: disabled, clock unset, or repeat with no weekday selected). Walks day
+ * by day through localtime/mktime so TZ/DST give the true wall-clock HH:MM. This is the
+ * single source of truth for the armed target and the "Rings in" estimate, so it is kept
+ * dead simple: always a time in the FUTURE relative to now. (The wake-race for an alarm
+ * that arrives during deep sleep is handled in almclk_load(), not here.) */
 static uint32_t almclk_next_epoch(const AlmClk *a) {
   if (!a->en) return 0;
   uint32_t now = rtc_now_epoch();
@@ -158,7 +182,7 @@ static uint32_t almclk_next_epoch(const AlmClk *a) {
     localtime_r(&base, &lt);
     lt.tm_hour = a->h; lt.tm_min = a->m; lt.tm_sec = 0; lt.tm_isdst = -1;
     time_t t = mktime(&lt);                  // also normalizes lt.tm_wday
-    if (t <= (time_t)now) continue;
+    if (t <= (time_t)now) continue;          // strictly future only
     if (a->rep && !(a->days & (1 << ((lt.tm_wday + 6) % 7)))) continue;
     return (uint32_t)t;
   }
@@ -181,6 +205,11 @@ static void almclk_save_csv(void) {
  * change and after a fire. Needs a valid RTC (so not from timer_load — the boot
  * wake test uses the previously saved master until almclk_load() runs). */
 static void almclk_rearm(void) {
+  // GUARD: never rearm from an unloaded list. Before almclk_load() runs (e.g. a light
+  // background-check wake, or a clock-set jump handled in loop() that lands before the
+  // deferred CSV load), s_almcs[] is empty -> this would compute master=0 and persist 0,
+  // WIPING the armed alarm in NVS. The saved "almc_tgt" stays authoritative until load.
+  if (!s_almc_loaded) return;
   uint32_t master = 0;
   for (uint8_t i = 0; i < s_almc_n; i++) {
     s_almcs[i].target = almclk_next_epoch(&s_almcs[i]);
@@ -195,6 +224,7 @@ static void almclk_rearm(void) {
  * exists yet, migrate the pre-multi single alarm out of NVS, then write the CSV. */
 static void almclk_load(void) {
   s_almc_n = 0;
+  s_almc_loaded = true;   // from here on rearm may persist; before this the NVS target rules
   if (store_available() && store_fs().exists(ALMC_CSV_PATH)) {
     File f = store_fs().open(ALMC_CSV_PATH, FILE_READ);
     while (f && f.available() && s_almc_n < ALMC_MAX) {
@@ -221,12 +251,44 @@ static void almclk_load(void) {
     USBSerial.println("[almc] migrated single NVS alarm -> alarms.csv");
   }
   almclk_rearm();
+
+  // Wake-race recovery: a deep-sleep wake fires the timer AT the alarm minute, but the
+  // rearm just above computed each target as the next FUTURE occurrence (tomorrow), so the
+  // loop would see nothing due and never ring. If the live wall clock is right now reading
+  // an enabled alarm's HH:MM (within grace), pull that alarm's target back to "now" so the
+  // loop rings it this minute; almclk_fired() then advances it cleanly. This stays out of
+  // almclk_next_epoch(), so the editor's "Rings in" is never affected.
+  uint32_t now = rtc_now_epoch();
+  if (now != 0) {
+    time_t tnow = (time_t)now; struct tm lt; localtime_r(&tnow, &lt);
+    int now_mod = lt.tm_hour * 60 + lt.tm_min;
+    uint32_t master = s_almc_master;
+    for (uint8_t i = 0; i < s_almc_n; i++) {
+      AlmClk *a = &s_almcs[i];
+      if (!a->en) continue;
+      int diff = now_mod - (a->h * 60 + a->m);
+      if (diff < 0) diff += 1440;
+      if (diff * 60 > (int)ALMC_FIRE_WINDOW_S) continue;  // not this alarm's recent minute
+      // This alarm's time just passed (within boot latency) -> mark it due so the loop
+      // fires it. almclk_due_index() uses the same window, so the ring won't be rejected.
+      a->target = now;
+      if (!master || now < master) master = now;
+    }
+    s_almc_master = master;
+  }
 }
 
+/* Used ONLY as the deep-sleep WAKE gate (whether to full-boot vs. go back to sleep). It is
+ * deliberately generous: if the RTC timer woke us anywhere near the armed alarm epoch, full
+ * boot and let the loop's HH:MM matcher (almclk_match_now via almclk_fire) decide whether to
+ * actually ring. The +5s covers an early wake; the trailing window covers a late wake / a
+ * master that already ticked. The ring itself no longer depends on this — it's purely the
+ * "don't sleep through the alarm" gate. */
 static bool almclk_is_due(void) {
   if (s_almc_master == 0) return false;
   uint32_t now = rtc_now_epoch();
-  return now != 0 && now >= s_almc_master;
+  if (now == 0) return false;
+  return (now + 5 >= s_almc_master) && (now <= s_almc_master + (uint32_t)ALMC_FIRE_WINDOW_S);
 }
 
 /* Seconds until the earliest armed fire (0 = nothing armed; 1 = due right now). */
@@ -237,21 +299,81 @@ static uint32_t almclk_seconds_until(void) {
   return (s_almc_master > now) ? (s_almc_master - now) : 1;
 }
 
-/* Which alarm is due right now? Earliest-due index, or -1. */
+/* Which alarm is due right now? Earliest-due index, or -1.
+ *
+ * An alarm is due only when its target epoch has arrived AND the live wall clock still
+ * reads that alarm's HH:MM (within ALMC_GRACE_S). The HH:MM cross-check is the guard that
+ * makes "rings only at the set time" hold even if the absolute target epoch and the wall
+ * clock have drifted apart — e.g. after the user changes the clock while an alarm is armed,
+ * which previously left a stale epoch that could fire at the wrong minute. */
 static int almclk_due_index(void) {
   uint32_t now = rtc_now_epoch();
   if (now == 0) return -1;
+  // Live wall-clock minute-of-day, and how far we are past the alarm's HH:MM today.
+  time_t tnow = (time_t)now;
+  struct tm lt; localtime_r(&tnow, &lt);
+  int now_mod = lt.tm_hour * 60 + lt.tm_min;          // 0..1439
   int best = -1;
-  for (uint8_t i = 0; i < s_almc_n; i++)
-    if (s_almcs[i].en && s_almcs[i].target && s_almcs[i].target <= now &&
-        (best < 0 || s_almcs[i].target < s_almcs[best].target))
-      best = i;
+  for (uint8_t i = 0; i < s_almc_n; i++) {
+    const AlmClk *a = &s_almcs[i];
+    if (!a->en || !a->target || a->target > now) continue;
+    // Wall clock must actually read this alarm's HH:MM (allow up to the grace window
+    // PAST it, so a slightly-late wake still rings the right minute). Diff is the signed
+    // minutes since the alarm minute, wrapped into 0..1439.
+    int diff = now_mod - (a->h * 60 + a->m);
+    if (diff < 0) diff += 1440;
+    if (diff * 60 > (int)ALMC_FIRE_WINDOW_S) continue; // not this alarm's minute (within latency)
+    if (best < 0 || a->target < s_almcs[best].target) best = i;
+  }
   return best;
+}
+
+/* ---- simple "ring when the clock matches" detector -------------------------------------
+ * Independent of the absolute-epoch target machinery (which was fragile across sleep). The
+ * rule is exactly: if any ENABLED alarm's HH:MM equals the current wall clock (and, for a
+ * repeat alarm, today is one of its days), it is due. A "last rang" stamp (minute-of-day +
+ * day-of-year) makes it fire ONCE per occurrence and never twice in the same minute. The
+ * caller is responsible for not ringing while the alarm-settings screen is open. */
+static int  s_almc_rang_min = -1;   // minute-of-day we last rang at (-1 = none)
+static int  s_almc_rang_yday = -1;  // day-of-year of that ring (so the next day re-arms)
+
+/* Index of an enabled alarm matching the current wall clock that we have NOT already rung
+ * this minute, or -1. */
+static int almclk_match_now(void) {
+  uint32_t now = rtc_now_epoch();
+  if (now == 0) return -1;
+  time_t tnow = (time_t)now; struct tm lt; localtime_r(&tnow, &lt);
+  int now_min  = lt.tm_hour * 60 + lt.tm_min;     // 0..1439
+  int now_dow  = (lt.tm_wday + 6) % 7;            // 0=Mon..6=Sun (match a->days bits)
+  // Already rang this exact minute today? Then we're done until the minute changes.
+  if (now_min == s_almc_rang_min && lt.tm_yday == s_almc_rang_yday) return -1;
+  for (uint8_t i = 0; i < s_almc_n; i++) {
+    const AlmClk *a = &s_almcs[i];
+    if (!a->en) continue;
+    if (a->h * 60 + a->m != now_min) continue;    // not this alarm's minute
+    if (a->rep && !(a->days & (1 << now_dow))) continue;   // repeat: not a selected day
+    return i;
+  }
+  return -1;
+}
+
+/* Record that we rang at the current minute (so almclk_match_now() won't fire again until
+ * the clock minute changes). */
+static void almclk_mark_rang(void) {
+  uint32_t now = rtc_now_epoch();
+  if (now == 0) return;
+  time_t tnow = (time_t)now; struct tm lt; localtime_r(&tnow, &lt);
+  s_almc_rang_min  = lt.tm_hour * 60 + lt.tm_min;
+  s_almc_rang_yday = lt.tm_yday;
 }
 
 /* Advance alarm `i` past a fire: one-shot disables itself; repeat re-arms. */
 static void almclk_fired(int i) {
   if (i < 0 || i >= s_almc_n) return;
+  // After ringing, advance past this occurrence. One-shot disables itself. For a repeat,
+  // almclk_rearm() -> almclk_next_epoch() returns the next FUTURE occurrence: "now" is a
+  // few seconds past the alarm minute, so today's slot is already in the past and skipped,
+  // landing on the next valid day. No re-ring loop, no extra state needed.
   if (!s_almcs[i].rep) { s_almcs[i].en = false; almclk_save_csv(); }
   almclk_rearm();
 }

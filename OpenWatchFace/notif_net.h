@@ -21,8 +21,14 @@
  * ========================================================================== */
 #pragma once
 #include <WiFi.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/WiFiClientSecure.h"   // CA holder; TLS happens inside the Tuya HTTP GET
+#include "tuya/compat/HTTPClient.h"         // ESP32 HTTPClient surface over http_client_request
+#include "tuya/compat/owf_tuya_sntp.h"      // real UDP SNTP (the core ships no SNTP service)
+#else
 #include <WiFiClientSecure.h>   // TLS client for HTTPS to the notify-server
 #include <HTTPClient.h>
+#endif
 #include "notify_ca.h"          // pinned Let's Encrypt root (validates the server cert)
 
 /* ---- core-0 task handshake flags (loop <-> net task) ---- */
@@ -84,6 +90,32 @@ static bool wifi_connect(void) {
   // Try each saved network in turn until one connects within the per-network
   // timeout (insertion order; the seeded home network is first).
   for (uint8_t i = 0; i < count; i++) {
+#if BOARD_PLATFORM_TUYA
+    // The T5 WiFi connect is ASYNCHRONOUS (tkl_wifi_station_connect returns at once;
+    // status walks IDLE->CONNECTING->GOT_IP, or to a terminal fail). A SINGLE begin()
+    // misses the AP intermittently (the "connects half the time, needs a reboot" bug).
+    // So retry a few times per network: disconnect+settle, begin, poll until GOT_IP or
+    // a TERMINAL fail (don't burn the whole 8s sitting on a known failure), then retry.
+    bool ok = false;
+    for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+      WiFi.disconnect(false);
+      delay(150);                                    // let the driver settle between tries
+      WiFi.begin(nets[i].ssid, nets[i].pass);
+      uint32_t start = millis();
+      while (millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+        WF_STATION_STAT_E st = WiFi.status();
+        if (st == WSS_GOT_IP) { ok = true; break; }
+        // Terminal failures: stop waiting and retry immediately (or move on).
+        if (st == WSS_CONN_FAIL || st == WSS_PASSWD_WRONG ||
+            st == WSS_NO_AP_FOUND || st == WSS_DHCP_FAIL) break;
+        delay(100);
+      }
+    }
+    if (ok) {
+      settings_apply_wifi_txp();   // driver restarts per fetch and resets TX power
+      return true;
+    }
+#else
     WiFi.begin(nets[i].ssid, nets[i].pass);
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED) {
@@ -95,6 +127,7 @@ static bool wifi_connect(void) {
       return true;
     }
     WiFi.disconnect(false);
+#endif
   }
   return false;
 }
@@ -107,7 +140,20 @@ static bool wifi_connect(void) {
  *
  * `force` bypasses the interval gate (used on cold boot for an immediate sync). */
 static bool ntp_sync_if_due(bool force) {
-  // Gate on the interval unless forced. Compute the RTC's current epoch (treating
+  // PRIMARY rate-limit: monotonic millis() since the last SUCCESSFUL sync. This does NOT
+  // depend on the RTC readback or on epoch bases matching, so it can't be defeated the way
+  // the epoch gate below can. On the T5 the epoch gate was failing to block (the RTC-readback
+  // comparison didn't hold), so ntp_sync_if_due() re-ran on every ~15 s notification fetch —
+  // each one a blocking DNS + UDP round-trip that stalled the UI. This floor guarantees at
+  // most one sync per NTP_SYNC_INTERVAL_S within a wake session regardless of RTC state.
+  // (millis() wraps ~every 49 days; the unsigned subtraction handles the wrap.)
+  static uint32_t s_last_sync_ms = 0;
+  static bool     s_have_synced  = false;
+  if (!force && s_have_synced &&
+      (uint32_t)(millis() - s_last_sync_ms) < NTP_SYNC_INTERVAL_S * 1000UL)
+    return false;
+
+  // SECONDARY gate on the interval unless forced. Compute the RTC's current epoch (treating
   // its stored fields as local time) and compare to the last-sync epoch. If the
   // RTC is unset/garbage, now_rtc will be small/0 and we'll sync anyway.
   if (!force && rtc_last_ntp_epoch != 0) {
@@ -124,17 +170,37 @@ static bool ntp_sync_if_due(bool force) {
   }
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  // Kick off SNTP with our timezone; configTzTime applies NTP_TZ to localtime().
+  // Apply our timezone so localtime()/getLocalTime() convert the (UTC) system clock
+  // to local wall-clock time with DST. On the ESP path configTzTime ALSO starts the
+  // built-in SNTP service; on the Tuya T5 it only sets TZ (no SNTP in the core), so we
+  // run our own UDP SNTP client below to actually fetch network time.
   configTzTime(NTP_TZ, NTP_SERVER1, NTP_SERVER2);
 
-  // Wait briefly for the first NTP response (year jumps past 2024 once set).
   struct tm tmv = {};
+
+#if BOARD_PLATFORM_TUYA
+#if OWF_TUYA_SNTP_ENABLE
+  // Real SNTP over UDP (the core has no SNTP). It returns the fetched UTC epoch directly;
+  // we convert THAT with localtime_r (TZ applied above) instead of reading the system clock
+  // back via getLocalTime() - the readback on this board is corrupted (gave year 3855160),
+  // so we never trust it. localtime_r applies the POSIX TZ to give local wall-clock time.
+  uint32_t utc_epoch = 0;
+  if (!owf_tuya_sntp_sync(&utc_epoch)) return false;
+  time_t et = (time_t)utc_epoch;
+  localtime_r(&et, &tmv);
+  if (tmv.tm_year + 1900 < 2024) return false;      // sanity
+#else
+  // SNTP disabled (OWF_TUYA_SNTP_ENABLE=0): rely on the battery-backed RTC / phone sync.
+  return false;
+#endif
+#else  /* non-Tuya: the platform SNTP set the system clock; read it back via getLocalTime */
   uint32_t start = millis();
   while (millis() - start < 5000) {       // up to 5s for a response
     if (getLocalTime(&tmv, 200) && tmv.tm_year + 1900 >= 2024) break;
     delay(50);
   }
   if (tmv.tm_year + 1900 < 2024) return false;  // no valid time received
+#endif
 
   // Write the local wall-clock time into the RTC. (On a board with no RTC chip,
   // configTzTime above already set the internal clock — this is a harmless
@@ -144,6 +210,8 @@ static bool ntp_sync_if_due(bool force) {
                   tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
   i2c_unlock();
   rtc_last_ntp_epoch = (uint32_t)mktime(&tmv);  // mktime here = local epoch
+  s_last_sync_ms = millis();                    // arm the monotonic rate-limit (see top)
+  s_have_synced  = true;
   USBSerial.printf("[ntp] synced: %04d-%02d-%02d %02d:%02d:%02d\n",
                    tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
                    tmv.tm_hour, tmv.tm_min, tmv.tm_sec);

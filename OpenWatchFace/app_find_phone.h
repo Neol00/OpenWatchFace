@@ -59,14 +59,21 @@ static void app_open_find_phone(void) {
   // Cap at 180 so the S3 keeps its original look; on the C6 it shrinks to fit.
   int ring_d = (int)screenWidth - UI_PX(40);   // leave a margin both sides
   if (ring_d > 180) ring_d = 180;
+  bool connected = ble_phone_connected();      // no phone -> button greyed + inert
   lv_obj_t *btn = lv_btn_create(app_scr);
   lv_obj_set_size(btn, ring_d, ring_d);
   lv_obj_align(btn, LV_ALIGN_CENTER, 0, UI_PX(-24));
   lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(ui_accent_hex()), 0);
+  // Accent-filled when a phone is connected; greyed out (disabled) otherwise so it
+  // visibly reads as un-pressable, matching the "No phone connected" status below.
+  lv_obj_set_style_bg_color(btn, lv_color_hex(connected ? ui_accent_hex() : 0x3A3A3A), 0);
   lv_obj_set_style_shadow_width(btn, 0, 0);
   lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_event_cb(btn, fmp_ring_cb, LV_EVENT_CLICKED, nullptr);
+  if (connected) {
+    lv_obj_add_event_cb(btn, fmp_ring_cb, LV_EVENT_CLICKED, nullptr);
+  } else {
+    lv_obj_add_state(btn, LV_STATE_DISABLED);   // ignores presses; no ring with no phone
+  }
 
   lv_obj_t *ic = lv_label_create(btn);
   // The icon glyph is a FIXED-size built-in font (not UI_PX-scaled), but the
@@ -78,7 +85,7 @@ static void app_open_find_phone(void) {
 #else
   lv_obj_set_style_text_font(ic, &lv_font_montserrat_34, 0);
 #endif
-  lv_obj_set_style_text_color(ic, lv_color_black(), 0);
+  lv_obj_set_style_text_color(ic, connected ? lv_color_black() : lv_color_hex(0x777777), 0);
   lv_label_set_text(ic, LV_SYMBOL_CALL);
 #if BOARD_SCREEN_NARROW
   lv_obj_align(ic, LV_ALIGN_CENTER, 0, -18);
@@ -88,7 +95,7 @@ static void app_open_find_phone(void) {
 
   fmp_btn_lbl = lv_label_create(btn);
   lv_obj_set_style_text_font(fmp_btn_lbl, &FONT_SMALL, 0);
-  lv_obj_set_style_text_color(fmp_btn_lbl, lv_color_black(), 0);
+  lv_obj_set_style_text_color(fmp_btn_lbl, connected ? lv_color_black() : lv_color_hex(0x777777), 0);
   lv_label_set_text(fmp_btn_lbl, "Ring");
 #if BOARD_SCREEN_NARROW
   lv_obj_align(fmp_btn_lbl, LV_ALIGN_CENTER, 0, 16);

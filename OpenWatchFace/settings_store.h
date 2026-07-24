@@ -11,7 +11,11 @@
  *  so it must come before them.
  * ========================================================================== */
 #pragma once
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/Preferences.h"
+#else
 #include <Preferences.h>
+#endif
 
 /* Stored in flash via the Preferences library — survives reboots/power-off.
  * The app menu calls settings_get/set_brightness(); this module owns the store
@@ -22,17 +26,48 @@ static uint8_t s_brightness = 204;        // 0-255; ~80%
 /* Forward decl: applying a brightness means the panel is at full, so any active
  * auto-dim state is now stale. Defined below with the auto-dim helpers. */
 static bool s_dimmed;
+static uint8_t s_panel_applied = 0;       // last brightness actually written to the panel (0 = unknown)
 static void settings_apply_brightness(uint8_t b) {
   s_brightness = b;
   s_dimmed = false;                       // panel is now at full -> not dimmed
+  s_panel_applied = b;                    // keep the dim dedup in sync with this direct write
   board_display_set_brightness(b);        // panel command (CO5300) or PWM backlight
 }
 
-/* Called by the app menu's brightness slider (live preview + persist). */
+/* Called by the app menu's brightness slider (live preview + persist).
+ *
+ * The NVS write is DEBOUNCED. Applying brightness is instant (a panel command), but persisting is
+ * a flash write — and on the Tuya KV store (tal_kv_set) that's tens of ms and BLOCKING. Writing on
+ * every slider step made the slider visibly lag on the T5 (ESP32's NVS is RAM-cached, so it never
+ * showed there). So we apply LIVE every step and commit the settled value to NVS later, from
+ * settings_brightness_commit_tick() in loop() (or settings_brightness_commit_now() before sleep). */
+static bool     s_bright_dirty    = false;
+static uint8_t  s_bright_pending  = 0;
+static uint32_t s_bright_dirty_ms = 0;
+
 static uint8_t settings_get_brightness(void) { return s_brightness; }
 static void settings_set_brightness(uint8_t b) {
-  settings_apply_brightness(b);
-  prefs.putUChar("bright", b);            // persist to NVS
+  settings_apply_brightness(b);           // live, instant (panel command)
+  s_bright_pending  = b;                  // defer the flash write until the slider settles
+  s_bright_dirty    = true;
+  s_bright_dirty_ms = millis();
+}
+
+/* Commit the deferred brightness to NVS once it's held steady briefly. Call from loop(). */
+static void settings_brightness_commit_tick(uint32_t ms) {
+  if (s_bright_dirty && (uint32_t)(ms - s_bright_dirty_ms) >= 700) {
+    prefs.putUChar("bright", s_bright_pending);
+    s_bright_dirty = false;
+  }
+}
+
+/* Flush a pending brightness immediately (call before sleep/power-off so a just-set value isn't
+ * lost inside the debounce window). Cheap no-op when nothing is pending. */
+static void settings_brightness_commit_now(void) {
+  if (s_bright_dirty) {
+    prefs.putUChar("bright", s_bright_pending);
+    s_bright_dirty = false;
+  }
 }
 
 /* ---- Auto-dim on idle (battery only) ---------------------------------------
@@ -51,17 +86,41 @@ static bool    settings_get_autodim(void)     { return s_autodim_on; }
 static uint8_t settings_get_autodim_pct(void) { return s_autodim_pct; }
 
 /* Push the panel to the dimmed level (a fraction of the user's brightness, floored
- * so it never goes fully dark) or back to full — WITHOUT touching s_brightness. */
+ * so it never goes fully dark) or back to full — WITHOUT touching s_brightness.
+ *
+ * Debounce on the ACTUAL APPLIED PANEL LEVEL, not on the s_dimmed bool. The old code
+ * returned early when `dim == s_dimmed` — but s_dimmed could fall out of sync with the real
+ * panel register (e.g. settings_apply_brightness clears s_dimmed on a wake/brightness change
+ * while a separate path had dimmed the panel). Then an un-dim (settings_dim_set(false) with
+ * s_dimmed already false) wrote NOTHING and the panel stayed dim until the brightness slider
+ * forced an unconditional write — exactly the observed "touch won't undim, but adjusting
+ * brightness does". Keying off the last value we actually wrote makes the un-dim self-correct:
+ * if the panel is dim, we restore it no matter what the bool says. */
 static void settings_dim_set(bool dim) {
-  if (dim == s_dimmed) return;            // debounce: only write the panel on a transition
-  s_dimmed = dim;
+  uint8_t target;
   if (dim) {
     uint16_t d = (uint16_t)s_brightness * s_autodim_pct / 100;
     if (d < 8) d = 8;                     // keep it visibly on, never black
-    board_display_set_brightness((uint8_t)d);  // panel only; s_brightness preserved
+    target = (uint8_t)d;
   } else {
-    board_display_set_brightness(s_brightness);  // restore the user's exact brightness
+    target = s_brightness;                // restore the user's exact brightness
   }
+  s_dimmed = dim;
+  if (target == s_panel_applied) return;  // already at the right level -> no redundant write
+  s_panel_applied = target;
+  board_display_set_brightness(target);   // panel only; s_brightness preserved
+}
+
+/* Force the panel back to full brightness, unconditionally re-asserting the register even if
+ * our bookkeeping already thinks it's full. Called on fresh user activity (touch / BOOT) to
+ * SELF-HEAL a desync: the brightness command shares the QSPI bus with the LVGL flush, so a
+ * single write can be dropped, leaving the panel stuck dim while s_panel_applied wrongly reads
+ * "full" — which the deduped settings_dim_set(false) would then never correct. This bypasses
+ * the dedup so any dropped un-dim is fixed by the next tap/press. */
+static void settings_undim_force(void) {
+  s_dimmed = false;
+  s_panel_applied = s_brightness;
+  board_display_set_brightness(s_brightness);
 }
 static bool settings_is_dimmed(void) { return s_dimmed; }
 
@@ -225,6 +284,27 @@ static void settings_set_checks_enabled(bool en) {
   prefs.putBool("checks", en);
 }
 
+/* ---- Sleep mode (sleep-quality tracking + Do-Not-Disturb) ------------------
+ * When ON the watch is in an overnight tracking session:
+ *   - the IMU keeps running through deep sleep (handed to the ULP/LP core, same as
+ *     the Fitness step counter) and each periodic wake logs a movement sample to a
+ *     CSV on the SD/FFat store, so we can derive sleep quality afterwards;
+ *   - Do-Not-Disturb: NOTIFICATIONS must NOT wake the screen (so the watch can't be
+ *     bumped awake while you sleep on it and then drain the battery), and no notif
+ *     popup cards appear. ALARMS + TIMERS still ring normally — those go through a
+ *     separate wake branch (timer_is_due/almclk_is_due) untouched by this flag.
+ * Persisted (NVS) so it survives the deep-sleep reboot each periodic wake does, and
+ * read in settings_load() before the wake dispatch decides whether to wake the
+ * screen for a found notification. Mutually exclusive with the Fitness step counter
+ * (both own the IMU/ULP) — the Sleep app refuses to start if counting is running and
+ * vice-versa; see app_sleep.h / app_fitness.h. Default OFF. */
+static bool s_sleep_mode = false;
+static bool settings_get_sleep_mode(void) { return s_sleep_mode; }
+static void settings_set_sleep_mode(bool en) {
+  s_sleep_mode = en;
+  prefs.putBool("sleepmode", en);
+}
+
 /* Radio enable toggles, persisted. When WiFi is OFF the watch never
  * brings up the STA radio, so no notification fetches happen — fully silent and
  * lowest-power. BLE is the (future) short-lived credential-sharing channel; the
@@ -260,8 +340,13 @@ static void settings_set_ble_enabled(bool en) {
  *     STARTED, and each fetch restarts it.
  *   - BLE:  settings_apply_ble_txp() right after BLEDevice::init() (ble_begin),
  *     gated on the controller actually being up so a stray call can't fault. */
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_wifi.h"   // TX-power no-op (no T5 max-tx-power setter)
+#include "tuya/compat/esp_bt.h"     // ESP_PWR_LVL_* enum + no-op BLE power (BLE off in P0)
+#else
 #include <esp_wifi.h>   // esp_wifi_set_max_tx_power
 #include <esp_bt.h>     // esp_ble_tx_power_set / esp_bt_controller_get_status
+#endif
 
 #define RADIO_TXP_COUNT 7
 static const char  *RADIO_TXP_NAMES[RADIO_TXP_COUNT] = { "Min", "VLow", "Low", "Mid", "High", "VHigh", "Max" };
@@ -313,7 +398,12 @@ static void settings_set_ble_txp(uint8_t idx) {
  * are valid AND WiFi-capable. setCpuFrequencyMhz() applies it.
  *   - S3-2.06 (ESP32-S3): 240 / 160 / 80.
  *   - C6-1.47 (ESP32-C6): max 160 MHz (no 240); 160 / 80. */
-#if defined(BOARD_WS_C6_TOUCH_LCD_147)
+#if BOARD_PLATFORM_TUYA
+/* T5-E1 (BK7258): the DVFS ladder. Each speed sets the core clock + its matched
+ * core voltage directly (owf_tuya_cpu_freq.h). Voltage rises with frequency. Highest-first (button row reads left=fast). */
+static const uint16_t CPU_FREQS[] = { 480, 320, 240 };
+static uint16_t s_cpu_mhz = 480;          // start at 480 MHz (max)
+#elif defined(BOARD_WS_C6_TOUCH_LCD_147)
 static const uint16_t CPU_FREQS[] = { 160, 80 };
 static uint16_t s_cpu_mhz = 160;          // C6 default (its max)
 #else
@@ -321,6 +411,23 @@ static const uint16_t CPU_FREQS[] = { 240, 160, 80 };
 static uint16_t s_cpu_mhz = 240;          // S3 default
 #endif
 static const uint8_t  CPU_FREQ_COUNT = sizeof(CPU_FREQS) / sizeof(CPU_FREQS[0]);
+
+#if BOARD_PLATFORM_TUYA
+/* DPLL overclock (T5 only): a forced VCO band above the stock 480 MHz, with its matched
+ * core voltage. Persisted in NVS and applied at boot — but GATED by a survived-boot flag
+ * so an OC that hangs on cold start auto-disables on the next power cycle (it can't brick
+ * the flash, but it could otherwise boot-loop and need a re-flash to clear). Band 0 is
+ * ~544 MHz on the reference part; values are user-tunable from the Power app. */
+static bool     s_oc_enabled = false;     // is a persistent overclock active?
+static uint8_t  s_oc_band    = 0;         // forced DPLL band (0 = ~544 MHz)
+static uint16_t s_oc_mv      = 975;       // matched core voltage (mV)
+#endif
+
+/* Lowest CPU clock the watch ever runs at — used on the screen-less background-check
+ * wake (no drawing/animation, so max speed is wasted power). 80 MHz is the slowest
+ * WiFi-capable PLL clock on BOTH chips (S3 and C6); the radio still works at it, so a
+ * timer-wake notification fetch is fine. The full-UI path always restores s_cpu_mhz. */
+static const uint16_t CPU_FREQ_LOW = 80;
 
 /* ===========================================================================
  *  EXPERIMENTAL — per-frequency system-rail UNDERVOLT (AXP2101 DCDC1)
@@ -358,7 +465,13 @@ static const uint8_t  CPU_FREQ_COUNT = sizeof(CPU_FREQS) / sizeof(CPU_FREQS[0]);
 // One entry per CPU_FREQS[] (board-specific). This is the AXP2101-RAIL undervolt,
 // so it's PMU-only — dead/no-op on the C6 (settings_apply_rail_for_mhz bails when
 // no PMU), but it must still match CPU_FREQS[] length for the static_assert.
-#if defined(BOARD_WS_C6_TOUCH_LCD_147)
+#if BOARD_PLATFORM_TUYA
+// T5 has no AXP2101 rail to trim (this is the PMU-rail undervolt). One STOCK entry per
+// CPU_FREQS[] so the static_assert holds; the real T5 core voltage is set per-frequency
+// via vcorehsel in owf_tuya_cpu_freq.h, not this AXP path.
+//   CPU MHz index:                      480   320   240
+static const uint16_t CPU_UVOLT_MV[] = { 3300, 3300, 3300 };
+#elif defined(BOARD_WS_C6_TOUCH_LCD_147)
 //   CPU MHz index:                      160    80   (C6 has no PMU rail to trim)
 static const uint16_t CPU_UVOLT_MV[] = { 3300, 3300 };
 #else
@@ -391,8 +504,18 @@ static void settings_apply_rail_for_mhz(uint16_t mhz) {
 #endif
 }
 
-static void settings_apply_cpu_mhz(uint16_t mhz) {
-  s_cpu_mhz = mhz;
+/* Push a CPU clock to the HARDWARE only (rail + clock + core undervolt) WITHOUT
+ * touching the saved s_cpu_mhz. Use this for a TRANSIENT clamp — e.g. dropping to
+ * CPU_FREQ_LOW for a screen-less background-check wake — so the user's chosen speed
+ * is preserved and can be restored with settings_apply_cpu_mhz(settings_get_cpu_mhz()). */
+static void settings_clock_hw(uint16_t mhz) {
+#if BOARD_PLATFORM_TUYA
+  // T5 (BK7258): set the core divider + its matched core voltage directly (the PM vote is
+  // ignored by CP1, and the SDK's stepping switch brownouts at 320M). owf_tuya_set_cpu_mhz
+  // keeps the 480 PLL + bus clock (QSPI/PSRAM domain) untouched and only scales the CPU,
+  // with voltage-before-speedup / voltage-after-slowdown ordering. Safe to call at boot.
+  owf_tuya_set_cpu_mhz(mhz);
+#else
   // Order matters when SPEEDING UP: raise the rail before the clock so the chip
   // never runs fast on a low rail. At boot the PMU isn't up yet, so this call
   // no-ops and the explicit apply after power.begin() handles the initial set.
@@ -403,6 +526,11 @@ static void settings_apply_cpu_mhz(uint16_t mhz) {
   // (No-op unless UNDERVOLT_CORE_ENABLE is set in core_voltage.h.) This is the
   // preferred undervolt path; the rail trick above is minor and higher-risk.
   core_apply_for_mhz(mhz);
+#endif
+}
+static void settings_apply_cpu_mhz(uint16_t mhz) {
+  s_cpu_mhz = mhz;                          // becomes the new SAVED interactive speed
+  settings_clock_hw(mhz);
 }
 static uint16_t settings_get_cpu_mhz(void) { return s_cpu_mhz; }
 static void settings_set_cpu_mhz(uint16_t mhz) {
@@ -410,15 +538,90 @@ static void settings_set_cpu_mhz(uint16_t mhz) {
   prefs.putUShort("cpumhz", mhz);          // persist to NVS
 }
 
+#if BOARD_PLATFORM_TUYA
+/* ---- persistent DPLL overclock (T5) ----------------------------------------------
+ * Storage keys in the "watch" namespace: "ocen" (bool), "ocband" (u8), "ocmv" (u16),
+ * plus "ocarmed" (bool) — the survived-boot guard, set just before applying OC at boot
+ * and cleared once the watch proves it booted OK. If a boot finds "ocarmed" still set,
+ * the previous OC boot hung before clearing it -> we DISABLE OC for this boot.
+ */
+static bool     s_oc_enabled_runtime = false;   // OC actually applied this session?
+
+static uint8_t  settings_get_oc_band(void)   { return s_oc_band; }
+static uint16_t settings_get_oc_mv(void)     { return s_oc_mv; }
+static bool     settings_get_oc_enabled(void){ return s_oc_enabled; }
+static bool     settings_oc_is_active(void)  { return s_oc_enabled_runtime; }
+
+/* Apply the overclock to hardware NOW (band + voltage) and mark it active this session. */
+static void settings_oc_apply_hw(void) {
+  owf_tuya_dpll_apply_band(s_oc_band, s_oc_mv);
+  s_oc_enabled_runtime = true;
+}
+
+/* Enable + persist a DPLL overclock with the given band/voltage, and apply it now.
+ * Called from the Power app once the user has confirmed band/voltage is stable. */
+static void settings_set_oc(uint8_t band, uint16_t mv) {
+  s_oc_band = band; s_oc_mv = mv; s_oc_enabled = true;
+  prefs.putUChar ("ocband", band);
+  prefs.putUShort("ocmv",   mv);
+  prefs.putBool  ("ocen",   true);
+  settings_oc_apply_hw();
+}
+
+/* Disable the persistent overclock and return the CPU to its normal saved speed. */
+static void settings_clear_oc(void) {
+  s_oc_enabled = false; s_oc_enabled_runtime = false;
+  prefs.putBool("ocen", false);
+  prefs.putBool("ocarmed", false);
+  owf_tuya_set_cpu_mhz(s_cpu_mhz);          // back to the normal divider-based speed
+}
+
+/* Boot-time OC apply with the survived-boot gate. Call AFTER settings_load(), in setup,
+ * before the watch does heavy work. Returns true if OC was applied this boot. */
+static bool settings_oc_boot_apply(void) {
+  if (!s_oc_enabled) return false;
+  if (prefs.getBool("ocarmed", false)) {
+    // Previous OC boot never reached settings_oc_boot_ok() -> it hung. Disable OC now.
+    prefs.putBool("ocarmed", false);
+    prefs.putBool("ocen",    false);
+    s_oc_enabled = false;
+    return false;
+  }
+  prefs.putBool("ocarmed", true);           // arm: must be cleared by a healthy boot
+  settings_oc_apply_hw();
+  return true;
+}
+
+/* Call once the watch has booted far enough to be considered healthy (e.g. first full
+ * render / a few seconds into loop). Clears the survived-boot arm so the NEXT boot keeps
+ * the OC. Until this runs, a hang/reset leaves "ocarmed" set -> OC auto-disables. */
+static void settings_oc_boot_ok(void) {
+  if (s_oc_enabled_runtime) prefs.putBool("ocarmed", false);
+}
+#endif  /* BOARD_PLATFORM_TUYA */
+
 /* Load all persisted settings from NVS into the globals above. Opens the
  * "watch" namespace (shared by the WiFi/notification stores). */
 static void settings_load(void) {
+#ifdef BOARD_NVS_EXT_LABEL
+  // S3-2.06: Preferences live in the 1 MB "nvsext" partition (see the board
+  // header + partitions.csv), keeping the 20 KB head "nvs" free for the system
+  // stores (WiFi cal, NimBLE bonds). Fall back to the default partition if the
+  // label is missing (e.g. flashed over an OLD partition table), so settings
+  // still work instead of silently resetting every boot.
+  if (!prefs.begin("watch", false, BOARD_NVS_EXT_LABEL)) {
+    USBSerial.println("[nvs] nvsext partition missing -> falling back to head nvs");
+    prefs.begin("watch", false);
+  }
+#else
   prefs.begin("watch", false);            // namespace "watch", read/write
+#endif
   s_brightness        = prefs.getUChar ("bright",   s_brightness);
   s_accent            = prefs.getUInt  ("accent",   s_accent);
   s_mute              = prefs.getBool  ("mute",     s_mute);
   s_check_interval_min= prefs.getUShort("checkmin", s_check_interval_min);
   s_checks_enabled    = prefs.getBool  ("checks",   s_checks_enabled);
+  s_sleep_mode        = prefs.getBool  ("sleepmode", s_sleep_mode);
   s_cpu_mhz           = prefs.getUShort("cpumhz",   s_cpu_mhz);
   s_wifi_enabled      = prefs.getBool  ("wifien",   s_wifi_enabled);
   s_ble_enabled       = prefs.getBool  ("bleen",    s_ble_enabled);
@@ -431,4 +634,9 @@ static void settings_load(void) {
   s_swap_wifi_ble     = prefs.getBool  ("swapwb",   s_swap_wifi_ble);
   s_mono_accent       = prefs.getBool  ("monoacc",  s_mono_accent);
   s_caffeine          = prefs.getBool  ("caffeine", s_caffeine);
+#if BOARD_PLATFORM_TUYA
+  s_oc_enabled        = prefs.getBool  ("ocen",     s_oc_enabled);
+  s_oc_band           = prefs.getUChar ("ocband",   s_oc_band);
+  s_oc_mv             = prefs.getUShort("ocmv",     s_oc_mv);
+#endif
 }

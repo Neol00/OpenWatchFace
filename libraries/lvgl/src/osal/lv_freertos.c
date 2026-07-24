@@ -66,7 +66,13 @@ static void prvTestAndDecrement(lv_thread_sync_t * pxCond,
  *  STATIC VARIABLES
  **********************/
 
-#ifdef ESP_PLATFORM
+/* ESP32-S3-WatchFace LOCAL PATCH: SMP critical sections need a spinlock arg.
+ * Both ESP-IDF and the Tuya T5 (FreeRTOS-SMP-v2 on Cortex-M33, ARDUINO_CHIP_T5)
+ * use the SMP-style port where portENTER/EXIT_CRITICAL take a portMUX_TYPE*.
+ * The default LVGL build assumes the single-core no-arg form, which fails to
+ * compile on those ports ("too few arguments to vPortEnterCritical"). Treat the
+ * T5 like ESP: give it a static spinlock and pass it to the critical macros. */
+#if defined(ESP_PLATFORM) || defined(ARDUINO_CHIP_T5)
     static portMUX_TYPE critSectionMux = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
@@ -74,7 +80,9 @@ static void prvTestAndDecrement(lv_thread_sync_t * pxCond,
  *      MACROS
  **********************/
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) || defined(ARDUINO_CHIP_T5)
+    /* SMP port (ESP-IDF / Tuya T5): task-level critical sections take a spinlock.
+     * The ISR-level macros stay no-arg here, same as upstream. See critSectionMux. */
     #define _enter_critical()   taskENTER_CRITICAL(&critSectionMux);
     #define _exit_critical()    taskEXIT_CRITICAL(&critSectionMux);
     #define _enter_critical_isr() taskENTER_CRITICAL_FROM_ISR();
@@ -107,7 +115,15 @@ lv_result_t lv_thread_init(lv_thread_t * pxThread,  const char * const name,
      * worker -> core 0, 2nd -> core 1. The dispatcher (loopTask, core 1) only
      * needs CPU between draw tasks, so brief preemption by the higher-prio
      * worker is harmless.
-     * NOTE: global LVGL-library edit; re-apply after any LVGL update. */
+     * NOTE: global LVGL-library edit; re-apply after any LVGL update.
+     *
+     * Tuya T5: 2 SMP FreeRTOS cores (+1 non-RTOS CP core). band_split renders two
+     * clip-halves on two worker threads, but ONLY parallelizes if those threads run on
+     * DIFFERENT cores. tskNO_AFFINITY let the SMP scheduler park both on one core -> the
+     * two halves serialized and DRAW_UNIT_CNT 2 gave no gain (the symptom we chased). So
+     * pin the workers to alternating cores 0/1, same as the ESP path. (Valid because the
+     * AP is 2-core; core IDs 0 and 1 both exist. If this ever runs on a 1-core SMP build
+     * core 1 would be invalid — not a config we ship for the T5.) */
     static BaseType_t xNextCore = 0;
     BaseType_t xPinCore = xNextCore;
     xNextCore ^= 1;

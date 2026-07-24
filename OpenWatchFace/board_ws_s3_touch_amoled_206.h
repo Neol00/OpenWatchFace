@@ -24,10 +24,29 @@
 #define BOARD_HAS_HAPTICS         1
 #define BOARD_HAS_SD_MMC          1
 #define BOARD_HAS_SD_SPI          0
-#define BOARD_HAS_IMU_QMI8658     0
+#define BOARD_HAS_IMU_QMI8658     1   /* same QMI8658 6-axis IMU as the C6, on the touch I2C bus */
 #define BOARD_HAS_BACKLIGHT_PWM   0   /* brightness = CO5300 panel command 0x51 */
 
+/* ---- Awake power model (mW; see power_model.h BOARD_PWR_* for the model) -----
+ * ESTIMATES ONLY — this unit has a soldered-in battery so it can't be metered;
+ * derived by scaling the MEASURED S3-1.47 numbers. The CO5300 AMOLED is 410x502
+ * (~3.7x the 1.47's pixels) AND emissive (an AMOLED draws with lit-pixel area and
+ * content, unlike a backlit LCD whose backlight dominates). So the screen span is
+ * much larger and the brightness curve is steeper. Floor is a bit higher too (PMU
+ * + larger panel controller). Same dual-core S3, so CPU k inherits the default.
+ * Tune these if you ever get a metered unit; until then health leans on the gauge-
+ * vs-voltage capacity learner (BOARD_HAS_PMU_AXP2101 smart path), not this model. */
+#define BOARD_PWR_FLOOR_MW        380.0f   /* est: 1.47 floor + AXP2101 + bigger panel ctrl */
+#define BOARD_PWR_SCREEN_MW_FULL  -50.0f   /* est: emissive AMOLED */
+#define BOARD_PWR_IMU_MW          2.0f     /* QMI8658 pedometer; same part as the C6 */
+
 #define XPOWERS_CHIP_AXP2101          /* required before XPowersLib.h */
+
+/* Extended NVS: the firmware's Preferences store lives in the 1 MB "nvsext"
+ * partition (app1's old slot — no OTA on this watch), not the 20 KB head "nvs"
+ * (which stays for the system consumers: WiFi PHY/cal, NimBLE bonds). Boards
+ * without this macro keep using the default partition. */
+#define BOARD_NVS_EXT_LABEL "nvsext"
 
 /* Hardware summary for the Settings > About screen (one line per peripheral). */
 #define BOARD_HW_SUMMARY \
@@ -67,13 +86,24 @@
 /* Lines per LVGL partial render buffer (x2 buffers, internal SRAM).
  * SIZING IS FIXED AT COMPILE TIME — never auto-size from boot free-heap
  * (see the PARTIAL render comment in the .ino). */
-#define BOARD_PARTIAL_BUF_LINES 104
+#define BOARD_PARTIAL_BUF_LINES 90
 
-/* ---- Touch: FT3168 + shared I2C bus (touch/PMU/RTC) ----------------------- */
+/* ---- Touch: FT3168 + shared I2C bus (touch/PMU/RTC/IMU) ------------------- */
 #define IIC_SDA  15
 #define IIC_SCL  14
 #define TP_INT   38
 #define TP_RESET 9
+
+/* ---- IMU: QMI8658 6-axis (same part as the C6), on the shared touch I2C bus
+ * (SCL=GPIO14 / SDA=GPIO15, == IIC_SCL/IIC_SDA above). INT1 on GPIO21 (free; touch
+ * INT is GPIO38). The INT line is only needed for interrupt-driven data-ready /
+ * step-event wakeups; polled register reads (our pedometer poll) don't use it. */
+#define IMU_QMI8658_ADDR 0x6B
+#define IMU_QMI8658_INT  21
+/* Deep-sleep step counting via the RISC-V ULP (bit-banged I2C to the IMU on GPIO14/15).
+ * S3 only — the C6 LP-core path is separate and not wired yet. Requires the custom libs
+ * built with CONFIG_ULP_COPROC_TYPE_RISCV=y. */
+#define BOARD_HAS_ULP_STEPS 1
 
 /* ---- microSD on SDMMC (1-bit). Core 3.3.x variants may already define these
  * as macros in pins_arduino.h; guard so we only add what's missing. ----------*/
@@ -104,6 +134,12 @@
 /* ---- Haptics: vibration motor (Q1 MMBT3904 driver) ------------------------ */
 #define HAPTICS_MOTOR_GPIO 18
 #define HAPTICS_ACTIVE_HIGH 1
+/* Per-board button-tick length. haptics_pulse() is an EXACT blocking pulse now, and a coin
+ * ERM needs ~20-40 ms to spin up enough to feel. This board's motor is WEAKER than the Tuya's,
+ * so it needs the longer end: 35 ms. Buzz strength is length-only (no amplitude PWM), so this
+ * is the per-device knob: raise if too faint, lower if too strong (not below ~25 here or it
+ * stops registering). Heartbeat is separate (H_DOT/DASH in haptics.h). */
+#define HAPTICS_CLICK_MS 40
 
 /* ---- Buttons / deep-sleep wake -------------------------------------------- */
 #define BOOT_BTN_GPIO 0   /* Key1; pull-up, LOW = pressed */

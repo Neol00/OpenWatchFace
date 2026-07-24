@@ -115,6 +115,12 @@ enum NotifCat : uint8_t {
   NCAT_OUTLOOK   = 74,
   NCAT_PAYPAL    = 75,
   NCAT_UBER      = 76,
+  NCAT_TWITCH    = 77,
+  NCAT_STEAM     = 78,
+  NCAT_GITHUB    = 79,
+  NCAT_ANDROID   = 80,
+  NCAT_ICLOUD    = 81,
+  NCAT_MTEAMS    = 82,
 
   NCAT_COUNT
   // NOTE: values are PERSISTED (NVS + CSV). Only APPEND new categories here; never
@@ -158,8 +164,14 @@ static NotifCat notif_cat_from_appid(const char *appid) {
   if (M("gmail") || M("com.google.gmail"))                    return NCAT_GMAIL;
   if (M("outlook"))                                           return NCAT_OUTLOOK;
   if (M("paypal"))                                            return NCAT_PAYPAL;
-  // Uber the rideshare app — but NOT Uber Eats (let that fall to FOOD/SHOPPING below).
   if (M("uber") && !M("ubereats") && !M("uber eats"))         return NCAT_UBER;
+  if (M("twitch") && M("twitchtv") && M("twitch.tv"))         return NCAT_TWITCH;
+  if (M("steam"))                                             return NCAT_STEAM;
+  if (M("github"))                                            return NCAT_GITHUB;
+  if (M("android"))                                           return NCAT_ANDROID;
+  if (M("icloud"))                                            return NCAT_ICLOUD;
+  if (M("teams") && M("microsoftteams") && M("microsoft.teams"))
+    return NCAT_MTEAMS;
 
   // Communication
   if (M("mobilephone") || M("facetime") || M(".phone") || M("missedcall") || M("dialer"))
@@ -309,7 +321,11 @@ struct NotifEntry {
   char title[NOTIF_TITLE_MAX];
   char body[NOTIF_BODY_MAX];
 };
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
 #include "esp_heap_caps.h"   // heap_caps_calloc — the list lives in PSRAM
+#endif
 
 /* The entry list lives in PSRAM, not static SRAM (~10 KB of .bss freed for the
  * display's partial render buffers). Allocated on first use; s_notif_count stays
@@ -440,5 +456,15 @@ static bool notif_store_remove_by_id(uint64_t id) {
       return true;
     }
   }
+  return false;
+}
+
+/* Is this id still in the store? Same locking convention as remove_by_id: the
+ * caller holds store_lock. Used by the loop to auto-hide the popup card when the
+ * notification it shows was removed (watch-app dismiss or the phone's ANCS
+ * REMOVED echo). */
+static bool notif_store_contains(uint64_t id) {
+  for (uint8_t i = 0; i < s_notif_count; i++)
+    if (s_notifs[i].id == id) return true;
   return false;
 }

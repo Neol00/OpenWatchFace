@@ -1,50 +1,75 @@
 /* ============================================================================
  *  OpenWatchFace.ino — Digital watch OS for multiple boards. Currently:
  *  Waveshare ESP32-S3-Touch-AMOLED-2.06
+ *  Waveshare ESP32-S3-Touch-LCD-1.47
  *  Waveshare ESP32-C6-Touch-LCD-1.47
- *  (Tuya T5-E1 port planned)
+ *  Waveshare Tuya T5-E1-Touch-AMOLED-1.75
+ *  Waveshare ESP32-S3-Touch-AMOLED-1.8
  *
  *  REQUIREMENTS:
- *    - esp32 (Espressif Systems) = v3.3.8
+ *    - esp32 (Espressif Systems) = v3.3.11
  *    - lvgl                      = v9.5.0   (+ lv_conf.h in libraries/)
  *    - GFX_Library_for_Arduino   = v1.6.5
  *    - Arduino_DriveBus          = v1.0.1
  *    - SensorLib                 = v0.4.1
  *    - XPowersLib                = v0.3.3
  *
- *  ARDUINO IDE BOARD SETTINGS ESP32-S3-Touch-AMOLED-2.06:
- *    Board:                                "Waveshare ESP32-S3-Touch-AMOLED-2.06"
- *    Erase All Flash Before Sketch Upload: "Enabled" (Only necessary to be enabled for the first flash)
- *    Events Run On:                        "Core 0"
- *    Flash Mode:                           "QIO 120 MHz"
- *    Arduino Runs On:                      "Core 1"
- *    Flash Size:                           32MB (fixed by the board)
- *    Partition:                            "Custom"  -> uses partitions.csv in THIS
- *                                          sketch folder (20KB NVS + 4MB app0/app1
- *                                          + 24MB FAT on the 32MB chip). app0 is
- *                                          pinned at 0x10000 (the core flashes the
- *                                          app there) — moving it (e.g. a bigger NVS
- *                                          before it, or "Max APP 32MB") boots to a
- *                                          BLACK SCREEN.
- *    PSRAM:                                "Enabled"
- *    Upload Mode:                          "UART0 / Hardware CDC"
  * ========================================================================== */
 
 #include <Wire.h>
 #include <Arduino.h>
 #include "board.h"       // board selection: pins, display/touch type, feature flags
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/owf_tuya_arduino_ext.h"  // ESP-Arduino extras the TuyaOpen core lacks (RTC_DATA_ATTR, settimeofday, temperatureRead, setCpuFrequencyMhz)
+#include "tuya/compat/owf_tuya_cpu_freq.h"     // owf_tuya_set_cpu_mhz() — PM-vote the user's baseline CPU clock (used by settings_store.h)
+#include "tuya/compat/owf_tuya_dpll_sweep.h"   // owf_tuya_dpll_apply_band() — persistent DPLL overclock (used by settings_store.h)
+#endif
 #include <lvgl.h>
-#include "Arduino_GFX_Library.h"
+#if BOARD_PLATFORM_MAIX
+#include "lvgl_compat.h"    // shims for LVGL API differences vs MaixCDK's bundled LVGL
+#include "owf_maix_hooks.h" // bridges to MaixCDK (button level, backlight) — extern "C", no maix headers
+#endif
+#if BOARD_PLATFORM_TUYA
+#include "tuya/owf_tuya_port.h"      // panel/touch registration, power latch, sleep, backlight (tkl shims)
+#include "tuya/owf_tuya_lvgl_own.h"  // OUR OWN LVGL v9.5 (replaces the SDK vendor v8) - display+indev+flush
+#endif
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#include "Arduino_GFX_Library.h"   // Arduino_GFX panel driver — not used when an external framework owns the display
+#endif
 #if BOARD_TOUCH_FT3168
 #include "Arduino_DriveBus_Library.h"
 #endif
 #include "lv_conf.h"
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/HWCDC.h"   // USBSerial wrapper over the core's Serial (adds printf)
+#else
 #include "HWCDC.h"
+#endif
 #include <WiFi.h>  // notification fetch
+#if BOARD_PLATFORM_TUYA
+/* TuyaOpen's WiFi.status() returns WF_STATION_STAT_E (WSS_*); the firmware compares
+ * against WL_CONNECTED ("online with an IP"), which is WSS_GOT_IP on TuyaOpen. */
+#ifndef WL_CONNECTED
+#define WL_CONNECTED WSS_GOT_IP
+#endif
+#endif
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/HTTPClient.h"   // ESP32 HTTPClient surface over the Tuya http client
+#else
 #include <HTTPClient.h>
+#endif
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/Preferences.h"  // NVS-equivalent backed by tal_kv (persists across reboots)
+#else
 #include <Preferences.h>  // NVS key-value storage (persists across reboots)
+#endif
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_sleep.h"   // deep sleep -> tkl_cpu_sleep_mode_set + tkl_wakeup
+#include "tuya/compat/esp_system.h"  // esp_reset_reason()/esp_restart() -> tkl_system_*
+#else
 #include <esp_sleep.h>    // deep sleep + timer wake
 #include <esp_system.h>   // esp_reset_reason() — on-screen boot-cause banner
+#endif
 // (RTC-GPIO / EXT0 wake config now lives in board_sleep.h)
 #include "device_info.h"    // product name / version / author — used by About + boot log
 
@@ -81,11 +106,17 @@
  * sd_rail_diag() code + the 07_LVGL_SD_Test example folder are kept for re-testing.) */
 #define SD_RAIL_DIAG 0
 
+/* DEV: seed synthetic sleep data. Set to 1, flash, and the watch OVERWRITES /sleep.csv
+ * with 30 varied nights at boot so the Sleep app's data screens (history list + per-night
+ * graph) can be tested without sleeping for real. Set back to 0 and flash to resume real
+ * logging. WARNING: while it's 1, any real recorded sleep data is wiped each boot. */
+#define SLEEP_TEST_DATA 0
+
 /* ===================== NTP time sync config ==============================
  * NTP returns UTC; NTP_TZ converts it to LOCAL wall-clock time (and handles DST
- * automatically). The current value is Central European Time (UTC+1, DST +2) —
- * change it if you're in a different zone. POSIX TZ format:
- *   CET-1CEST,M3.5.0,M10.5.0/3  => base UTC+1, summer UTC+2, DST Mar/Oct.
+ * automatically). Current value = SWEDEN / Europe-Stockholm (Central European Time,
+ * UTC+1 winter, UTC+2 CEST summer) — change it if you're in a different zone. POSIX TZ:
+ *   CET-1CEST,M3.5.0,M10.5.0/3  => base UTC+1, summer UTC+2, DST last-Sun-Mar..last-Sun-Oct.
  * (US Eastern would be "EST5EDT,M3.2.0,M11.1.0".) We re-sync at most every
  * NTP_SYNC_INTERVAL_S to keep radio time minimal. */
 #define NTP_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
@@ -93,20 +124,47 @@
 #define NTP_SERVER2 "time.nist.gov"
 #define NTP_SYNC_INTERVAL_S (6UL * 3600UL)   // re-sync every 6 hours
 
+/* T5 SNTP test switch. The custom UDP SNTP client is new and runs on the WiFi connect.
+ * Set to 0 to DISABLE it (WiFi still connects; the battery-backed PCF85063 keeps time) to
+ * confirm whether SNTP is the cause of a WiFi-connect panic. 1 = SNTP enabled. */
+#ifndef OWF_TUYA_SNTP_ENABLE
+#define OWF_TUYA_SNTP_ENABLE 1
+#endif
+
 HWCDC USBSerial;
 
-#if BOARD_DISPLAY_CO5300_QSPI
-/* ---- Display: CO5300 over QSPI (Waveshare's exact construction) ----------- */
+#if BOARD_DISPLAY_AMOLED_QSPI
+/* ---- Display: QSPI AMOLED (Waveshare's exact construction) -----------------
+ * Two panels share this path — CO5300 (S3-2.06) and SH8601 (S3-1.8 HW V1). The
+ * BUS and the flush plumbing are identical; only the panel class and its
+ * offsets differ, so just the `new` below is per-panel. */
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   LCD_CS /* CS */, LCD_SCLK /* SCK */, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
 
-/* Keep a CO5300-typed pointer too: setBrightness() lives on Arduino_CO5300, not
- * the Arduino_GFX base class, so we need the derived type to call it. Both point
- * at the same object. */
-Arduino_CO5300 *co5300 = new Arduino_CO5300(
-  bus, LCD_RESET, 0 /* rotation */, LCD_WIDTH, LCD_HEIGHT,
+/* Keep a PANEL-typed pointer too: setBrightness() and writeAddrWindow() live on
+ * the derived class (Arduino_OLED/Arduino_TFT), not the Arduino_GFX base, so we
+ * need the derived type to call them. Both point at the same object.
+ * OwfAmoled is the concrete class for this board; `amoled` is what the rest of
+ * the firmware uses, so panel-neutral code never names CO5300 or SH8601. */
+#if BOARD_DISPLAY_CO5300_QSPI
+typedef Arduino_CO5300 OwfAmoled;
+#else
+typedef Arduino_SH8601 OwfAmoled;
+#endif
+/* Reset pin: boards that break one out define LCD_RESET; the S3-1.8 does not
+ * (deliberately — see the note in its board header: a defined-but-negative pin
+ * macro would satisfy every "#ifdef LCD_RESET" guard and then feed -1 to a GPIO
+ * API). Arduino_TFT wants GFX_NOT_DEFINED in that case, and that constant is an
+ * Arduino_GFX one, so it is spelled HERE where the library is in scope. */
+#if BOARD_LCD_HAS_RESET
+#define OWF_LCD_RST LCD_RESET
+#else
+#define OWF_LCD_RST GFX_NOT_DEFINED
+#endif
+OwfAmoled *amoled = new OwfAmoled(
+  bus, OWF_LCD_RST, 0 /* rotation */, LCD_WIDTH, LCD_HEIGHT,
   LCD_COL_OFFSET1, LCD_ROW_OFFSET1, LCD_COL_OFFSET2, LCD_ROW_OFFSET2);
-Arduino_GFX *gfx = co5300;
+Arduino_GFX *gfx = amoled;
 
 /* Bus-typed pointer for the async flush: writePixelsBeAsync()/waitAsync() are
  * LOCAL PATCH additions on Arduino_ESP32QSPI, not the Arduino_DataBus base. */
@@ -117,22 +175,60 @@ Arduino_ESP32QSPI *qspi_bus = static_cast<Arduino_ESP32QSPI *>(bus);
  * panel needs the vendor register-init table after begin() — jd9853_reg_init()
  * in display_jd9853.h, taken from Waveshare's C6-1.47 demo. ----------------- */
 /* MISO passed so the shared SPI bus enables it for the microSD card (the JD9853
- * itself is write-only). Without it SD reads fail -> SD won't mount. */
-Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, LCD_MISO);
+ * itself is write-only). Without it SD reads fail -> SD won't mount.
+ *
+ * Arduino_ESP32SPIDMA (NOT Arduino_HWSPI): the GFX library's IDF-spi_master DMA bus.
+ * It owns the FSPI host (spi_bus_initialize), and the microSD attaches as a SECOND
+ * device on that same host via the IDF sdspi driver (see sd_card.h) — NOT via Arduino
+ * SPIClass, which would try to spi_bus_initialize() the host a second time and reboot.
+ * Crucially this enables writePixelsAsync(): the JD9853 flush queues the tile as DMA
+ * and RETURNS, so the single C6 core renders the next tile while the wire drains
+ * (my_disp_flush async branch). is_shared_interface=false so beginWrite() doesn't
+ * acquire the bus per-write (the queued async API is incompatible with a held bus);
+ * begin() also drops the permanent acquire, and the IDF arbitrates the LCD vs SD
+ * device per-transaction. */
+Arduino_DataBus *bus = new Arduino_ESP32SPIDMA(
+  LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, LCD_MISO, FSPI, false /* don't hold the bus */);
 Arduino_GFX *gfx = new Arduino_ST7789(
   bus, LCD_RESET, 0 /* rotation */, false /* IPS */, LCD_WIDTH, LCD_HEIGHT,
   LCD_COL_OFFSET1, LCD_ROW_OFFSET1, LCD_COL_OFFSET2, LCD_ROW_OFFSET2);
+
+/* Bus-typed pointer for the async flush: writePixelsAsync()/waitAsync() are LOCAL
+ * additions on Arduino_ESP32SPIDMA, not the Arduino_DataBus base. */
+Arduino_ESP32SPIDMA *spidma_bus = static_cast<Arduino_ESP32SPIDMA *>(bus);
+/* TFT-typed pointer too: writeAddrWindow() lives on Arduino_TFT (Arduino_ST7789's
+ * base), not Arduino_GFX. The async flush sets the window then queues pixels itself. */
+Arduino_TFT *spidma_tft = static_cast<Arduino_TFT *>(gfx);
 #include "display_jd9853.h"
+
+#elif BOARD_DISPLAY_GC9A01_SPI
+/* ---- Display: GC9A01 240x240 ROUND LCD over classic SPI (custom Super Mini build).
+ * Same SPI-DMA bus + async-flush plumbing as the JD9853 path above (Arduino_TFT /
+ * spidma_tft), just a different panel driver. Unlike the JD9853, the GC9A01 runs its
+ * FULL init inside begin() — there is NO vendor register table to apply afterward, so
+ * no display_*.h include here. Write-only panel: LCD_MISO is -1 (no SD on this bus). */
+Arduino_DataBus *bus = new Arduino_ESP32SPIDMA(
+  LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, LCD_MISO, FSPI, false /* don't hold the bus */);
+Arduino_GFX *gfx = new Arduino_GC9A01(
+  bus, LCD_RESET, 0 /* rotation */, true /* IPS */, LCD_WIDTH, LCD_HEIGHT,
+  LCD_COL_OFFSET1, LCD_ROW_OFFSET1, LCD_COL_OFFSET2, LCD_ROW_OFFSET2);
+
+Arduino_ESP32SPIDMA *spidma_bus = static_cast<Arduino_ESP32SPIDMA *>(bus);
+Arduino_TFT *spidma_tft = static_cast<Arduino_TFT *>(gfx);
 #endif
 
 /* Board-neutral brightness (0-255). CO5300: panel command. JD9853: PWM backlight
  * (analogWrite = LEDC on the ESP32 cores). All UI code calls this, never the
  * panel object directly. */
 static inline void board_display_set_brightness(uint8_t b) {
-#if BOARD_DISPLAY_CO5300_QSPI
-  co5300->setBrightness(b);
+#if BOARD_DISPLAY_AMOLED_QSPI
+  amoled->setBrightness(b);   // panel command 0x51 (CO5300 and SH8601 alike)
 #elif BOARD_HAS_BACKLIGHT_PWM
   analogWrite(LCD_BL, b);
+#elif BOARD_PLATFORM_MAIX
+  owf_maix_set_backlight((int)b * 100 / 255);   // firmware uses 0..255; MaixCDK wants 0..100
+#elif BOARD_PLATFORM_TUYA
+  owf_tuya_set_backlight((int)b * 100 / 255);   // firmware uses 0..255; TuyaOpen display wants 0..100
 #endif
 }
 
@@ -143,6 +239,12 @@ static inline void board_display_set_brightness(uint8_t b) {
  * is built). gfx->begin() must have run (it has, at this point in setup).
  * Board-neutral: shown on both the S3 (AXP2101 gauge) and C6 (ADC). */
 static void low_batt_splash(uint16_t hold_ms) {
+#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA
+  /* Raw Arduino_GFX panel draw — no gfx object when an external framework owns the
+   * panel (Maix/Tuya). A LVGL low-battery splash can replace this later; for now it's
+   * a no-op (the low-batt path still proceeds). */
+  (void)hold_ms;
+#else
   const int W = gfx->width(), H = gfx->height();
   gfx->fillScreen(RGB565_BLACK);
 
@@ -167,6 +269,7 @@ static void low_batt_splash(uint16_t hold_ms) {
   delay(hold_ms);
   board_display_set_brightness(0);                 // backlight off before sleep
   gfx->fillScreen(RGB565_BLACK);
+#endif  /* gfx splash - skipped when Maix/Tuya owns the panel */
 }
 
 #if BOARD_TOUCH_FT3168
@@ -191,10 +294,20 @@ void Arduino_IIC_Touch_Interrupt(void) {
 /* ---- Touch: AXS5106L over I2C (Waveshare bsp_touch helper library) -------- */
 #include "esp_lcd_touch_axs5106l.h"
 static volatile bool s_touch_activity = false;   // set whenever a finger is seen
+#else  /* BOARD_TOUCH_MAIX — MaixCDK owns the touch indev; keep the loop's idle-refresh flag */
+static volatile bool s_touch_activity = false;
 #endif
+
+/* Set on a BOOT-button press edge; consumed in loop() to force-undim the panel (self-heals a
+ * dropped un-dim brightness write). Tuya-only use, but declared unconditionally to keep the
+ * BOOT handler branch-free. */
+static volatile bool s_boot_activity = false;
 
 /* ---- RTC: board-neutral wrapper (PCF85063 on the S3-2.06 board) ---------- */
 #include "board_clock.h"
+
+/* ---- Step counter: QMI8658 hardware pedometer (both boards) -------------- */
+#include "imu_steps.h"
 
 /* ---- PMU / battery: board-neutral wrapper (AXP2101 on the S3-2.06 board) -- */
 #include "board_power.h"
@@ -236,6 +349,19 @@ static void enter_power_off(void);
 static inline void i2c_lock(void);
 static inline void i2c_unlock(void);
 
+// Defined next to watchface_present() (far below); the alarm overlay (app_timer.h,
+// included at ~L546) calls it to FLUSH itself to the glass before it kicks off the
+// blocking audio bring-up — so a timer/alarm that fires on the first loop after a
+// deep-sleep cold boot paints fully instead of freezing half-drawn. Forward-declared
+// here so app_timer.h can see it.
+static void ui_pump_frame(int frames);
+
+// Global haptic click feedback: one indev-level LV_EVENT_CLICKED hook gives a tiny
+// buzz on EVERY clickable widget, instead of relying on per-call-site haptics_pulse()
+// (which only covered ~half the buttons). Defined after the loop helpers (needs LVGL);
+// registered once in setup() after the display/indev are up. No-op without a motor.
+static void haptics_attach_click_feedback(void);
+
 /* Shared low-battery cutoff decision (both boards). Returns true once the CELL
  * voltage has sat below BATT_CUTOFF_MV for `need` consecutive calls with no USB
  * power present — the caller then shows the splash + powers off.
@@ -251,7 +377,10 @@ static inline void i2c_unlock(void);
  * function-local static. `need` lets the boot/wake one-shots require fewer polls. */
 static bool board_low_batt_cutoff_check(uint8_t need) {
   static uint8_t strikes = 0;
-  if (board_usb_powered()) { strikes = 0; return false; }   // plugged in -> never cut off
+  // T5 note: the divider ratio is now calibrated against a multimeter (4.20 V real), and
+  // board_usb_powered() reads the real BAT_CHG pin (GPIO30) - so the cutoff is trustworthy
+  // and correctly inhibited while charging. (Was temporarily disabled during ADC bring-up.)
+  if (board_usb_powered()) { strikes = 0; return false; }   // plugged in/charging -> never cut off
   i2c_lock();                                       // shared bus (no-op before mutex exists)
   uint16_t cell = board_batt_voltage_mv();
   i2c_unlock();
@@ -272,6 +401,8 @@ static inline bool board_low_batt_should_cutoff(void) {
 // until this is set.
 static bool s_display_ready = false;
 static uint32_t lastActivityMs = 0;          // reset on any touch
+// (The old T5 screen-off light-sleep state — s_tuya_screen_off + the sleep-moment activity
+// snapshots — is REMOVED: T5 sleep is real deep sleep only now, and waking is a reboot.)
 
 /* True if THIS boot was woken by a BOOT press (EXT0). That same press is still
  * held LOW as the loop starts; we swallow it so the wake press only wakes the
@@ -359,27 +490,37 @@ static uint32_t lastMillis = 0;
  * HERE: after the hardware objects (co5300 / rtc / power / WiFi) they drive, and
  * before the watch-face UI + menu below that consume them. ORDER MATTERS:
  *   watch_base.h    — mutexes + shared RTC-session globals (first; others use it)
- *   settings_store.h— owns `prefs`; drives co5300/CPU/WiFi
+ *   settings_store.h- owns `prefs`; drives co5300/CPU/WiFi
  *   power_model.h   — reads settings globals + rtc + i2c_lock
  *   wifi_store.h    — uses `prefs` + the WIFI_SSID/WIFI_PASS macros above
  *   notif_store.h   — uses `prefs` + store_lock */
 #include "watch_base.h"
 #include "player_state.h"      // source-agnostic Now Playing state (fed by AMS/HTTP/Android)
 #include "cpu_usage.h"         // power-safe per-core CPU usage estimate (idle-hook based; for the Power app)
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
 #include "core_voltage.h"      // EXPERIMENTAL core (dig_dbias) undervolt — default OFF, see it's header
 #include "clocks.h"            // read-only clock-tree dump (observability for the overclock work)
 #include "overclock.h"         // EXPERIMENTAL CPU overclock (>240 MHz) — default OFF, see it's header
+#elif BOARD_PLATFORM_MAIX
+#include "esp_clk_stubs.h"     // Maix: SoC-register clock/voltage modules stubbed (no MCU clock tuning)
+#else
+#include "tuya/compat/esp_clk_stubs.h"  // Tuya: same SoC-register modules stubbed (no MCU clock tuning)
+#endif
 #include "settings_store.h"
 #include "power_model.h"
 #include "haptics.h"          // vibration motor (GPIO18) — non-blocking pattern player
 #define AUDIO_SMALL_SPEAKER 0 // 1 = THIS if watch has the tiny in-ear speaker mod (full drive).
                               // Set to 0 (or delete) when building for a stock watch — the
                               // original speaker clips and can be damaged at full drive!
-#include "audio_alarm.h"      // alarm chime: ES8311 codec + speaker amp (synthesized, no files)
+#include "audio_alarm.h"      // alarm chime + ding (synthesized, no files): backend per board —
+                             // ES8311 I2S (S3), LEDC PWM beeper, or T5 internal codec + NS4150B
 #include "sd_card.h"          // shared microSD mount (SDMMC on S3-2.06, SPI on C6-1.47); board-neutral sd_fs()
 #include "storage_fs.h"       // pick SD-if-present-else-FFat for ALL persistent files
 #include "timer_store.h"      // countdown timer + alarm clocks (rtc_now_epoch, prefs,
                               // alarms.csv via store_fs — hence AFTER storage_fs.h)
+#include "sleep_track.h"      // Sleep-mode session: IMU movement logging to sleep.csv
+                              // (needs imu_steps + store_fs; consumed by sleep_power.h
+                              // background check + app_sleep.h — so BEFORE both)
 /* Optional SD trend-logger for battery health — MUST follow power_model.h, which
  * forward-declares batt_health_sd_log(); this defines it. Degrades to a no-op if
  * no SD card is present (the NVS running-average health is unaffected). */
@@ -388,7 +529,16 @@ static uint32_t lastMillis = 0;
 #include "notif_store.h"
 #include "notif_archive_sd.h"   // unlimited notification history on SD (CSV); flash is the newest-32 cache
 #include "notif_icons.h"        // per-category notification icons (MDI font; built-in fallback)
+#if BOARD_HAS_BLE
 #include "ble_provision.h"      // BLE peripheral: encrypted WiFi provisioning + find-phone (lazy; off in sleep)
+#elif BOARD_PLATFORM_TUYA
+#define BLE_TUYA_HAVE_ANCS 1    // Phase B: suppress ble_tuya.h/ble_notif_flags_tuya.h's inert ANCS
+                                // stubs; the real client (tuya/ble_ancs_tuya.h) is included after
+                                // the notif store below. Needs the SM-enabled libtuyaos.a rebuild.
+#include "tuya/ble_tuya.h"      // Tuya T5 BLE peripheral on the raw NimBLE host: advertise + pair + NUS server + bonds
+#else
+#include "ble_compat_stubs.h"   // BLE-less Maix build: no-op public BLE API (provisioning + ANCS hooks)
+#endif
 
 /* Rail-probe read accessors + recalibrate, used by the Power screen (app_power.h).
  * Defined later in this .ino next to the sleep code; forward-declared here so the
@@ -418,10 +568,14 @@ static uint8_t      rails_cut_count(void);
 #include "app_notifications.h"
 #include "app_player.h"         // Now Playing (reads player_state; AMS/HTTP/Android feed it)
 #include "quick_shade.h"        // pull-down brightness shade (uses settings_get/set_brightness)
+#include "button_nav.h"         // UP/DOWN/SELECT physical-button navigation (BOARD_HAS_NAV_BUTTONS only;
+                                // whole file preprocesses away on touch boards)
 #include "app_appearance.h"     // accent-color picker (uses quick_shade_restyle + ui_accent_*)
 #include "app_timer.h"          // Timer + Stopwatch + alarm overlay (uses timer_store + haptics)
 #include "app_find_phone.h"     // Find My Phone: ring the paired phone (uses ble_ping_phone)
 #include "app_files.h"          // Files: on-device browser for FFat + SD (view/delete/space)
+#include "app_fitness.h"        // Fitness: step counter (uses imu_steps + i2c_lock)
+#include "app_sleep.h"          // Sleep: sleep-quality tracking + DND (uses sleep_track)
 
 /* BOOT button: BOOT_BTN_GPIO comes from the board header. While the watch is
  * running we can read it as a normal input (LOW = pressed, it has a pull-up).
@@ -442,6 +596,16 @@ static lv_obj_t *notif_card = nullptr;
 static lv_obj_t *notif_title = nullptr;
 static lv_obj_t *notif_body = nullptr;
 
+/* Tap-on-card dismiss. The ESP32 boards also dismiss on ANY touch from their raw
+ * touch callbacks in my_touchpad_read() — but the Tuya T5 uses its own LVGL indev
+ * (CST92xx via the port), so that path never runs there and the card could NEVER
+ * be dismissed. An LVGL event on the card itself works on every board. */
+static void notif_dismiss(void);   // defined below
+static void notif_card_click_cb(lv_event_t *e) {
+  (void)e;
+  notif_dismiss();
+}
+
 static void notif_card_create(void) {
   lv_obj_t *scr = lv_scr_act();
   notif_card = lv_obj_create(scr);
@@ -451,6 +615,7 @@ static void notif_card_create(void) {
   lv_obj_set_style_border_width(notif_card, 0, 0);  // no border
   lv_obj_set_style_radius(notif_card, 16, 0);
   lv_obj_clear_flag(notif_card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(notif_card, notif_card_click_cb, LV_EVENT_CLICKED, nullptr);
 
   notif_title = lv_label_create(notif_card);
   lv_obj_set_style_text_font(notif_title, &FONT_LABEL, 0);
@@ -518,12 +683,19 @@ static void notif_dismiss(void) {
  * The deep-sleep light-check path below calls notif_fetch_raw, so it must be
  * included here, before setup()/loop(). */
 #include "notif_net.h"
+#if BOARD_HAS_BLE
 #include "ble_ancs.h"           // ANCS client: iPhone notifications over BLE -> the same store.
 #include "ble_player_ams.h"     // AMS client: iPhone media (now-playing + controls) -> the Player.
                                 // Included here (after notif_store/archive/net) because it feeds
                                 // notif_store_add / na_append / s_pop_* and is called by ble_provision.h.
 #include "ble_gadgetbridge.h"   // Gadgetbridge server: ANDROID notifications (Bangle.js protocol)
                                 // -> the same store + the same s_pop_*/dirty handoff as ANCS.
+#elif BOARD_PLATFORM_TUYA
+#include "tuya/ble_notif_flags_tuya.h"   // shared store->loop flags + ancs_take_* accessors (ANCS + Gadgetbridge feed them)
+#include "tuya/ble_gadgetbridge_tuya.h"  // Gadgetbridge server (Android) over the NUS chars defined in ble_tuya.h
+#include "tuya/ble_ancs_tuya.h"          // ANCS client (iPhone) on the raw NimBLE host -> the same store +
+                                         // s_pop_*/dirty handoff. AMS (media) is still a stub in this file.
+#endif  /* BOARD_HAS_BLE - Maix uses the no-op ancs hooks from ble_compat_stubs.h above */
 
 /* Read the PMU and update the status row. Shows VBUS (charging input) voltage
  * while charging, otherwise the battery voltage. Returns true if anything
@@ -543,7 +715,15 @@ static bool refresh_battery(void) {
   i2c_lock();   // shared bus
   int pct = board_batt_percent();
   bool chg = board_is_charging();
+  // Voltage shown in the corner readout. On a PMU board while charging, show the USB
+  // INPUT voltage (the gauge reads the system rail, not the raw cell). On the ADC
+  // board there's no separate VBUS rail to read and the cell voltage IS measurable
+  // (just pulled high by the charger), so always show the measured battery voltage.
+#if BOARD_HAS_ADC_BATTERY
+  uint16_t mv = board_batt_voltage_mv();
+#else
   uint16_t mv = chg ? board_vbus_voltage_mv() : board_batt_voltage_mv();
+#endif
   i2c_unlock();
 
   // Low-battery protective cutoff. The S3's AXP2101 also has its own hardware
@@ -558,7 +738,19 @@ static bool refresh_battery(void) {
     enter_power_off();                      // does not return
   }
 
-  drain_update(pct, chg);   // feed the %/hour tracker (runs even if display unchanged)
+  // Reflect the live BLE radio state into the power model (ble_provision.h is
+  // included after power_model.h, so the model can't call ble_is_up() itself — we
+  // push the flag here, mirroring how the WiFi path sets s_wifi_active). BLE up =
+  // advertising or connected, both of which add the measured radio draw.
+  s_ble_active = ble_is_up() ? 1 : 0;
+
+  // Feed the %/hour tracker + capacity learner (runs even if display unchanged).
+  // Pass the measured CELL voltage so the learner can cross-check coulomb-% against
+  // voltage-SoC. When NOT charging, `mv` (read above, inside the I2C lock) IS the
+  // cell voltage on both the PMU and ADC paths; when charging it's VBUS, so pass 0
+  // to disable the cross-check (the learner self-gates on charging anyway). Reusing
+  // `mv` avoids a second, UNLOCKED getBattVoltage() race on the shared I2C bus.
+  drain_update(pct, chg, chg ? 0 : mv);
 
   // Report battery to a connected phone (BAS notify + Gadgetbridge status line) on
   // any %/charger change, plus ONCE per connection — delayed ~3s past connect so it
@@ -639,6 +831,7 @@ static bool s_flush_async = false;
 /* Glyph-buffer allocator for LVGL's FONT draw-buf handlers (hooked in setup —
  * see the comment there). lv_draw_buf_handlers_t's fields live in a private
  * header; including it is fine, the lib is vendored in this repo. */
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA   /* glyph font-handler tuning: LVGL-internal + ESP-patch APIs; unused when an external framework (Maix/Tuya) owns LVGL */
 #include <draw/lv_draw_buf_private.h>
 static void *glyph_buf_malloc(size_t size, lv_color_format_t cf) {
   (void)cf;
@@ -655,6 +848,13 @@ static void glyph_buf_free(void *p) {
  * 63k times/10s for a few hundred distinct glyphs. Init from setup() while
  * still single-threaded; before init the cache is a transparent no-op. */
 extern "C" void lv_font_fmt_txt_glyph_cache_init(void);
+#endif  /* glyph font-handler tuning - excluded when Maix/Tuya owns LVGL */
+
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+/* The firmware's own panel flush + touch read. When an external framework owns LVGL
+ * (Maix: MaixCDK lvgl_init; Tuya: the SDK lv_vendor task - both create the LVGL
+ * display/indev), and the Arduino_GFX `gfx`/SPI-bus objects don't exist, so this whole
+ * block (down to my_touchpad_read) compiles out. */
 
 /* SPI transfer-done -> hand the buffer back to LVGL. INTERRUPT context: this runs
  * from the SPI master ISR after the tile's last DMA segment. lv_disp_flush_ready
@@ -663,13 +863,106 @@ static void flush_done_cb(void *arg) {
   lv_disp_flush_ready((lv_display_t *)arg);
 }
 
+#if BOARD_SD_SHARES_LCD_BUS
+/* CROSS-TASK display<->SD arbitration mutex (C6 shared SPI host). The drain/sync_only
+ * handshake below is only sound if the SD op and the display flush can't run at the same
+ * time — but SD writes also come from the BLE host task and the net task (notification
+ * archive na_append, wifi_store), not just the loop task. Without a real lock, an SD
+ * transaction can hit the bus BETWEEN the flush's polling addr-window commands while the
+ * panel CS is held LOW by raw GPIO -> the panel clocks in SD traffic -> its address window
+ * desyncs -> persistent "sliced/garbled lines" that survive leaving the screen (seen on
+ * alarm-create and sleep-night, the screens that mix SD I/O with heavy redraws).
+ * RECURSIVE: sd_bus_lock() nests (open->read->close), and my_disp_flush's guard must not
+ * self-deadlock against display_bus_drain(). Static so it exists before any task runs. */
+static StaticSemaphore_t s_dispsd_mtx_buf;
+static SemaphoreHandle_t s_dispsd_mtx = xSemaphoreCreateRecursiveMutexStatic(&s_dispsd_mtx_buf);
+struct DispBusGuard {
+  DispBusGuard()  { xSemaphoreTakeRecursive(s_dispsd_mtx, portMAX_DELAY); }
+  ~DispBusGuard() { xSemaphoreGiveRecursive(s_dispsd_mtx); }
+};
+#endif
+
+/* Drain any in-flight async display DMA so the SPI bus is idle. No-op on boards without the
+ * async SPIDMA path. */
+void display_bus_drain(void) {
+#if BOARD_DISPLAY_SPIDMA
+#if BOARD_SD_SHARES_LCD_BUS
+  DispBusGuard g;   // serialize against a concurrent flush/SD op on another task
+#endif
+  if (s_flush_async && spidma_bus) spidma_bus->waitAsync();
+#endif
+}
+
+/* SD<->display HYBRID flush gate (C6 shared SPI host). The microSD shares the display's SPI
+ * host; the display's async DMA path (queued transfers + raw-GPIO CS) corrupts when the SD
+ * device coexists. So while ANY SD I/O is in progress, the display must flush SYNCHRONOUSLY
+ * (blocking, no queued DMA in flight); the rest of the time it stays async for the FPS win.
+ * The SD layer brackets every op with sd_bus_lock()/unlock(); lock() drains the current
+ * in-flight tile then enters sync mode, unlock() (when the count returns to 0) restores async.
+ * Counted because one fs call nests (open->read->close). spidma_bus->set_sync_only() flips the
+ * library's mode flag so writePixelsAsync() falls back to the blocking path. */
+static volatile int s_sd_bus_held = 0;
+void sd_bus_lock(void) {
+#if BOARD_SD_SHARES_LCD_BUS
+  // Take the cross-task mutex FIRST: if the loop task is mid-flush (CS low, polling the
+  // addr window or queuing the tile DMA), this blocks until that whole bracket is done.
+  // Held until the matching sd_bus_unlock(), so no flush can start mid-SD-op either.
+  xSemaphoreTakeRecursive(s_dispsd_mtx, portMAX_DELAY);
+  if (s_sd_bus_held == 0 && spidma_bus) {
+    spidma_bus->waitAsync();        // finish the queued tile already on the wire
+    spidma_bus->forceCsIdle();      // belt-and-braces: panel MUST be deaf during SD traffic
+    spidma_bus->set_sync_only(true); // sync-only: display flushes block + acquire the IDF bus
+  }
+  s_sd_bus_held++;
+#endif
+}
+void sd_bus_unlock(void) {
+#if BOARD_SD_SHARES_LCD_BUS
+  if (s_sd_bus_held > 0 && --s_sd_bus_held == 0 && spidma_bus) {
+    // Re-latch the display's bus config NOW, while both CS lines are HIGH. Without this,
+    // the IDF reconfigures the bus (SD 20 MHz -> LCD 80 MHz) at the start of the display's
+    // FIRST transaction after the SD op — which happens with the panel CS already LOW (raw
+    // GPIO, lowered in beginWrite before the transaction), so any reconfig glitch on SCLK
+    // is clocked into the panel and shifts its command stream => corrupted address window
+    // => the sliced/garbled lines. One dummy byte here makes the switch happen while
+    // nobody is listening. Done BEFORE releasing the mutex so no flush can interleave.
+    spidma_bus->resyncBus();
+    spidma_bus->set_sync_only(false);   // SD done -> async allowed again
+  }
+  xSemaphoreGiveRecursive(s_dispsd_mtx);
+#endif
+}
+
+#if BOARD_SD_SHARES_LCD_BUS
+// Set when a flush had to be dropped (SD held the bus). The loop repaints the whole screen
+// once rendering is over — invalidating from INSIDE the flush callback (mid-refresh) mutates
+// LVGL's dirty-area list while it's being walked, which itself garbles output.
+static volatile bool s_flush_dropped = false;
+#endif
+
 static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_map) {
 #ifndef DIRECT_RENDER_MODE
   uint32_t w = lv_area_get_width(area), h = lv_area_get_height(area);
+#if BOARD_SD_SHARES_LCD_BUS
+  // Serialize the ENTIRE flush bracket (drain, addr-window polling with raw-GPIO CS low,
+  // async queue / blocking write) against SD ops from ANY task. RAII: released on every
+  // return path. An async tile still on the wire after we return is fine — sd_bus_lock()
+  // drains it under this same mutex before the SD touches the bus.
+  DispBusGuard bus_guard;
+  // HARD GATE: while SD I/O owns the shared SPI host, the display must issue NO bus traffic at
+  // all (sync OR async both corrupt against the SD device). With the mutex above this should
+  // be unreachable (belt and braces); defer the repaint to the loop instead of invalidating
+  // mid-refresh.
+  if (s_sd_bus_held > 0) {
+    s_flush_dropped = true;
+    lv_disp_flush_ready(d);
+    return;
+  }
+#endif
 #if CPU_PROFILE_SERIAL
   uint32_t f0 = micros();
 #endif
-#if BOARD_DISPLAY_CO5300_QSPI   /* async DMA flush is a QSPI LOCAL-PATCH feature */
+#if BOARD_DISPLAY_AMOLED_QSPI   /* async DMA flush is a QSPI LOCAL-PATCH feature */
   if (s_flush_async) {
     // ASYNC: send the address window (sync commands — these drain any still-in-
     // flight previous tile, which is exactly the pipelining handshake), queue the
@@ -685,7 +978,7 @@ static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_ma
     uint32_t f1 = micros(); s_fl_swap_us += (uint32_t)(f1 - f0);
 #endif
     gfx->startWrite();
-    co5300->writeAddrWindow(area->x1, area->y1, w, h);
+    amoled->writeAddrWindow(area->x1, area->y1, w, h);
 #if CPU_PROFILE_SERIAL
     uint32_t f2 = micros(); s_fl_addr_us += (uint32_t)(f2 - f1);
 #endif
@@ -708,7 +1001,58 @@ static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_ma
     lv_draw_sw_rgb565_swap(px_map, w * h);
     gfx->endWrite();
   }
-#endif  /* BOARD_DISPLAY_CO5300_QSPI */
+#endif  /* BOARD_DISPLAY_AMOLED_QSPI */
+#if BOARD_DISPLAY_SPIDMA    /* JD9853 / GC9A01: async DMA flush via Arduino_ESP32SPIDMA */
+  if (s_flush_async) {
+    // ASYNC: set the address window (sync polling commands — leaves DC HIGH / CS LOW),
+    // then QUEUE the pixels as DMA and RETURN. The single C6 core renders the next tile
+    // while this one clocks out; CS is raised and lv_disp_flush_ready() fired from the
+    // SPI transfer-done ISR (flush_done_cb).
+    //
+    // Drain the PREVIOUS tile's DMA FIRST: writeAddrWindow() below issues POLLING
+    // transactions, which the IDF spi_master forbids while queued (interrupt) transfers
+    // are still pending on the bus. Draining here (not inside writePixelsAsync, which
+    // runs after the addr window) keeps the polling addr-window legal. It also fences
+    // the bus before the SD card (2nd device on this host) can be touched.
+    spidma_bus->waitAsync();
+#if FLUSH_RENDER_SWAPPED && LV_DRAW_SW_SUPPORT_RGB565_SWAPPED
+    // LVGL already rendered in LV_COLOR_FORMAT_RGB565_SWAPPED (panel byte order — set in
+    // setup when s_flush_async), so the tile is wire-ready: NO swap pass here. Swapping
+    // again transposes the two RGB565 bytes -> correct B&W but wrong color TONES (the
+    // bug we saw), since 0x0000/0xFFFF are swap-invariant but channel bits move.
+#else
+    // Plain RGB565 render: convert to panel byte order here.
+    lv_draw_sw_rgb565_swap(px_map, w * h);
+#endif
+#if CPU_PROFILE_SERIAL
+    uint32_t f1 = micros(); s_fl_swap_us += (uint32_t)(f1 - f0);
+#endif
+    gfx->startWrite();                                  // beginWrite: DC HIGH, CS LOW (no acquire)
+    spidma_tft->writeAddrWindow(area->x1, area->y1, w, h);  // CASET/RASET/RAMWR, DC ends HIGH
+#if CPU_PROFILE_SERIAL
+    uint32_t f2 = micros(); s_fl_addr_us += (uint32_t)(f2 - f1);
+#endif
+    if (spidma_bus->writePixelsAsync(px_map, w * h * 2, flush_done_cb, d)) {
+#if CPU_PROFILE_SERIAL
+      s_fl_queue_us += (uint32_t)(micros() - f2);
+      s_flush_us += (uint32_t)(micros() - f0);          // CPU-side cost only (swap+addr+queue)
+      s_flush_calls++;
+      s_flush_px += w * h;
+#endif
+      s_lvgl_drew = true;
+      // NO endWrite()/flush_ready here — the DMA-done ISR raises CS and delivers ready.
+      return;
+    }
+    // Too big for ASYNC_MAX_SEG (shouldn't happen at this tile size). The blocking
+    // draw16bitRGBBitmap below expects plain little-endian RGB565 and byte-swaps during
+    // its copy. If we rendered in SWAPPED (BE) format the buffer is BE, so swap it back
+    // to LE first; in plain format it's already LE. Then close the bracket we opened.
+#if FLUSH_RENDER_SWAPPED && LV_DRAW_SW_SUPPORT_RGB565_SWAPPED
+    lv_draw_sw_rgb565_swap(px_map, w * h);
+#endif
+    gfx->endWrite();
+  }
+#endif  /* BOARD_DISPLAY_SPIDMA */
   gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
 #if CPU_PROFILE_SERIAL
   s_flush_us += (uint32_t)(micros() - f0);
@@ -828,8 +1172,23 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   } else {
     data->state = LV_INDEV_STATE_REL;
   }
+#else
+  // No capacitive touch panel (BOARD_TOUCH_BUTTONS, e.g. the Super Mini). This POINTER
+  // indev always reports "released" — navigation comes from the physical UP/DOWN/SELECT
+  // buttons via a SEPARATE encoder/keypad indev (the button-nav input layer, added on
+  // top). Keeping this stub means the shared flush/indev plumbing compiles unchanged.
+  data->state = LV_INDEV_STATE_REL;
 #endif
 }
+#endif  /* firmware-owned panel flush + touch read - excluded when Maix/Tuya owns LVGL */
+
+#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA
+/* No firmware-owned async LCD DMA when an external framework owns the panel (Maix:
+ * MaixCDK; Tuya: the SDK lv_vendor task), so there's nothing to fence. Provided here
+ * because the gated block above (which holds the real one) is compiled out, yet
+ * app_menu.h / sd_card.h still call it. */
+void display_bus_drain(void) {}
+#endif
 
 #if BOARD_LCD_EVEN_ALIGN
 /* CO5300 requires draw areas aligned to even pixel boundaries. (An LVGL display
@@ -852,18 +1211,44 @@ static void rounder_event_cb(lv_event_t *e) {
  * are forward-declared earlier for app_power.h; this defines them. */
 #include "sleep_power.h"
 
+/* The C6 reaches the SD card through the IDF VFS -> FATFS (f_read/f_write) -> sdspi ->
+ * spi_master chain, which is DEEP and stack-hungry, and it all runs on the Arduino loop task
+ * (the same task LVGL renders on). At the default 8 KB loop-task stack, doing real SD file I/O
+ * here — the FFat->SD flush on Sleep stop, and the triple CSV stream when opening a night's
+ * detail — overflowed the stack and crashed (garbled screen + reboot). Give the C6 a larger
+ * loop stack. S3 uses SDMMC (a shorter/different path) and is unaffected, so this is C6-only. */
+#if BOARD_HAS_SD_SPI
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 /* ================================ setup ================================== */
 void setup() {
+#if BOARD_PLATFORM_TUYA
+  // FIRST: latch the soft power supply ON (assert the GPIO19 keep-alive). Without this
+  // the device only stays powered while the PWR button is physically held (on USB, VBUS
+  // hides the issue). Must precede everything else so battery power holds immediately.
+  owf_tuya_power_latch_on();
+#endif
   USBSerial.begin(115200);
   USBSerial.println(DEVICE_NAME " v" DEVICE_VERSION " boot");
+#if BOARD_PLATFORM_TUYA && OWF_T5_DEEP_SLEEP
+  // Deep-sleep PHASE 2: if the previous session requested deep sleep (double-press ->
+  // owf_tuya_deep_sleep_try -> controlled reboot), THIS is the quiet sleep-boot. Arms the
+  // wake buttons/timer AND the GPIO19 power-latch keep-status (so battery power survives the
+  // sleep), then enters deep sleep right here — never returns; the eventual button wake
+  // reboots into a normal setup(). No-op on a normal boot. Must run before any hardware
+  // init so the sleep-boot stays dark and fast.
+  owf_tuya_deep_sleep_boot_check();
+#endif
 
   // Release the wake-time pull hold on the BOOT pin so it works as a normal
   // input again for the menu/sleep press handling below.
   board_wake_release_button();
 
-  // C6: release the deep-sleep holds on the backlight / LCD+touch reset lines (a
-  // timer wake isn't a reset, so they'd otherwise stay latched OFF and block the
-  // panel init below). No-op on the S3.
+  // Release the deep-sleep peripheral holds (a timer wake isn't a reset, so
+  // they'd otherwise stay latched and block the init below). C6: backlight /
+  // LCD+touch reset lines. S3-2.06: the TP_RESET hold — releasing it also gives
+  // the hibernated FT3168 its wake-up reset edge.
   board_release_sleep_isolation();
 
 
@@ -879,7 +1264,12 @@ void setup() {
   // otherwise defer to s_defer_fs_loads, run just after the screen first paints.
   bool light_path = board_woke_from_timer() && s_checks_enabled;
   if (light_path) wifi_nets_load();
-  else            s_defer_fs_loads = true;
+  // ALWAYS defer the slow FS loads to the post-paint block, light path included: the
+  // common "nothing new" light wake sleeps long before that block runs, so it pays
+  // nothing — and the rare light-wake-that-full-boots picks them up there (the
+  // duplicate wifi_nets_load re-read is harmless). This is what keeps the screen-less
+  // wake short: no SD scans on the decide-and-sleep path.
+  s_defer_fs_loads = true;
   // Battery-health running average + learned sleep-floor (NVS — fast). Loaded on all
   // paths so the background wake's drain_update() can keep learning across reboots.
   health_load();
@@ -894,6 +1284,12 @@ void setup() {
   core_selftest_capture_golden();
 #endif
   settings_apply_cpu_mhz(s_cpu_mhz);   // apply saved CPU speed early (affects all paths)
+#if BOARD_PLATFORM_TUYA
+  // Persistent DPLL overclock, if enabled. Gated by a survived-boot flag: if the last
+  // OC boot hung before settings_oc_boot_ok(), this auto-disables it. Applied AFTER the
+  // normal speed so it overrides the divider-based clock with the forced band.
+  settings_oc_boot_apply();
+#endif
 #if UNDERVOLT_CORE_ENABLE
   if (!core_selftest_ok()) {
     core_set_dig_dbias(CORE_DBIAS_STOCK);   // back off to a known-good voltage
@@ -904,6 +1300,15 @@ void setup() {
                      core_dbias_to_mv(core_get_dig_dbias()), s_cpu_mhz);
   }
 #endif
+  // Background-check wake: nothing is drawn or animated — we only poll the server/
+  // iPhone and go straight back to sleep. So run that whole light path at the lowest
+  // CPU clock (CPU_FREQ_LOW = 80 MHz) to save power; the user's saved speed is still
+  // applied above (so the self-test ran at the real worst-case freq) and we drop from
+  // it now. settings_clock_hw() touches only the hardware clock, NOT the saved
+  // s_cpu_mhz, so the user's chosen speed is preserved for the restore below / Power
+  // app. If the check finds something, the full-UI boot restores the user's speed
+  // before any drawing happens. Interactive wakes keep the user's speed throughout.
+  if (light_path) settings_clock_hw(CPU_FREQ_LOW);
   clocks_dump("boot");   // baseline clock state (read-only) — our overclock reference
 
   // EXPERIMENTAL overclock is now BUTTON-triggered (Settings > Power), never at
@@ -914,16 +1319,37 @@ void setup() {
   // Load the stored notification list (needed on the light path too, so the
   // background check appends to the existing history rather than starting fresh).
   notif_store_load();   // NVS-backed list (fast); needed on the light path too
-  // na_seed_total() SCANS the whole SD notification archive — slow. The bell badge
-  // it feeds isn't needed for the first frame, so defer it past first paint on the
-  // interactive path (light path runs it inline below since it sleeps before paint).
-  if (light_path) na_seed_total();
+  // na_seed_total() SCANS the whole SD notification archive — slow. The bell badge it
+  // feeds isn't needed until something PAINTS, so it now lives ONLY in the deferred
+  // post-paint block (s_defer_fs_loads, set above for every path). The light path used
+  // to run it inline here — a full SD mount + archive read on EVERY background wake,
+  // paid even when the check found nothing and went straight back to sleep. If the
+  // check appends a new item before the seed, s_na_total is briefly off by the
+  // pre-seed count; the deferred re-scan reads the true total from disk before the
+  // bell badge repaints, so nothing user-visible ever sees the stale value.
+
+  // If we slept with a ULP session running, tear it down BEFORE Wire.begin(): stop + halt the
+  // ULP, release the RTC-IO it held on GPIO14/15, drop the RTC_PERIPH hold, and fold its data.
+  // MUST precede Wire.begin() — otherwise Wire tries to take GPIO14/15 while they're still
+  // RTC-IO held by the ULP, and touch/battery (same bus) come up dead. Step and sleep have
+  // SEPARATE collect paths; pick by which session was running (s_sleep_running is RTC-backed
+  // and survives the deep-sleep wake).
+  if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+    if (imu_sleep_running()) imu_sleep_ulp_collect();
+    else                     imu_steps_ulp_collect();
+  }
 
   // Bring up I2C + RTC first (cheap, no display) so the background check can use
   // them. Then branch on WHY the ESP32 woke:
   //   TIMER wake          -> scheduled background notification check (light path)
   //   PWR press / power-on -> full interactive UI
-  Wire.begin(IIC_SDA, IIC_SCL);
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] pre-Wire"); USBSerial.flush();
+#endif
+  OWF_WIRE_BEGIN(IIC_SDA, IIC_SCL);
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] post-Wire / pre-power"); USBSerial.flush();
+#endif
   audio_alarm_quiesce_codec();  // ES8311 is on the always-on rail and survives every
                                 // reboot — force it to standby in case a crash mid-ring
                                 // (or older firmware) left its analog blocks powered.
@@ -941,18 +1367,44 @@ void setup() {
   // re-powered rails) stayed dead. A cold power-on works only because the PMU
   // powers up fresh with full settle. MIMIC that: retry begin() until it answers.
   bool pmu_up = board_power_begin();
-  for (int t = 0; !pmu_up && t < 40; t++) {
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] post-power"); USBSerial.flush();
+#endif
+  // Retry until the PMU answers, but BOUND THE TOTAL WALL-CLOCK (not just the iteration
+  // count): with a charger plugged in, the AXP2101 is busy negotiating VBUS/charge and
+  // can NAK I2C for a moment on a deep-sleep wake, so begin() misses a few times. The old
+  // 40-iteration cap, with each miss costing Wire.end()+20ms+a begin() I2C timeout, could
+  // run for seconds — part of the ~5s charger-insertion wake hang. ~600ms is plenty for
+  // the PMU to come ready in every observed case (it normally answers within 1-3 tries);
+  // if it still hasn't, we proceed anyway — rails_restore()/RTC bring-up below re-probe.
+#if BOARD_HAS_PMU_AXP2101
+  // Only meaningful on a board WITH a PMU: retry begin() until the AXP2101 answers.
+  // On no-PMU boards (C6 ADC / Tuya T5) board_power_begin() always returns false, so
+  // this loop would just spin Wire.end()/Wire.begin() for 600ms for nothing (and the
+  // repeated TuyaOpen Wire teardown/re-init can fault) - skip it entirely.
+  uint32_t pmu_t0 = millis();
+  for (int t = 0; !pmu_up && millis() - pmu_t0 < 600; t++) {
     // Re-init the I2C peripheral between tries: a deep-sleep wake can leave the bus
     // controller in a half-state, and re-begin()'ing Wire clears it. Then give the
     // PMU time to come ready before re-probing.
     Wire.end();
     delay(20);
-    Wire.begin(IIC_SDA, IIC_SCL);
+    OWF_WIRE_BEGIN(IIC_SDA, IIC_SCL);
     pmu_up = board_power_begin();
     if (pmu_up) USBSerial.printf("[wake] PMU answered on begin() retry %d\n", t + 1);
   }
+#endif
   USBSerial.printf("[wake] board_power_begin()=%d\n", pmu_up);
-  if (pmu_up) {
+  // DEFER rails_restore() on the light background-check path. That path uses ONLY the
+  // PMU + RTC + radio — all on the never-cut ALDO1 (RTC/I2C supply) — and the display,
+  // touch and SD rails it would otherwise re-power go completely unused before it sleeps
+  // again. rails_restore() is also a ~250-300ms SEQUENCED LDO ramp (one rail at a time
+  // with settles), so skipping it on the common "nothing new" wake removes that awake
+  // time AND avoids powering four peripheral rails for the whole ~radio-check window.
+  // If the check finds a notification and falls through to the full UI boot, rails are
+  // restored there (see the light_path block before display init). A no-op cost on the
+  // rare full-boot-from-timer case: the restore just happens a few hundred ms later.
+  if (pmu_up && !light_path) {
     rails_restore();
     // NOTE: the SD card draws from a peripheral rail that rails_restore() may have
     // just re-enabled, and the first sd_mount() (in wifi_nets_load above) ran before
@@ -974,12 +1426,27 @@ void setup() {
   // works because the AXP2101 brings every rail up in its hardware default sequence
   // with full settle — so MIMIC that: retry the begin(), re-running rails_restore()
   // and waiting between tries, the same way the cold path gives the rail time.
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] pre-clock_begin"); USBSerial.flush();
+#endif
   bool rtc_ok = board_clock_begin();
-  for (int t = 0; !rtc_ok && t < 8; t++) {
-    USBSerial.printf("[rtc] begin() miss %d/8 - re-powering rail + retrying\n", t + 1);
-    if (board_power_ok()) rails_restore();   // re-assert the rail enables (AXP2101 may have NAK'd)
-    delay(50);                                // let the rail/oscillator settle
-    rtc_ok = board_clock_begin();
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] post-clock_begin"); USBSerial.flush();
+#endif
+  // Re-assert the rails AT MOST ONCE if the first RTC probe misses, then poll cheaply.
+  // rails_restore() is a ~250-300ms sequenced LDO ramp — calling it on EVERY miss (the
+  // old behavior) turned a slow-to-answer RTC into a multi-second stall, which is what
+  // made a charger-insertion wake hang ~5s: VBUS insertion keeps the AXP2101 busy so the
+  // RTC (on a PMU rail) is briefly slow, and 8 × (rails_restore + 50ms) compounded. One
+  // re-assert fixes a genuinely NAK'd rail; after that the rail is up and the RTC just
+  // needs its oscillator to settle, so cheap polling (no more LDO ramps) is enough.
+  if (!rtc_ok && board_power_ok()) {
+    USBSerial.println("[rtc] begin() miss - re-asserting rails once, then polling");
+    rails_restore();
+    for (int t = 0; !rtc_ok && t < 10; t++) {   // ~10 × 50ms = up to 0.5s of cheap polling
+      delay(50);                                 // let the rail/oscillator settle
+      rtc_ok = board_clock_begin();
+    }
   }
   if (!rtc_ok) {
     // Still no RTC after retries: don't hang forever (that bricks the wake). Log it
@@ -999,6 +1466,10 @@ void setup() {
   bool wake_timer = board_woke_from_timer();
   // Remember a BOOT wake so the loop swallows that same still-held press.
   s_woke_from_boot = board_woke_from_button();
+  // (Sleep-drain forensics report moved BELOW the RTC/clock restore — calling it here
+  // computed the slept span against the unrestored clock and printed garbage.)
+
+
 
   // On a screen-less BACKGROUND-CHECK wake (RTC timer) we'd wake the radio and
   // keep nibbling an empty cell — so on THAT path only, bail straight to power-off
@@ -1014,6 +1485,8 @@ void setup() {
   if (wake_timer && (timer_is_due() || almclk_is_due())) {
     // The countdown elapsed / the alarm clock's time arrived while asleep: do NOT
     // go back to sleep — fall through to the full UI boot so the loop rings it.
+    // (almclk_load() re-detects the just-passed alarm within ALMC_FIRE_WINDOW_S and the
+    // loop rings it; the wake here just ensures we full-boot instead of sleeping again.)
     USBSerial.println("[wake] timer/alarm-clock due -> full boot");
   } else if (s_checks_enabled && wake_timer) {
     USBSerial.println("[wake] timer -> background check");
@@ -1025,13 +1498,27 @@ void setup() {
     s_check_on_wake = true;
   }
 
+  // We're proceeding to the FULL UI boot. If this was the light path (timer wake), we
+  // SKIPPED rails_restore() above to save power — but a notification/alarm landed and we
+  // fell through to draw, so the display/touch/SD rails must be powered NOW (the panel
+  // reset + settle below assumes live rails). Light wakes that found nothing already
+  // deep-slept inside background_check_has_new() and never reach here, so this only runs
+  // on the (rare) light-wake-that-full-boots and is a no-op on every other path.
+  if (light_path && pmu_up) rails_restore();
+
+  // From here on the screen comes up and we draw/animate, so restore the user's saved
+  // CPU speed. This matters when the light background check (above) found a notification
+  // and fell through to the full UI boot: it ran at CPU_FREQ_LOW, so bump back to
+  // s_cpu_mhz before any rendering. A no-op on every path that never dropped the clock.
+  if (getCpuFrequencyMhz() != s_cpu_mhz) settings_clock_hw(s_cpu_mhz);
+
   // Full boot from here on. The alarm-clock list (alarms.csv on SD/FFat) is a SLOW
   // filesystem read and isn't needed for the first frame, so defer it past first
   // paint on the interactive path. (The wake test above only needs the NVS-mirrored
   // earliest target from timer_load(); a light wake that sleeps never needs the list
   // at all.) Loaded via s_defer_fs_loads after the screen paints.
 
-#if BOARD_DISPLAY_CO5300_QSPI && BOARD_HAS_PMU_AXP2101
+#if BOARD_DISPLAY_AMOLED_QSPI && BOARD_HAS_PMU_AXP2101
   // S3 cold-panel bring-up. When the display rails (ALDO1/2/4) are CUT in deep
   // sleep, this wake re-powers them in rails_restore() above. An AMOLED panel must
   // see its reset asserted across the supply ramp, or it powers up into a bad state
@@ -1041,8 +1528,16 @@ void setup() {
   // gfx->begin() release reset and run the full init sequence against stable power.
   // Harmless on a warm boot where the rails were never cut (just an extra reset
   // pulse + delay before the same begin()). S3-only; the C6 path is unchanged.
+  //
+  // BOARD_LCD_HAS_RESET: the S3-1.8 breaks out NO panel reset (LCD_RESET is
+  // GFX_NOT_DEFINED = -1 there), so the pin half must be compiled out — a
+  // pinMode(-1) would be a silent no-op at best. The RAIL SETTLE still applies
+  // on such a board, so keep the delay; that panel relies on its software-reset
+  // /sleep-out init sequence instead of a reset line.
+#if BOARD_LCD_HAS_RESET
   pinMode(LCD_RESET, OUTPUT);
   digitalWrite(LCD_RESET, LOW);   // assert panel reset while VCI/VDD/VEE stabilize
+#endif
   delay(60);                      // AMOLED supply settle (the display rail already got
                                   // its per-rail + final settle in rails_restore above)
 #endif
@@ -1054,18 +1549,40 @@ void setup() {
   // GFX_NOT_DEFINED = library default 40 MHz).
   // (gfx->begin() drives LCD_RESET: it releases the hold above and runs the panel's
   // full power-on reset + register init — correct for a cold, just-re-powered panel.)
+#if BOARD_PLATFORM_TUYA
+  /* Bring the panel + OUR OWN LVGL v9.5 up HERE (the natural display-init point, same
+   * place the ESP path runs gfx->begin). We do NOT use the SDK's vendor LVGL (v8) any
+   * more: owf_tuya_register_panel() registers the CO5300 + CST92xx, then owf_lvgl_own_begin()
+   * runs lv_init() + creates our display (full PSRAM framebuffer + flush_cb) + touch indev.
+   * There is NO vendor task - the firmware runs lv_timer_handler() in loop() itself, so no
+   * display lock is needed. See tuya/owf_tuya_lvgl_own.h. */
+  USBSerial.println("[ckpt] pre-lvgl_begin (early)"); USBSerial.flush();
+  owf_tuya_register_panel();     // CO5300 QSPI + CST92xx (our config)
+  owf_lvgl_own_begin();          // our LVGL v9.5: display + indev + flush
+  USBSerial.println("[ckpt] post-lvgl_begin (early)"); USBSerial.flush();
+  s_display_ready = true;
+#elif BOARD_PLATFORM_MAIX
+  s_display_ready = true;     // MaixCDK lvgl_init already brought up the panel
+#else
   if (!gfx->begin(BOARD_LCD_BUS_HZ)) USBSerial.println("gfx->begin() failed!");
   s_display_ready = true;     // gfx is now safe to draw to / displayOff()
 #if BOARD_DISPLAY_JD9853_SPI
   jd9853_reg_init();          // vendor register table — required after begin()
 #endif
   gfx->fillScreen(RGB565_BLACK);
+#endif
   // The display has now set up the (shared) SPI bus with MISO — SD-over-SPI may
   // mount from here on (it waits on this; SDMMC boards ignore it).
   sd_set_bus_ready();
 
   // Apply saved brightness before anything is shown.
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] pre-brightness"); USBSerial.flush();
+#endif
   settings_apply_brightness(s_brightness);
+#if BOARD_PLATFORM_TUYA
+  USBSerial.println("[ckpt] post-brightness"); USBSerial.flush();
+#endif
 
   // On-screen reset banner — shown ONLY for an UNEXPECTED reset (a crash: PANIC/
   // WDT/BROWNOUT, or a deep-sleep that didn't go through our intended sleep path).
@@ -1092,7 +1609,18 @@ void setup() {
     // with no serial. Read then clear it so the next boot reflects the next event.
     bool clean_sleep = (rtc_sleep_intent == SLEEP_INTENT_MAGIC);
     rtc_sleep_intent = 0;
-    bool unexpected = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+
+    // A BROWNOUT reset WHILE USB/charger power is present is almost always the
+    // CHARGER-INSERTION inrush sagging the rail for a moment as VBUS is plugged in —
+    // NOT a code crash. Plugging in the charger then waking showed the "RST: BROWNOUT
+    // UNEXPECTED!" banner with its 3 s hold, making the screen take >5 s to appear
+    // (a quick wake with no charger is instant). So don't treat a brownout-with-USB as
+    // unexpected: skip the scary banner + its delay(3000). A real brownout off USB
+    // (e.g. a sagging battery under load) still flags normally. board_usb_powered() is
+    // the PMU VBUS sense on the S3; valid here since the PMU came up above.
+    bool brownout_on_usb = (rr == ESP_RST_BROWNOUT) && board_usb_powered();
+    bool unexpected = !brownout_on_usb &&
+                      (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                        rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ||
                        rr == ESP_RST_BROWNOUT ||
                        (rr == ESP_RST_DEEPSLEEP && !clean_sleep));
@@ -1100,6 +1628,7 @@ void setup() {
     USBSerial.printf("[reset] reason=%d (%s) clean_sleep=%d\n",
                      (int)rr, txt, (int)clean_sleep, (int)unexpected);
     // Only paint for an unexpected reset (a crash) — every normal boot is silent.
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
     if (unexpected) {
       gfx->setTextColor(RGB565(255, 60, 60));
       gfx->setTextSize(3);
@@ -1111,19 +1640,39 @@ void setup() {
       delay(3000);                  // hold the crash banner long enough to read
       gfx->fillScreen(RGB565_BLACK);
     }
+#else
+    (void)unexpected;   // no raw-GFX crash banner on Maix (LVGL not up yet here)
+#endif
   }
 
 #if BOARD_TOUCH_FT3168
   // The FT3168 sits in low-power MONITOR mode (set below) and hibernates after
   // ~10 s; a longer deep sleep can leave it deep enough that the first I2C probe
   // NAKs. A quick wake finds it awake and inits on the first try (stays instant).
-  // If the first try fails, hardware-reset it via TP_RESET to bring it back, then
-  // retry FAST — the old loop waited 2 s per attempt, so 1-3 misses made the watch
-  // face take 2-6 s to appear (and spammed the log).
+  // If the first try fails, recover it (see per-board branch below), then retry
+  // FAST — the old loop waited 2 s per attempt, so 1-3 misses made the watch face
+  // take 2-6 s to appear (and spammed the log).
+  // NO TP_RESET (S3-1.8): there is no reset pulse to give, so recovery is I2C-only.
+  // That is why board_isolate_peripherals_for_sleep() puts this board's panel into
+  // MONITOR rather than HIBERNATE — a hibernated FT3x68 stops answering I2C
+  // entirely and only a reset pin can revive it (the "display works, touch dead
+  // after deep sleep" bug). From MONITOR the chip still ACKs, so the retry loop
+  // below is a sufficient recovery on its own.
   if (!FT3168->begin()) {
+#ifdef TP_RESET
     pinMode(TP_RESET, OUTPUT);
     digitalWrite(TP_RESET, LOW);  delay(10);    // assert reset
     digitalWrite(TP_RESET, HIGH); delay(200);   // release + let the controller boot
+#else
+    // No reset line: nudge the controller out of MONITOR with an explicit ACTIVE
+    // write before retrying. A bare address probe can NAK while the chip is still
+    // in its low-power scan, so poke the power-mode register directly.
+    Wire.beginTransmission(FT3168_DEVICE_ADDRESS);
+    Wire.write(0xA5);                           // PMODE register
+    Wire.write(0x00);                           // PMODE_ACTIVE
+    Wire.endTransmission();
+    delay(20);
+#endif
     int tries = 0;
     while (!FT3168->begin()) {
       if (++tries >= 12) { USBSerial.println("FT3168 init fail after reset"); break; }
@@ -1133,10 +1682,58 @@ void setup() {
   FT3168->IIC_Write_Device_State(FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
                                  FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
 #elif BOARD_TOUCH_AXS5106L
-  // AXS5106L init via Waveshare's bsp helpers (Wire is already begun above).
+  // AXS5106L via Waveshare's bsp helpers (Wire is already begun above).
   bsp_touch_init(&Wire, TP_RESET, TP_INT, gfx->getRotation(), gfx->width(), gfx->height());
+#elif BOARD_TOUCH_BUTTONS
+  // No touch panel — bring up the physical navigation buttons as active-LOW inputs
+  // with internal pull-ups (idle HIGH, LOW when pressed; no external resistors). The
+  // button-nav input layer (encoder/keypad indev) reads + debounces these; this just
+  // makes the pins electrically ready (and verifiable) from boot.
+#if BOARD_HAS_NAV_BUTTONS
+  pinMode(BTN_UP_GPIO,     INPUT_PULLUP);
+  pinMode(BTN_DOWN_GPIO,   INPUT_PULLUP);
+  pinMode(BTN_SELECT_GPIO, INPUT_PULLUP);
 #endif
-  // (RTC already initialized near the top of setup for the alarm-flag check.)
+#endif
+
+  // QMI8658 step counter (hardware pedometer). MUST come AFTER the touch controller's
+  // begin() above: the Waveshare S3 QMI8658 example (04_LVGL_QMI8658_ui) initializes
+  // touch FIRST then the IMU on the shared I2C bus, and that order is what keeps the
+  // bus healthy. Bringing the IMU up BEFORE touch (the earlier bug) corrupted the bus
+  // and made FT3168->begin() fail with ESP_ERR_INVALID_STATE. Single-threaded here, so
+  // no i2c_lock yet. Non-fatal: a missing IMU just disables the Fitness step count.
+  i2c_lock();   // hold the shared bus across IMU bring-up so touch ISR reads can't interleave
+  bool imu_ok = imu_steps_begin();
+  i2c_unlock();
+  if (imu_ok) USBSerial.println("[imu] QMI8658 pedometer ready");
+  else        USBSerial.println("[imu] QMI8658 not found - step counting disabled");
+
+  // Restore the persisted step total from NVS. RTC memory survives a deep-sleep TIMER wake,
+  // but a full power-off (and on the C6, the RST-button wake) wipes it — NVS is the durable
+  // floor. set_total takes the larger of NVS vs whatever RTC retained, so we never regress.
+  if (imu_ok) {
+    imu_steps_set_total(prefs.getUInt("steps", 0));
+    // Resume counting if a session was active before the last shutdown. s_imu_running is in
+    // RTC mem (survives a deep-sleep TIMER wake) but is wiped by power-off / C6 RST wake, so
+    // NVS is the durable source — without this the watch silently stops counting every cold
+    // boot. restore_running only re-enables if NVS says "was counting" and RTC didn't retain it.
+    i2c_lock();
+    // Resume the right session if one was active before this (deep-sleep) reboot. Step and
+    // sleep are mutually exclusive and have SEPARATE restore paths + durable NVS keys: steps
+    // from "run", sleep from s_sleep_mode. RTC flags (s_imu_running / s_sleep_running) survive
+    // a deep-sleep TIMER wake but are wiped by a power-off / C6 RST wake, so NVS is the floor.
+    // Without resuming, the accel would come up parked off and the ULP wouldn't re-arm.
+    imu_steps_restore_running(prefs.getUInt("run", 0) != 0);
+    imu_sleep_restore_running(s_sleep_mode);
+    i2c_unlock();
+  }
+
+  // Full/BOOT-button wake during a sleep session: the per-span ULP movement was already folded
+  // into s_slp_* by imu_steps_ulp_collect() above (it runs on EVERY deep-sleep wake, including a
+  // button wake), but only the background-CHECK wake path calls sleep_track_log_wake(). Without
+  // logging it here too, the movement accumulated since the last periodic wake would be silently
+  // dropped whenever you wake the watch by hand mid-session. Log it now so no span is lost.
+  if (s_sleep_mode && imu_sleep_samples() > 0) sleep_track_log_wake((uint32_t)rtc_now_epoch());
 
   // PMU on the same I2C bus. Full config (fuel gauge, power key, IRQs) lives in
   // board_power.h; non-fatal if absent.
@@ -1177,6 +1774,10 @@ void setup() {
 #define TIME_SET_MI 28
 #define TIME_SET_S 0
   {
+    // Boards with no battery-backed RTC (C6): the internal clock died on the RST-button
+    // wake, so first restore the last saved time from NVS (stale by the sleep duration;
+    // NTP / the phone corrects it shortly after). No-op on the S3 (real RTC chip).
+    board_clock_persist_restore();
     RTC_DateTime cur = board_clock_now();
     bool rtc_unset = (cur.getYear() < 2024);  // never set / lost backup
     if (FORCE_TIME_SET || rtc_unset) {
@@ -1188,6 +1789,31 @@ void setup() {
     }
   }
 
+  // Sleep-drain forensics: wake counter + VBAT-delta line (printed AND persisted to
+  // NVS, so it's readable over USB on a later reset). Runs AFTER the clock restore
+  // above so the slept-span math uses a valid clock; marks the mV delta INVALID if
+  // USB/charger was present at either sample. See sleep_power.h.
+  drain_diag_boot_report(wake_timer, s_woke_from_boot);
+
+#if BOARD_PLATFORM_MAIX
+  /* MaixCDK's maix::lvgl_init() (called from main.cpp before setup()) already did
+   * lv_init(), created the display (monitor_flush) + touch indev (pointing_device)
+   * and set the tick. Adopt that display and skip the firmware's Arduino_GFX panel
+   * bring-up below. */
+  disp = lv_display_get_default();
+  screenWidth  = lv_display_get_horizontal_resolution(disp);
+  screenHeight = lv_display_get_vertical_resolution(disp);
+#elif BOARD_PLATFORM_TUYA
+  /* OUR OWN LVGL v9.5 (not the SDK vendor v8): owf_tuya_register_panel() registered the
+   * CO5300 + CST92xx, and owf_lvgl_own_begin() ran lv_init() + lv_display_create() +
+   * the touch indev at the early display-init point above. The firmware runs
+   * lv_timer_handler() itself in loop() (no vendor task, no display lock). Here we just
+   * ADOPT the display we created as the default. See tuya/owf_tuya_lvgl_own.h. */
+  disp = lv_display_get_default();
+  screenWidth  = lv_display_get_horizontal_resolution(disp);
+  screenHeight = lv_display_get_vertical_resolution(disp);
+  USBSerial.printf("[ckpt] display adopted: disp=%p %ux%u\n", (void*)disp, (unsigned)screenWidth, (unsigned)screenHeight); USBSerial.flush();
+#else
   lv_init();
   lv_tick_set_cb(millis_cb);
 
@@ -1268,7 +1894,8 @@ void setup() {
     // Async flush needs SPI-DMA-readable buffers; PSRAM fallback can't, so it
     // keeps the legacy blocking flush. (Only the QSPI bus has the async LOCAL
     // PATCH — other display buses always take the sync path.)
-#if BOARD_DISPLAY_CO5300_QSPI
+#if BOARD_DISPLAY_AMOLED_QSPI || BOARD_DISPLAY_SPIDMA
+    // QSPI (S3 AMOLEDs) and ESP32SPIDMA (JD9853/GC9A01) both have the async writePixels*() addition.
     s_flush_async = disp_draw_buf2 &&
                     esp_ptr_dma_capable(disp_draw_buf) &&
                     esp_ptr_dma_capable(disp_draw_buf2);
@@ -1304,8 +1931,12 @@ void setup() {
 #if BOARD_LCD_EVEN_ALIGN
   lv_display_add_event_cb(disp, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
 #endif
+#endif  /* external-framework (Maix/Tuya) vs firmware-owned LVGL/display/touch bring-up */
 
   ui_scrollbar_style_init();   // build the shared narrow-panel scrollbar nudge (no-op on wide panels)
+
+  haptics_attach_click_feedback();   // GLOBAL: a tiny buzz on every clickable widget (one hook,
+                                     // not per-call-site) so all buttons give feedback, not ~half
 
   watchface_create();
   notif_card_create();
@@ -1315,6 +1946,9 @@ void setup() {
   // exist to catch the gesture — there's no pre-build trigger to defer it to.
   quick_shade_init();                     // build the pull-down brightness shade (sys layer)
   pinMode(BOOT_BTN_GPIO, INPUT_PULLUP);   // BOOT button as input
+#if BOARD_PLATFORM_TUYA
+  pinMode(PWR_BTN_GPIO, INPUT_PULLUP);    // PWR button (active-LOW) for long-press power-off
+#endif
 
   // Draw the current time + battery once immediately so the face isn't blank
   // until the first minute rollover.
@@ -1345,8 +1979,23 @@ void setup() {
     almclk_load();         // alarm-clock list (CSV) — needed for alarms to fire
     na_seed_total();       // scan SD archive for the unread count
     watchface_refresh_bell();   // now repaint the bell badge with the real count
+#if SLEEP_TEST_DATA
+    // DEV: overwrite /sleep.csv with synthetic nights so the Sleep data screens can be
+    // tested without sleeping for real. Runs once per boot, here where the store is ready
+    // and we're still single-threaded. Set SLEEP_TEST_DATA back to 0 to resume real data.
+    sleep_test_seed();
+#endif
     s_defer_fs_loads = false;
   }
+
+  // Pre-register the audio/media stack now (interactive full boot only — the light
+  // background-check path deep-sleeps before reaching here). A deep-sleep TIMER/alarm
+  // wake cold-boots and rings from the FIRST loop iteration; without this, that ring's
+  // alarm_fire() would bring the SDK media driver up for the first time on the loop
+  // thread, the slow/blocking path that froze the half-drawn ring screen. Registering
+  // here (off the ring's critical path) means the first ring only does the cheap
+  // per-ring find/open. No-op on boards with nothing to pre-register.
+  audio_alarm_warmup();
 
   // One-time per-rail safety probe: classify which AXP2101 peripheral rails are
   // safe to cut in deep sleep. Runs here while I2C is still SINGLE-THREADED (before
@@ -1365,10 +2014,33 @@ void setup() {
   xTaskCreatePinnedToCore(net_task_fn, "net", 8192, nullptr, 1, &s_net_task, 0);
 
   ble_apply_enabled();        // bring BLE up if its toggle was left on (lazy; off in sleep)
+  ble_prune_orphan_peer_keys(); // NVS-leak fix: drop bn*/gv* keys not tied to a current bond
+                                // (rotating-RPA / transient connects left these forever, filling
+                                // the 20KB NVS until WiFi PHY writes failed with ret=101). No-op
+                                // if BLE is off or already clean.
 
   cpu_usage_init();           // per-core idle hooks for the Power app's CPU graph
 
   lastActivityMs = millis();  // start the idle timer
+
+#if BOARD_DISPLAY_SPIDMA
+  // JD9853 / GC9A01: force a FULL-screen repaint at boot. Partial rendering only pushes
+  // dirty regions, so any pixel the watchface widgets don't cover keeps the panel RAM's
+  // power-on garbage. But a single invalidate here isn't enough on its own: the top
+  // indicator row (voltage etc.) is laid out by flex/align that LVGL only resolves on
+  // a later lv_timer_handler, so an invalidate before layout settles records the WRONG
+  // dirty area (the row above the icons stays black until a manual redraw). So:
+  //   1) force the layout NOW so widget geometry is final, then invalidate everything;
+  //   2) ALSO re-invalidate on the next handler via lv_async_call, after the first
+  //      render pass has fully settled — belt-and-suspenders for any deferred content.
+  lv_obj_update_layout(lv_screen_active());
+  lv_obj_invalidate(lv_screen_active());
+  lv_async_call([](void *) { lv_obj_invalidate(lv_screen_active()); }, nullptr);
+#endif
+
+  /* No vendor task to start: our own LVGL runs lv_timer_handler() in loop()
+   * (owf_lvgl_own_handler), single-threaded, so no display lock is needed. */
+
   USBSerial.println("Setup done");
 }
 
@@ -1379,6 +2051,62 @@ static inline void watchface_present(void) {
 #endif
 }
 
+/* Synchronously run the LVGL handler `frames` times and present, so newly-created
+ * widgets are RENDERED + FLUSHED to the panel right now instead of on the next loop
+ * iteration. Used by the alarm overlay (app_timer.h): on a deep-sleep timer/alarm
+ * wake the chip cold-boots and the FIRST loop builds the overlay then immediately
+ * starts audio (a blocking SDK media bring-up on Tuya). Without pumping a frame here
+ * the loop blocks in audio before its next lv_timer_handler(), leaving the overlay
+ * half-drawn and the watch frozen. Pumping a couple of frames guarantees the full
+ * overlay is on the glass before any blocking work runs. Cheap, LVGL-thread only.
+ * (One pass renders; a second covers any deferred invalidate/layout settle.) */
+static void ui_pump_frame(int frames) {
+  for (int i = 0; i < frames; i++) {
+#if BOARD_PLATFORM_TUYA
+    owf_lvgl_own_handler();   // our own LVGL v9.5 handler (= lv_timer_handler + per-area flush)
+#elif BOARD_PLATFORM_MAIX
+    lv_timer_handler();
+#else
+    lv_task_handler();
+#endif
+    watchface_present();      // DIRECT-render only; no-op in PARTIAL (flush already pushed)
+  }
+}
+
+/* ---- global haptic click feedback ------------------------------------------
+ * One hook, the single source of UI buzz (the old scattered per-call haptics_pulse(6..25)
+ * values were removed so every app feels identical). The indev sends LV_EVENT_CLICKED to
+ * whatever widget was clicked; this indev-level cb sees them all.
+ *
+ * We buzz ONLY on actual CONTROLS — switches, push buttons, and checkable widgets — NOT
+ * on app-launcher tiles, the quick-shade scrim/panel, list rows, or the watch face. Most
+ * of that exclusion is automatic by widget CLASS: tiles' containers, the scrim/panel/strip
+ * and list rows are plain lv_obj (made clickable), so they're skipped. The ONE exception
+ * is the app launcher tile, which IS an lv_btn — it's tagged with HAPTICS_NO_BUZZ_FLAG in
+ * menu_build_tile() so opening an app stays silent. The only explicit haptics_pulse() calls
+ * left are the +/- steppers (PRESSED/LONG_PRESSED_REPEAT, which CLICKED can't see); they use
+ * HAPTICS_CLICK_MS too and the debounce swallows any tap overlap. */
+#if BOARD_HAS_HAPTICS
+static void haptics_click_cb(lv_event_t *e) {
+  (void)e;
+  lv_obj_t *o = lv_indev_get_active_obj();    // the widget that was clicked
+  if (!o) return;
+  if (lv_obj_has_flag(o, HAPTICS_NO_BUZZ_FLAG)) return;   // app tile etc. -> silent
+  // Buzz only for real controls: a switch, a push button, or anything checkable
+  // (checkbox / day pill). Plain lv_obj clickables (tiles, scrim, rows) are excluded.
+  bool is_control = lv_obj_check_type(o, &lv_switch_class) ||
+                    lv_obj_check_type(o, &lv_button_class) ||
+                    lv_obj_has_flag(o, LV_OBJ_FLAG_CHECKABLE);
+  if (is_control) haptics_pulse(HAPTICS_CLICK_MS);
+}
+static void haptics_attach_click_feedback(void) {
+  lv_indev_t *id = lv_indev_get_next(NULL);   // the (single) pointer indev
+  if (id) lv_indev_add_event_cb(id, haptics_click_cb, LV_EVENT_CLICKED, NULL);
+}
+#else
+static void haptics_attach_click_feedback(void) {}   // no motor -> nothing to attach
+#endif
+
 /* ================================ loop =================================== */
 static int lastMinuteShown = -1;  // -1 = nothing drawn yet
 static uint32_t lastBattMs = 0;   // battery poll timer
@@ -1387,11 +2115,33 @@ static uint32_t lastNotifMs = 0;  // notification fetch timer
 void loop() {
   uint32_t ms = millis();
   bool dirty = false;  // did anything visible change?
+#if BOARD_PLATFORM_TUYA
+  // Survived-boot confirm for the persistent overclock: once we've run a few seconds in
+  // the main loop, this boot is healthy -> clear the arm so the OC stays for next boot.
+  // (A hang before here leaves the arm set, auto-disabling OC on the next power cycle.)
+  static bool s_oc_boot_confirmed = false;
+  if (!s_oc_boot_confirmed && ms > 5000) { settings_oc_boot_ok(); s_oc_boot_confirmed = true; }
+
+  // DEFERRED PSRAM reclock: the app is XIP'd from PSRAM, so flipping the PSRAM clock divider at
+  // boot races the divider edge against the CPU's own code/heap fetches and DMA -> cold-boot
+  // freeze. Instead we booted at stock 80 MHz and flip to the overclocked rate HERE, once the
+  // first frame has painted, on the MAIN thread (NOT the flush task — so it can park that task and
+  // wait for DMA-idle without waiting on itself). One-shot. See owf_tuya_psram_freq.h.
+  static bool s_psram_reclocked = false;
+  if (!s_psram_reclocked && s_owf_frames_flushed > 0) {
+    owf_tuya_psram_overclock_deferred();     // no-op unless OWF_PSRAM_FREQ_APPLY && DEFER_TO_FIRST_DRAW
+    s_psram_reclocked = true;                // one-shot regardless of result (don't retry-thrash)
+  }
+#endif
 #if CPU_PROFILE_SERIAL
   uint32_t lp_t0 = micros();   // loop micro-profile: body-time capture (see loop tail)
 #endif
 
-  // NOTE: BOOT is polled FIRST, before lv_task_handler(), so heavy touch/render
+  /* No display lock on Tuya any more: our own LVGL runs lv_timer_handler() in THIS loop
+   * (single-threaded), so there is no concurrent render task to race. The old vendor-task
+   * lock dance is gone. */
+
+  // NOTE: BOOT is polled FIRST, before the LVGL handler, so heavy touch/render
   // work in LVGL can't delay or starve the button check.
 
   // --- BOOT button: wake + menu + sleep (single tap = menu, double-tap = sleep) ---
@@ -1418,15 +2168,29 @@ void loop() {
       bootDown = true;
       boot_suppress_touch = true;
       lastActivityMs = ms;
+      s_boot_activity = true;   // loop force-undims on this edge (heals a dropped un-dim write)
       if (bootLastTap != 0 && (ms - bootLastTap) <= BOOT_DTAP_MS) {
-        // Second tap within the window -> double-tap -> sleep.
+        // Second tap within the window -> double-tap -> sleep. On T5 this BLOCKS in a
+        // suspend sleep and returns when a User/PWR press wakes it (the UI resumes as-is,
+        // so the menu the first tap opened is still there — same screen it slept on).
         bootLastTap = 0;
-        enter_deep_sleep();               // does not return
+        enter_deep_sleep();               // ESP/Maix: does not return. T5: blocks, returns on wake.
+#if BOARD_PLATFORM_TUYA
+        lastActivityMs = millis();        // woke: fresh stamp (millis, not stale ms) = fresh idle period
+        dirty = true;
+        if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
+          notif_show(s_pop_id, s_pop_title, s_pop_body);
+          pending_notif = false;
+        }
+#endif
       } else {
         // First tap -> remember the time for a possible 2nd. If the shade is
         // open, BOOT just closes it; otherwise it does the usual one-level back.
         bootLastTap = ms;
         if (g_alarm_active)        alarm_dismiss();   // ringing -> BOOT silences it
+#if BOARD_HAS_NAV_BUTTONS
+        else if (button_nav_handle_boot()) {}         // slider edit mode -> BOOT only deselects
+#endif
         else if (quick_shade_is_open()) quick_shade_close();
         else                       app_menu_back();
         dirty = true;
@@ -1438,10 +2202,78 @@ void loop() {
     boot_suppress_touch = false;
   }
 
+#if BOARD_HAS_NAV_BUTTONS
+  // UP/DOWN/SELECT nav buttons (button_nav.h): watchface DOWN = quick-shade
+  // shortcut, in-shade highlight navigation + slider edit. Polled right after
+  // BOOT so buttons are never delayed by render work. Any press counts as real
+  // user activity, exactly like touch/BOOT.
+  if (button_nav_poll(ms)) {
+    lastActivityMs = ms;        // fresh idle/dim period
+    s_boot_activity = true;     // force-undim on the idle->active edge (same heal as BOOT)
+    dirty = true;
+  }
+#endif
+
+#if BOARD_PLATFORM_TUYA
+  // PWR button (IO18, active-LOW): hold ~2.5s -> hardware power-off (drop the GPIO19
+  // keep-alive latch). The device fully powers down (unless USB is plugged); revived by
+  // a PWR press. A short PWR tap does nothing while awake (avoid accidental shutdown).
+  // While deep-asleep, PWR is armed as a wake source (owf_tuya_deep_sleep_try) — a press
+  // reboots the chip into a fresh setup(); nothing to handle here.
+  {
+    static uint32_t s_pwr_down_ms = 0;          // when PWR was first seen held (0 = not held)
+    // Fresh timestamp, NOT the loop-start `ms`: on the very iteration that resumes from deep
+    // sleep, `ms` predates the whole sleep. With compensated ticks the stale delta would read
+    // as an instant 2.5s "long press" and power the watch off on a quick wake tap.
+    uint32_t pms = millis();
+    bool pwrRaw = (digitalRead(PWR_BTN_GPIO) == LOW);
+    if (pwrRaw) {
+      if (s_pwr_down_ms == 0) {
+        s_pwr_down_ms = pms;
+      } else if (pms - s_pwr_down_ms >= 2500) {  // held long enough -> power off
+        USBSerial.println("[power] PWR long-press -> power off");
+        USBSerial.flush();
+        settings_brightness_commit_now();        // flush any debounced brightness before the latch drops
+        owf_tuya_set_backlight(0);
+        owf_tuya_power_off();                    // drop GPIO19 latch (does not return on battery)
+        delay(500);
+        s_pwr_down_ms = 0;                       // (on USB, latch can't cut -> reset)
+      }
+    } else {
+      s_pwr_down_ms = 0;                         // released before the threshold
+    }
+  }
+
+  // (The old touch/activity screen-wake block is REMOVED with the panel-off light-sleep
+  // state: while deep-asleep the chip is off — nothing runs, and waking is a reboot.)
+#endif
+
   // Service LVGL (timers, input) every loop — AFTER the BOOT check so the button
   // is always polled first and never delayed by render/touch work.
+  // Safety net: if the quick-shade closed but its opaque black scrim got left visible (a close
+  // animation that was interrupted without firing its completed-cb), hide it + invalidate NOW,
+  // BEFORE the handler below, so the SAME lv_timer_handler() repaints the revealed UI this frame
+  // (no extra-iteration black flash). Runs on the loop thread (not mid-refresh) -> safe to
+  // invalidate. Idempotent no-op unless the scrim is actually stuck.
+  quick_shade_reconcile();
+#if BOARD_PLATFORM_TUYA
+  owf_lvgl_own_handler();   // our own LVGL v9.5 timer/handler (replaces the vendor task)
+#else
   lv_task_handler();
+#endif
+#if BOARD_SD_SHARES_LCD_BUS
+  // A flush was dropped because SD held the shared bus mid-refresh: repaint the whole
+  // screen now, on the loop thread OUTSIDE the refresh, where invalidating is safe.
+  if (s_flush_dropped) {
+    s_flush_dropped = false;
+    lv_obj_t *scr = lv_screen_active();
+    if (scr) lv_obj_invalidate(scr);
+  }
+#endif
   ble_ui_tick();   // render/hide the BLE pair-code overlay (LVGL-thread side of BLE)
+#if BOARD_PLATFORM_TUYA
+  ancs_pair_watchdog();   // stalled iOS pairing after the ANCS auth bounce -> retry + diagnose
+#endif
 
   // Find My Watch: the phone wrote the find-watch characteristic -> ring the watch
   // using the timer's alarm overlay, with its own text. Checked every loop so it's
@@ -1458,12 +2290,50 @@ void loop() {
   // powered, so this retries (rate-limited) until the card mounts or is ruled absent.
   sd_retry_tick(ms);
 
+  // Background step sampling: keeps the awake step counter running regardless of which
+  // screen is open (the Fitness app's own timer only runs while that screen is up). Self
+  // rate-limited (~50ms) + self-locking; no-op unless a counting session is active.
+  imu_steps_tick(ms);
+
+  // Persist the step total to NVS on a throttled cadence (>=1 min between writes, only when
+  // it changed) so it survives a power-off / C6 RST-button wake. Cheap when nothing changed.
+  if (imu_steps_save_due(ms)) {
+    prefs.putUInt("steps", imu_steps_count());
+    imu_steps_mark_saved(ms);
+  }
+
+  // Commit a debounced brightness change to NVS once the slider has settled (~700ms). Applying
+  // brightness is live/instant; only the flash persist is deferred — on the Tuya KV store a
+  // per-step write blocks for tens of ms and made the slider lag. Cheap no-op when not pending.
+  settings_brightness_commit_tick(ms);
+
   // Reflect the caffeine (keep-awake) state in the watchface corner mug, painting
   // only when it actually changes.
   static bool s_caf_shown = false;
   if (s_caffeine != s_caf_shown) {
     s_caf_shown = s_caffeine;
     watchface_set_caffeine(s_caffeine);
+    dirty = true;
+  }
+
+  // Reflect the mute state in the watchface corner (empty-speaker icon), painting only
+  // on change (edge-detected like the caffeine mug above).
+  static bool s_mute_shown = false;
+  bool mute_now = settings_get_mute();
+  if (mute_now != s_mute_shown) {
+    s_mute_shown = mute_now;
+    watchface_set_mute(mute_now);
+    dirty = true;
+  }
+
+  // Reflect sleep-mode (sleep-quality tracking + DND) in the watchface corner glyph,
+  // edge-detected like the caffeine mug. Shows the user the watch is in a tracking
+  // session and won't wake the screen for notifications.
+  static int s_sleep_shown = -1;
+  bool sleep_now = sleep_track_active();
+  if ((int)sleep_now != s_sleep_shown) {
+    s_sleep_shown = sleep_now;
+    watchface_set_sleep(sleep_now);
     dirty = true;
   }
 
@@ -1487,12 +2357,34 @@ void loop() {
       lastMinuteShown = now.getMinute();
       watchface_update(now);
       dirty = true;
+      board_clock_persist_save();   // keep the NVS time snapshot fresh (no-op on the S3
+                                    // RTC chip; ~8 bytes/min on the C6) so an RST recovers close
+    }
+    // Re-arm alarm targets if the wall clock was just SET (NTP / phone / manual). Alarm
+    // targets are absolute epochs; a clock jump leaves them misaligned with the new
+    // wall-clock HH:MM, which could otherwise ring at the wrong minute or be missed.
+    // Detect a jump as the epoch moving backward, or forward by more than the ~1s tick
+    // plus slack. Runs on the UI thread, so almclk_rearm()'s state writes are race-free.
+    // (The net/BLE clock-set callers can't safely rearm from their own threads.)
+    {
+      static uint32_t s_last_epoch = 0;
+      uint32_t e = rtc_now_epoch();
+      if (e != 0) {
+        // Backward jump = clock set back; large forward jump (> 90s, well past any slow
+        // loop tick) = clock set forward. A normal ~1s tick never trips this, so rearm
+        // (a small NVS write) only happens on a genuine clock change, not every second.
+        if (s_last_epoch != 0 && (e < s_last_epoch || e - s_last_epoch > 90))
+          almclk_rearm();                 // clock was set -> realign targets to new wall time
+        s_last_epoch = e;
+      }
     }
     // Countdown reached zero while we're awake -> ring. (timer_is_due() reads the
     // RTC with its own i2c_lock, so it must run OUTSIDE the lock taken above.)
     if (!g_alarm_active && timer_is_due())  alarm_fire();
-    // Wall-clock alarm reached its set time -> ring (same overlay/chime).
-    if (!g_alarm_active && almclk_is_due()) almclk_fire();
+    // Wall-clock alarm: ring if any enabled alarm's HH:MM matches the clock right now (and
+    // we haven't already rung it this minute). almclk_fire() does the match + once-guard +
+    // editor suppression itself, so we just call it every tick.
+    if (!g_alarm_active) almclk_fire();
   }
 
   // --- Battery + bell: poll every 20s. (WiFi indicator is refreshed on the 15s
@@ -1542,7 +2434,9 @@ void loop() {
       static char ct[NOTIF_TITLE_MAX], cb[sizeof(s_pop_body)];
       if (have) { strcpy(ct, s_pop_title); strcpy(cb, s_pop_body); }
       store_unlock();
-      if (have && !app_menu_is_open()) {
+      // Sleep-mode DND: never pop a notification card or bump activity (that would keep
+      // the screen lit while you sleep -> battery drain). The bell count still updates.
+      if (have && !app_menu_is_open() && !sleep_track_active()) {
         notif_show(id, ct, cb);
         lastActivityMs = ms;             // keep screen awake to read it
       }
@@ -1561,7 +2455,8 @@ void loop() {
     static char act[NOTIF_TITLE_MAX], acb[sizeof(s_pop_body)];
     if (have) { strcpy(act, s_pop_title); strcpy(acb, s_pop_body); }
     store_unlock();
-    if (have && !app_menu_is_open()) {
+    // Sleep-mode DND: suppress the popup + activity bump (same as the fetch path above).
+    if (have && !app_menu_is_open() && !sleep_track_active()) {
       notif_show(id, act, acb);
       lastActivityMs = ms;                // wake the screen so it can be read
     }
@@ -1579,8 +2474,20 @@ void loop() {
     dirty = true;
   }
 
-  // A card dismiss (from the touch callback) needs a repaint to actually clear
-  // the card off the panel.
+  // The popup card must never outlive its notification: if the item it shows was
+  // removed from the store (dismissed in the watch's Notifications app, or cleared
+  // on the phone via the ANCS REMOVED echo), hide the card. Cheap: only checks
+  // while a card is actually showing. This is also what clears a card that was
+  // left up across a sleep/wake after its item is long gone.
+  if (notif_card_id) {
+    store_lock();
+    bool still_there = notif_store_contains(notif_card_id);
+    store_unlock();
+    if (!still_there) notif_dismiss();
+  }
+
+  // A card dismiss (from the touch callback / card tap / auto-hide above) needs a
+  // repaint to actually clear the card off the panel.
   if (notif_needs_repaint) { notif_needs_repaint = false; dirty = true; }
 
   // Re-render + push the panel ONLY when something actually changed on screen.
@@ -1628,10 +2535,49 @@ void loop() {
   // consumed, finger-count reads 0 in the FT3168's low-power monitor mode), which
   // on battery let the 2-minute timeout fire on the very tap meant to keep it
   // awake. Consuming the ISR flag here makes any tap reliably reset the timer.
+  bool fresh_activity = false;
   if (s_touch_activity) {
     s_touch_activity = false;
     lastActivityMs = ms;
+    fresh_activity = true;
   }
+#if BOARD_PLATFORM_TUYA
+  // Tuya touch is POLLED in owf_lvgl_touch_cb (no ISR sets s_touch_activity), so consume the
+  // touch module's own activity flag here -> any finger un-dims and resets the idle timer.
+  if (owf_tuya_take_touch_activity()) { lastActivityMs = ms; fresh_activity = true; }
+  if (s_boot_activity) { s_boot_activity = false; fresh_activity = true; }   // BOOT press edge
+  // FORCE the panel to full brightness on the idle->active EDGE (first activity after a quiet
+  // stretch), not on every held-finger poll. This bypasses the dim dedup to self-heal the desync
+  // where an un-dim's brightness QSPI command is dropped because it shares the bus with the LVGL
+  // flush: the panel is dim but bookkeeping says full, so the deduped un-dim won't re-write it.
+  //
+  // A SINGLE write isn't enough on the BOOT (user-button) wake: a lone BOOT tap on the dimmed face
+  // opens the menu, and the menu's full-screen render queues async QSPI pushes that hog the bus at
+  // exactly the moment this brightness command goes out — so that one write reliably drops, and
+  // because nothing retries (the menu keeps the idle timer fresh, so settings_dim_set(false) stays
+  // deduped to "already full") the panel stays dim for the whole menu session. That is the
+  // "pressing User doesn't undim" symptom. So instead of one write, re-assert full brightness for a
+  // short WINDOW after the wake edge: spread across the menu-open flush burst, at least one write
+  // lands on an idle bus and sticks. Throttled to ~20 ms so we don't ourselves flood the bus we're
+  // racing. Edge-gating still avoids spamming brightness commands during a drag.
+  {
+    static bool     s_was_idle      = false;
+    static bool     s_undim_healing = false;   // re-asserting full brightness across a wake?
+    static uint32_t s_undim_edge_ms = 0;       // ms of the idle->active edge being healed
+    static uint32_t s_undim_last_ms = 0;       // last re-assert write (throttle)
+    bool idle_now = (ms - lastActivityMs) > (DIM_IDLE_MS / 2);   // "quiet" if past half the dim timer
+    if (fresh_activity && s_was_idle) {        // woke from quiet (touch OR BOOT) -> open a heal window
+      s_undim_healing = true;
+      s_undim_edge_ms = ms;
+      s_undim_last_ms = ms - 100;              // force the first re-assert this loop
+    }
+    if (s_undim_healing) {
+      if ((uint32_t)(ms - s_undim_last_ms) >= 20) { settings_undim_force(); s_undim_last_ms = ms; }
+      if ((uint32_t)(ms - s_undim_edge_ms) > 300) s_undim_healing = false;  // window outlasts the flush burst
+    }
+    s_was_idle = idle_now;
+  }
+#endif
 
   // A ringing alarm must never idle-sleep mid-buzz: keep the idle timer fresh so
   // it stays awake until dismissed (BOOT or touch).
@@ -1669,6 +2615,14 @@ void loop() {
   bool ble_overlay = ble_overlay_active();
   if (ble_overlay) lastActivityMs = ms;   // treat the reveal as activity (un-dim, stay awake)
 
+  // A menu/app or the quick-shade being OPEN counts as active use: keep the idle timer fresh
+  // so the panel never auto-dims while you're navigating. This also removes a churn bug — BOOT
+  // toggles menu<->clock, and if the idle timer expired mid-navigation the dim/undim would fire
+  // back-to-back on each press, racing the brightness QSPI command against the LVGL flush and
+  // occasionally dropping it (the "BOOT sometimes desyncs the dim" symptom). Idle dimming is for
+  // the QUIET clock face only. (The idle-SLEEP timeout still applies; this only blocks the dim.)
+  if (app_menu_is_open() || quick_shade_is_open()) lastActivityMs = ms;
+
   bool usb_blocks = usb_connected && !settings_get_dim_on_usb();
   bool dim_now = settings_get_autodim() && !usb_blocks && !s_caffeine &&
                  !g_alarm_active && !ble_overlay &&
@@ -1703,7 +2657,14 @@ void loop() {
   if (s_caffeine) {                      // caffeine = stay awake, don't even count toward sleep
     lastActivityMs = ms;
   } else if (!usb_connected && ms - lastActivityMs > IDLE_SLEEP_MS) {
-    enter_deep_sleep();  // does not return (never while on USB)
+    enter_deep_sleep();  // ESP/Maix: does not return. T5: blocks in suspend, returns on button wake.
+#if BOARD_PLATFORM_TUYA
+    lastActivityMs = millis(); // woke: fresh stamp (the block lasted the whole sleep) = fresh idle period
+    if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
+      notif_show(s_pop_id, s_pop_title, s_pop_body);
+      pending_notif = false;
+    }
+#endif
   }
 
   // Per-task CPU profiler -> serial, every 10 s (measured-runtime libs only; no-op
@@ -1781,5 +2742,6 @@ void loop() {
   }
 #endif
 
+  // (No Tuya display lock to release - our own LVGL is single-threaded in this loop.)
   delay(fast_pace ? 1 : 5);
 }

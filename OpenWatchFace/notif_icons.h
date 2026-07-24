@@ -16,14 +16,12 @@
 #ifndef NOTIF_ICONS_HAVE_MDI
 #define NOTIF_ICONS_HAVE_MDI 1
 #endif
-
 #if NOTIF_ICONS_HAVE_MDI
 LV_FONT_DECLARE(icons22);                 // the converted MDI font (icons22.c)
 #define NOTIF_ICON_FONT (&icons22)
 #else
 #define NOTIF_ICON_FONT (&lv_font_montserrat_20)   // fallback: built-in symbol font
 #endif
-
 /* ---- per-category MDI codepoints ----
  * Indexed by NotifCat. Verify/adjust each against your MDI version on
  * pictogrammers.com/library/mdi (codepoints shift between MDI releases). Only used
@@ -88,7 +86,7 @@ static const uint32_t NOTIF_CAT_CP[NCAT_COUNT] = {
   /* TICKET   */ 0xF0507,   // ticket
   /* UMBRELLA */ 0xF0560,   // umbrella
   /* WHATSAPP */ 0xF05A3,   // whatsapp
-  /* MESSENGER*/ 0xF0364,   // facebook-messenger
+  /* MESSENGER*/ 0xF020E,   // facebook-messenger
   /* TELEGRAM */ 0xF052D,   // telegram
   /* SIGNAL   */ 0xF1098,   // message-lock (signal has no dedicated MDI glyph)
   /* DISCORD  */ 0xF066F,   // discord
@@ -96,17 +94,23 @@ static const uint32_t NOTIF_CAT_CP[NCAT_COUNT] = {
   /* INSTAGRAM*/ 0xF02FE,   // instagram
   /* FACEBOOK */ 0xF020C,   // facebook
   /* TWITTER  */ 0xF0544,   // twitter (X has no MDI glyph; using bird)
-  /* SNAPCHAT */ 0xF04ED,   // snapchat
+  /* SNAPCHAT */ 0xF04B6,   // snapchat
   /* TIKTOK   */ 0xF1337,   // music (tiktok deprecated; music note fallback)
-  /* REDDIT   */ 0xF0455,   // reddit
+  /* REDDIT   */ 0xF044D,   // reddit
   /* LINKEDIN */ 0xF033B,   // linkedin
   /* YOUTUBE  */ 0xF05C3,   // youtube
-  /* SPOTIFY  */ 0xF04F8,   // spotify
+  /* SPOTIFY  */ 0xF04C7,   // spotify
   /* NETFLIX  */ 0xF0746,   // netflix
   /* GMAIL    */ 0xF02AB,   // gmail
   /* OUTLOOK  */ 0xF0D22,   // microsoft-outlook
   /* PAYPAL   */ 0xF0431,   // paypal
   /* UBER     */ 0xF0553,   // uber
+  /* TWITCH   */ 0xF0543,   // twitch
+  /* STEAM    */ 0xF04D3,   // steam
+  /* GITHUB   */ 0xF02A4,   // github
+  /* ANDROID  */ 0xF0032,   // android
+  /* ICLOUD   */ 0xF0038,   // icloud
+  /* MTEAMS   */ 0xF02BB,   // microsoft teams
 
 };
 #else
@@ -190,6 +194,12 @@ static const char *NOTIF_CAT_SYMBOL[NCAT_COUNT] = {
   /* OUTLOOK  */ LV_SYMBOL_ENVELOPE,
   /* PAYPAL   */ LV_SYMBOL_BELL,
   /* UBER     */ LV_SYMBOL_GPS,
+  /* TWITCH   */ LV_SYMBOL_BELL,
+  /* STEAM    */ LV_SYMBOL_BELL,
+  /* GITHUB   */ LV_SYMBOL_BELL,
+  /* ANDROID  */ LV_SYMBOL_BELL,
+  /* ICLOUD   */ LV_SYMBOL_BELL,
+  /* MTEAMS   */ LV_SYMBOL_BELL,
 
 };
 #endif  // NOTIF_ICONS_HAVE_MDI
@@ -274,6 +284,12 @@ static const uint32_t NOTIF_CAT_RGB[NCAT_COUNT] = {
   /* OUTLOOK  */ 0x0078D4,   // outlook blue
   /* PAYPAL   */ 0x003087,   // paypal blue
   /* UBER     */ 0xE0E0E0,   // uber is black; use near-white so it's visible on AMOLED
+  /* TWITCH   */ 0xA64DFF,   // twitch purple
+  /* STEAM    */ 0x003399,   // steam dark blue
+  /* GITHUB   */ 0xEDEDED,   // github gray
+  /* ANDROID  */ 0x22CC00,   // android green
+  /* ICLOUD   */ 0xB3E5FF,   // icloud bright blue
+  /* MTEAMS   */ 0xBB33FF,   // microsoft teams purple
 
 };
 
@@ -320,6 +336,17 @@ static void notif_icon_apply(lv_obj_t *label, uint8_t cat) {
   lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
   lv_label_set_text(label, NOTIF_CAT_SYMBOL[cat]);
 #endif
+}
+
+/* UTF-8 string for an MDI codepoint, into a caller-owned char[5] buffer. Thin wrapper
+ * so callers don't repeat the encoder; works regardless of NOTIF_ICONS_HAVE_MDI. */
+static inline const char *mdi_utf8(uint32_t cp, char out[5]) {
+  out[0] = (char)(0xF0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (char)(0x80 | (cp & 0x3F));
+  out[4] = '\0';
+  return out;   // MDI glyphs all sit in 0xF0000+ (4-byte UTF-8); fine for this use
 }
 
 /* The category's color, for callers that draw the icon themselves (e.g. the big

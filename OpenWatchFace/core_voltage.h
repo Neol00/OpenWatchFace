@@ -1,20 +1,13 @@
 /* ============================================================================
- *  core_voltage.h — EXPERIMENTAL real core undervolt (ESP32-S3 digital LDO).
+ *  core_voltage.h — EXPERIMENTAL real core undervolt.
  *
  *  This is the REAL knob, not the AXP2101 rail trick in settings_store.h. It
  *  lowers the chip's ACTUAL digital-core voltage by overriding the `dig_dbias`
  *  trim that ESP-IDF programs into the on-die LDO. Power ~ V^2, so dropping the
- *  core from 1.25V to 1.15V at 240 MHz cuts core dynamic power ~15%. The biggest
- *  wins are at LOW clocks: IDF leaves 80/160 MHz at 1.25V too (when flash is
+ *  core from 1.15V to 1.05V at 240 MHz cuts core dynamic power ~15%. The biggest
+ *  wins are at LOW clocks: IDF leaves 80/160 MHz at 1.15V too (when flash is
  *  80/160 MHz, which this board uses), so they're badly over-volted by default.
  *
- *  ---------------------------------------------------------------------------
- *  HOW TO TUNE: edit CORE_UV_MV[] below — just type the core voltage you want
- *  for each CPU speed, in MILLIVOLTS. You don't need exact values or to know the
- *  register: the code snaps whatever you write to the nearest voltage the chip
- *  actually supports (50 mV grid) and clamps it to a safe floor. So "1100" means
- *  "give 80 MHz roughly 1.1 V". Lower number = more undervolt = more savings and
- *  more risk. That's the whole knob.
  *  ---------------------------------------------------------------------------
  *
  *  MECHANISM: the active digital-core voltage is the I2C_DIG_REG_EXT_DIG_DREG
@@ -30,11 +23,11 @@
  *  and the target values live only in this source table -> reflash to change.
  *
  *  The boot path captures a "golden" self-test result at the stock voltage,
- *  applies the table, then re-checks; on mismatch it AUTO-REVERTS to 1.25V and
+ *  applies the table, then re-checks; on mismatch it AUTO-REVERTS to 1.15V and
  *  flags it, so a too-aggressive value can't brick a boot. Tune ONE step at a
  *  time, flash, then run it hard (max brightness + WiFi fetch + busy CPU) for a
- *  long while. Expect silicon lottery — your chip likely does 240 MHz at ~1.15V
- *  and 80 MHz far lower.
+ *  long while. Expect silicon lottery — your chip likely does 240 MHz at ~1.10V
+ *  and 80 MHz lower.
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
@@ -44,7 +37,7 @@
  * The two chips set the active digital-core voltage through DIFFERENT hardware:
  *
  *   S3-2.06 (ESP32-S3): a static analog "regi2c" trim — write the
- *     I2C_DIG_REG_EXT_DIG_DREG field once and it holds. (Original path.)
+ *     I2C_DIG_REG_EXT_DIG_DREG field once and it holds.
  *
  *   C6-1.47 (ESP32-C6): the PMU owns core voltage. The active voltage is the
  *     PMU HP_ACTIVE regulator dbias field (PMU.hp_sys[HP_ACTIVE].regulator0.dbias),
@@ -54,11 +47,15 @@
  *
  * Both are 5-bit dbias codes (0..31), so the canary + auto-revert logic is shared;
  * only the setter/getter, the code<->mV grid, and the "stock" code differ. */
-#if defined(BOARD_WS_S3_TOUCH_AMOLED_206)
+/* Gate on the SoC, not a specific board id: the regi2c trim is an ESP32-S3
+ * mechanism shared by EVERY S3 board (the AMOLED-2.06 and the LCD-1.47), while the
+ * PMU dbias path is the C6's. Keying off CONFIG_IDF_TARGET_* means a new S3/C6
+ * board "just works" without being added here. */
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
   #define CORE_UV_VIA_REGI2C 1
   #include "esp_private/regi2c_ctrl.h" // REGI2C_WRITE_MASK / READ_MASK (private SDK API)
   #include "soc/regi2c_dig_reg.h"      // I2C_DIG_REG, I2C_DIG_REG_EXT_DIG_DREG
-#elif defined(BOARD_WS_C6_TOUCH_LCD_147)
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
   #define CORE_UV_VIA_PMU 1
   // Direct MMIO to the PMU HP_ACTIVE regulator register — NOT the pmu_ll inline +
   // &PMU struct symbol, which crash-looped (instruction-access fault) when called
@@ -76,27 +73,27 @@
 
 typedef struct { uint16_t mhz; uint16_t mv; } core_uv_entry_t;
 #if CORE_UV_VIA_PMU
-/* C6-1.47 (ESP32-C6): stock HP-active core ≈ 1.10 V (dbias 25). The C6 commonly
+/* C6-1.47 (ESP32-C6): stock HP-active core ≈ 1.15 V (dbias 25). The C6 commonly
  * runs at 160 MHz (boot default) / 80 MHz. CONSERVATIVE first sweep — drop a step
  * at a time against a USB meter, watching the [uv] canary line. Lower = more
  * savings + more risk of SILENT corruption (canary auto-reverts a bad boot). */
 static const core_uv_entry_t CORE_UV_MV[] = {
-  { 160, 1100 },   // stock
-  {  80, 1100 },   // over-volted by default -> good headroom
+  { 160, 1150 },   // stock
+  {  80, 1150 },   // over-volted by default -> good headroom
 };
 #else
 /* Target core voltage (mV) per CPU speed, same order as the Power menu offers.
- * DEFAULT = 1250 everywhere = STOCK / no-op. Lower a number to undervolt that
+ * DEFAULT = 1150 everywhere = STOCK / no-op. Lower a number to undervolt that
  * speed. Values interpolate to the nearest ~20 mV hardware code and clamp to
  * CORE_UV_FLOOR_MV.
  *
- *   Conservative first try:   240->1200  160->1150   80->1100
- *   Aggressive (validate!):   240->1150  160->1100   80->1050
- * S3-2.06 (ESP32-S3): stock 1.25 V; IDF leaves 80/160 over-volted -> big headroom. */
+ *   Conservative first try:   240->1150  160->1120   80->1100
+ *   Aggressive (validate!):   240->1100  160->1050   80->1000
+ * S3-2.06 (ESP32-S3): stock 1.15 V; IDF leaves 80/160 over-volted -> big headroom. */
 static const core_uv_entry_t CORE_UV_MV[] = {
-  { 240, 1250 },   // stock
-  { 160, 1250 },   // over-volted by default -> good headroom
-  {  80, 1250 },   // most over-volted -> lots of room to drop
+  { 240, 1150 },   // stock
+  { 160, 1150 },   // over-volted by default -> good headroom
+  {  80, 1150 },   // most over-volted -> lots of room to drop
 };
 #endif
 static const uint8_t CORE_UV_COUNT = sizeof(CORE_UV_MV) / sizeof(CORE_UV_MV[0]);
@@ -113,12 +110,13 @@ typedef struct { uint16_t mv; uint8_t code; } core_dbias_step_t;
 #if CORE_UV_VIA_PMU
 /* C6-1.47 (ESP32-C6 PMU dbias). Anchored on two values from the C6 IDF
  * (pmu_param.h): code 1 = 0.6 V (PMU_HP_DBIAS_LIGHTSLEEP_0V6_DEFAULT) and the
- * stock HP-active code 25 (HP_CALI_DBIAS_DEFAULT) ≈ 1.10 V. That's ~21 mV/code,
+ * stock HP-active code 25 (HP_CALI_DBIAS_DEFAULT) ≈ 1.15 V. That's ~21 mV/code,
  * a straight line used to interpolate the intermediate codes. The high anchor
  * (~1.15 V) is the IDF max; rows above stock are not used for undervolting. */
 static const core_dbias_step_t CORE_DBIAS_GRID[] = {
   {  600, 1  }, {  700, 6  }, {  800, 10 }, {  900, 15 },
-  { 1000, 20 }, { 1050, 22 }, { 1100, 25 }, { 1150, 27 },
+  { 1000, 20 }, { 1025, 21 }, { 1050, 22 }, { 1075, 24 },
+  { 1100, 25 }, { 1150, 27 },
 };
 static const uint8_t CORE_DBIAS_GRID_N = sizeof(CORE_DBIAS_GRID) / sizeof(CORE_DBIAS_GRID[0]);
 #define CORE_DBIAS_STOCK 25          // C6 stock HP-active (HP_CALI_DBIAS_DEFAULT) — safe fallback
@@ -131,7 +129,7 @@ static const core_dbias_step_t CORE_DBIAS_GRID[] = {
   { 1150, 25 }, { 1200, 28 }, { 1250, 30 }, { 1300, 31 },
 };
 static const uint8_t CORE_DBIAS_GRID_N = sizeof(CORE_DBIAS_GRID) / sizeof(CORE_DBIAS_GRID[0]);
-#define CORE_DBIAS_STOCK 30          // 1.25 V — IDF's default; the safe fallback
+#define CORE_DBIAS_STOCK 25          // 1.15 V — IDF's default; the safe fallback
 #endif
 
 /* Requested mV -> nearest hardware dbias code via piecewise-linear interpolation

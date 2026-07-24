@@ -35,7 +35,11 @@
  * ========================================================================== */
 #pragma once
 #include <lvgl.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
 #include "esp_heap_caps.h"
+#endif
 
 /* One cache slot per app + the launcher grid. Keep in sync with the call sites;
  * unused slots cost nothing (lazy alloc). */
@@ -85,8 +89,12 @@ static inline void screen_cache_invalidate_all(void) {
  * render. Pushes the whole screen via the same call the flush path uses. */
 static inline bool screen_cache_blit(uint8_t slot) {
   if (!screen_cache_valid(slot)) return false;
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
   gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)s_sc[slot].buf, screenWidth, screenHeight);
   return true;
+#else
+  return false;   // screen cache disabled when an external framework owns flush (Maix/Tuya)
+#endif
 }
 
 /* Capture a fully-rendered screen object into the slot's PSRAM buffer. Allocates
@@ -96,6 +104,9 @@ static inline bool screen_cache_blit(uint8_t slot) {
  * keeps that cost off the visible open frame. Safe to call on every open; it just
  * refreshes the cache for next time. */
 static inline void screen_cache_capture(uint8_t slot, lv_obj_t *scr) {
+#if BOARD_PLATFORM_MAIX
+  (void)slot; (void)scr;   // screen cache is a PSRAM-only optimization; disabled on Maix
+#else
   if (slot >= SC_SLOT_COUNT || scr == nullptr) return;
 
   // Lazy-allocate this slot's PSRAM buffer on first capture.
@@ -121,4 +132,5 @@ static inline void screen_cache_capture(uint8_t slot, lv_obj_t *scr) {
   s_sc[slot].valid = (r == LV_RESULT_OK);
   if (r != LV_RESULT_OK)
     USBSerial.printf("[scache] slot %u: snapshot failed (rc=%d)\n", (unsigned)slot, (int)r);
+#endif  /* !BOARD_PLATFORM_MAIX */
 }

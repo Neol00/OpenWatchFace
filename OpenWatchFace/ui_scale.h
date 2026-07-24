@@ -34,9 +34,17 @@
  * it MUST be included AFTER that declaration. It deliberately does NOT re-declare
  * screenWidth (an `extern` would clash with the file-static definition). */
 
-/* Scale factor as a percent (e.g. 100 = 1.0x on the S3, ~42 on the C6's 172px). */
+/* Scale factor as a percent (e.g. 100 = 1.0x on the S3, ~42 on the C6's 172px).
+ * A board can pin an EXPLICIT factor with BOARD_UI_SCALE_PCT instead of the
+ * width-derived one — used by the round 240x240 (width says 59%, but the panel
+ * is only 48% of the reference HEIGHT, so the width factor overflows vertically;
+ * a flat 50% fits both axes on the round bezel). */
 static inline int ui_scale_pct(void) {
+#ifdef BOARD_UI_SCALE_PCT
+  return BOARD_UI_SCALE_PCT;
+#else
   return (int)((screenWidth * 100u) / UI_REF_W);
+#endif
 }
 
 /* Map a reference-pixel value to this screen. Rounds to nearest. Signed so it

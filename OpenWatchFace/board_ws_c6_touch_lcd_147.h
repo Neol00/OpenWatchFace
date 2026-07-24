@@ -33,13 +33,29 @@
 #define BOARD_DUAL_CORE           0
 #define BOARD_HAS_PMU_AXP2101     0
 #define BOARD_HAS_ADC_BATTERY     1   /* no PMU; battery sensed on an ADC divider */
+
+/* Extended NVS: Preferences live in the 1 MB "nvsext" partition (app1's old
+ * slot in partitions_c6_8mb.csv — no OTA), not the 20 KB head "nvs" (kept for
+ * the system stores: WiFi PHY/cal, BLE bonds). See settings_load(). */
+#define BOARD_NVS_EXT_LABEL "nvsext"
 #define BOARD_HAS_RTC_PCF85063    0
 #define BOARD_HAS_AUDIO_ES8311    0
+#define BOARD_HAS_AUDIO_PWM       0   /* speaker REMOVED — GPIO7 repurposed as deep-sleep wake
+                                       * input (BOOT button wired in parallel to GPIO7). */
 #define BOARD_HAS_HAPTICS         0
 #define BOARD_HAS_SD_MMC          0
 #define BOARD_HAS_SD_SPI          1   /* shares the LCD SPI bus; CS below */
 #define BOARD_HAS_IMU_QMI8658     1   /* on the touch I2C bus, addr 0x6B */
 #define BOARD_HAS_BACKLIGHT_PWM   1   /* brightness = PWM on LCD_BL */
+
+/* ---- Awake power model (mW; see power_model.h BOARD_PWR_* for the model) -----
+ * Same 172x320 JD9853 LCD as the S3-1.47, so screen + floor inherit the measured
+ * S3-1.47 defaults UNTIL measured here (battery header lets you meter this board).
+ * The C6 is SINGLE-core (vs the S3's dual), so its CPU coefficient is ~half — a
+ * starting estimate; refine against a meter. It HAS the QMI8658, so add the IMU
+ * draw when the step counter / sleep tracker is running. */
+#define BOARD_PWR_CPU_K           0.00130f   /* single core ~half the S3 dual-core k (estimate) */
+#define BOARD_PWR_IMU_MW          2.0f       /* QMI8658 ~0.5 mA @ ~3.9 V (pedometer); MEASURE to refine */
 
 /* Hardware summary for the Settings > About screen (one line per peripheral). */
 #define BOARD_HW_SUMMARY \
@@ -47,7 +63,7 @@
   "Touch:   AXS5106L capacitive\n" \
   "RTC:     internal (no chip)\n" \
   "IMU:     QMI8658\n" \
-  "PMU:     none (ADC battery)"
+  "PMU:     ETA6098 (ADC battery)"
 
 /* ---- BLE TX-power ladder (7 tiers: Min,VLow,Low,Mid,High,VHigh,Max) -------
  * The C6 controller's ESP_PWR_LVL_* enum has NO -24/-18 (its floor is -15) but
@@ -81,12 +97,8 @@
 #define BOARD_LCD_EVEN_ALIGN 0
 
 /* Lines per LVGL partial render buffer (x2). The buffers cost
- * 172 * lines * 2 bytes EACH, in scarce internal SRAM. 80 lines was ~27 KB x2 =
- * ~54 KB — too much on a board that also needs a big LVGL heap (no PSRAM). 40
- * lines = ~13.5 KB x2 = ~27 KB, freeing ~27 KB for the LVGL pool, at the cost of
- * 8 flushes per full frame instead of 4 (negligible: partial rendering rarely
- * redraws the whole screen, and the small frame flushes fast). */
-#define BOARD_PARTIAL_BUF_LINES 40
+ * 172 * lines * 2 bytes EACH */
+#define BOARD_PARTIAL_BUF_LINES 43
 
 /* ---- Touch: AXS5106L over I2C (shared with the QMI8658 IMU) --------------- */
 #define IIC_SDA  18
@@ -129,18 +141,43 @@
 #define BOARD_BATT_CAL_NUM  4070
 #define BOARD_BATT_CAL_DEN  4000
 
+/* ---- Audio: REMOVED on this unit. The PWM speaker (was AUDIO_PWM_PIN=GPIO7) has been
+ * desoldered and GPIO7 repurposed as the deep-sleep WAKE input (see below). BOARD_HAS_AUDIO_PWM
+ * is 0, so no audio code drives GPIO7. */
+
 /* ---- IMU ------------------------------------------------------------------- */
 #define IMU_QMI8658_ADDR 0x6B
+/* HARDWARE MOD for LP-core deep-sleep step counting: the IMU's SDA/SCL pads are ALSO wired to
+ * GPIO5/GPIO6 (in addition to the original GPIO18/19 touch-bus routing through the IMU chip,
+ * which can't be cut). This BRIDGES GPIO5<->GPIO18 (IMU SDA net) and GPIO6<->GPIO19 (IMU SCL
+ * net) into single nets. Touch is also on GPIO18/19. So it's ONE shared bus reachable from
+ * either pin-pair. GPIO5/6 are in the C6 LP power domain (GPIO0..7), so the LP core can reach
+ * the IMU there during deep sleep.
+ *
+ * CONTENTION RULE (critical): GPIO5 and GPIO18 are the SAME net; GPIO6 and GPIO19 the same.
+ * NEVER drive both pins of a pair at once. So:
+ *   - AWAKE: the IMU stays on the normal shared touch bus (GPIO18/19, hardware I2C via Wire,
+ *     exactly as stock). GPIO5/6 are left as idle INPUTS — never driven by the HP CPU.
+ *   - ASLEEP: the LP core drives GPIO5/6 (GPIO18/19 are powered down with the HP domain, so
+ *     no conflict). The IMU's INT pins that were on GPIO5/6 are unused (pedometer engine dead).
+ *
+ * Hence the IMU is NOT on its own bus awake — it's shared (no IMU_HAS_OWN_BUS). GPIO5/6 are
+ * used ONLY by the LP-core sleep program. */
+#define IMU_LP_SDA_GPIO   5     /* LP-core (sleep) IMU SDA — bridged to GPIO18 at the IMU pad */
+#define IMU_LP_SCL_GPIO   6     /* LP-core (sleep) IMU SCL — bridged to GPIO19 at the IMU pad */
+#define BOARD_HAS_LP_STEPS 1    /* C6 LP-core deep-sleep step counting (analog of S3 ULP) */
 
 /* ---- Buttons / deep-sleep wake --------------------------------------------
- * BOOT button is on GPIO9 (used for the in-app menu while awake; pull-up, LOW =
- * pressed). The C6 uses real DEEP sleep, but it CANNOT arm a GPIO wake: the
- * silicon restricts deep-sleep wake to GPIO0..7, and both the BOOT button
- * (GPIO9) and the touch INT (GPIO21) are outside it. So the watch is brought
- * back from deep sleep with the hardware RST button — a reset is a clean cold
- * boot, which is exactly what every deep-sleep wake on this firmware already is.
- * board_sleep.h therefore arms NO button wake here (only the RTC timer). */
-#define BOOT_BTN_GPIO 9   /* C6 BOOT button; pull-up, LOW = pressed (awake-only) */
-/* No EXT0 on the C6 (RISC-V); board_sleep.h skips the GPIO wake-arm when this is
- * 0 and relies on the RTC timer + the hardware RST button. */
+ * BOOT button is on GPIO9 (used for the in-app menu while awake; pull-up, LOW = pressed).
+ * GPIO9 is a STRAPPING pin and is OUTSIDE the C6 deep-sleep wake mask (silicon allows only
+ * GPIO0..7), so it cannot wake from deep sleep — confirmed by a failed lib rebuild.
+ *
+ * HARDWARE MOD on this unit: a wire ties the BOOT button's GPIO9 node ALSO to GPIO7 (which
+ * IS in the GPIO0..7 wake mask and is NOT a strapping pin). The speaker that used GPIO7 was
+ * removed. So one BOOT press pulls BOTH GPIO9 (awake menu, unchanged) and GPIO7 (deep-sleep
+ * wake) LOW. board_sleep.h arms an esp_deep_sleep_enable_gpio_wakeup() on GPIO7, wake-on-LOW. */
+#define BOOT_BTN_GPIO 9   /* C6 BOOT button -> GPIO9 for the awake in-app menu (unchanged) */
+#define BOARD_WAKE_GPIO 7 /* deep-sleep wake input: BOOT button also wired to GPIO7 (HW mod) */
+/* No EXT0 on the C6 (RISC-V); the wake is the GPIO7 deep-sleep wake armed in board_sleep.h. */
 #define BOARD_WAKE_USE_EXT0 0
+#define BOARD_TRY_GPIO9_WAKE 0   /* GPIO9 wake proven impossible — now using the GPIO7 HW mod */

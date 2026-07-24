@@ -94,7 +94,9 @@ static void jd9853_reg_init(void) {
 
     WRITE_C8_D8, 0xDE, 0x00,
     WRITE_C8_D8, 0x36, 0x00,
-    WRITE_COMMAND_8, 0x21,
+    WRITE_COMMAND_8, 0x21,  // INVON — correct for this panel (0x20/INVOFF makes a full
+                            // negative incl. B&W). The wrong-TONE-but-correct-B&W issue
+                            // is an RGB-channel-ORDER problem, not display inversion.
     END_WRITE,
 
     DELAY, 10,

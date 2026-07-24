@@ -29,9 +29,22 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#if BOARD_PLATFORM_TUYA
+/* Keep the FreeRTOS task/type shims that the rest of the firmware reaches transitively
+ * through this header (e.g. the .ino's xTaskCreatePinnedToCore for the net task). The
+ * T5 then has its OWN real per-core CPU path (kernel run-time stats) below, since the
+ * ESP idle-hook registration is a no-op on this core (why the graph read 100%). The
+ * Tuya branch defines CPU_CORE_COUNT and the cpu_usage_* API itself — see the bottom
+ * of this branch — so the ESP/idle-hook bodies are skipped entirely on Tuya. */
+#include "tuya/compat/freertos/FreeRTOS.h"
+#include "tuya/compat/freertos/task.h"
+#include "tuya/compat/owf_tuya_cpu_stats.h"
+#else
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#endif
 
+#if !BOARD_PLATFORM_TUYA
 /* Number of CPU cores to profile. The S3-2.06 is dual-core; the C6-1.47 is
  * single-core, where xTaskGetIdleTaskHandleForCore(1) / an idle hook on core 1
  * ASSERT (xCoreID < 1). Driven by the board's BOARD_DUAL_CORE flag. */
@@ -166,7 +179,11 @@ static void cpu_usage_profile_tick(void) {}
 
 #else
 /* ======================= path 2: idle-tick proxy ========================== */
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_freertos_hooks.h"   // idle-hook registration no-op (CPU% reads idle)
+#else
 #include "esp_freertos_hooks.h"
+#endif
 
 /* Distinct ticks in which each core's idle task ran. volatile: written from the
  * idle task on each core, read from the UI; aligned 32-bit accesses are atomic
@@ -231,3 +248,18 @@ static void cpu_usage_profile_tick(void) {}
 static uint8_t cpu_usage_pct(uint8_t core) {
   return (core < 2) ? s_cpu_pct[core] : 0;
 }
+
+#else  /* BOARD_PLATFORM_TUYA: real per-core path via the T5 kernel run-time stats */
+
+/* The T5 app FreeRTOS SMP domain is 2 cores (the 3rd BK7258 core is the separate
+ * coprocessor domain — not in our scheduler, see owf_tuya_cpu_stats.h). */
+#define CPU_CORE_COUNT  OWF_TUYA_CPU_CORES
+#define CPU_CORE_MAX    OWF_TUYA_CPU_CORES
+
+static void cpu_usage_init(void)         { owf_tuya_cpu_init(); }
+static void cpu_usage_sample(void)       { owf_tuya_cpu_sample(); }
+static void cpu_usage_reset_window(void) { owf_tuya_cpu_reset_window(); }
+static void cpu_usage_profile_tick(void) {}   /* per-task serial profiler: n/a here */
+static uint8_t cpu_usage_pct(uint8_t core) { return owf_tuya_cpu_pct((int)core); }
+
+#endif  /* BOARD_PLATFORM_TUYA */

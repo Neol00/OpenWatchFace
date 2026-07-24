@@ -1,5 +1,5 @@
 /* ============================================================================
- *  watchface.h — the clock face: Fossil-style stat row + enormous HH:MM clock.
+ *  watchface.h — the clock face: stat row + enormous HH:MM clock.
  *
  *  Top row, three colored stat columns (bell/unread · battery · wifi) with a
  *  top-right indicator tray (caffeine mug, BLE glyph) and corner voltage; center
@@ -34,6 +34,8 @@ static lv_obj_t *lbl_ble_icon = nullptr;                   // top-right BLE glyp
  * representations always track real state (watchface_set_wifi/_set_ble update both);
  * watchface_apply_indicator_layout() shows exactly one of each pair per the setting. */
 static lv_obj_t *lbl_wifi_tray = nullptr;                  // top-right WiFi glyph (used when swapped)
+static lv_obj_t *lbl_mute_icon = nullptr;                  // top-right muted-speaker glyph, shown when muted
+static lv_obj_t *lbl_sleep_icon = nullptr;                 // top-right sleep-mode glyph, shown while a sleep session is active
 static lv_obj_t *lbl_ble_col_icon = nullptr, *lbl_ble_col_txt = nullptr;  // RIGHT column BLE (used when swapped)
 
 /* Container handles, kept so the deep-dim "minimal face" (watchface_set_minimal)
@@ -75,7 +77,14 @@ static lv_obj_t *make_stat_column(lv_obj_t *scr, int cx_pct, int y) {
 static void watchface_realign_volt(void) {
   if (!lbl_volt || !wf_corner_tray) return;
   lv_obj_update_layout(wf_corner_tray);     // recompute content-size width NOW
+#if BOARD_SCREEN_ROUND
+  // ROUND: the tray is parked lower-and-inset (see watchface_create). The voltage sits to
+  // its left on the SAME row, so it shares the wide part of the circle and stays visible
+  // whether or not any tray icon is showing. Tighter gap since the tray is already inset.
+  lv_obj_align_to(lbl_volt, wf_corner_tray, LV_ALIGN_OUT_LEFT_MID, UI_PX(-12), 0);
+#else
   lv_obj_align_to(lbl_volt, wf_corner_tray, LV_ALIGN_OUT_LEFT_MID, UI_PX(-20), 0);
+#endif
 }
 
 static void watchface_create(void) {
@@ -84,7 +93,16 @@ static void watchface_create(void) {
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+  // ROUND panel (T5-1.75): the corners are clipped by the bezel, so anything parked in
+  // the top corners (the indicator tray + voltage) or near the very top edge is cut off,
+  // and the stat row sat low enough to crowd the big clock. Pull the stat row UP and pull
+  // corner content DOWN+IN so it lands inside the inscribed circle. Square panels keep their
+  // original values (this whole block is gated on BOARD_SCREEN_ROUND).
+#if BOARD_SCREEN_ROUND
+  const int TOP_Y = UI_PX(112);  // stat row higher -> clears the clock below
+#else
   const int TOP_Y = UI_PX(128);  // vertical offset of the stat row (scaled to panel)
+#endif
 
   /* --- Voltage readout: tucked in the top-right corner (its own little label).
    *     Its X is NOT fixed — it's re-anchored to the LEFT of the indicator tray
@@ -112,13 +130,43 @@ static void watchface_create(void) {
   lv_obj_set_flex_align(corner_tray, LV_FLEX_ALIGN_END,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(corner_tray, UI_PX(6), 0);
+#if BOARD_SCREEN_ROUND
+  // ROUND: the top-right corner is clipped, so park the tray LOWER (where the circle is
+  // wide) and well INSET so the rightmost icon — and the voltage label anchored to the
+  // tray's left — stay inside the bezel. Aligned top-CENTER-ish-right: down UI_PX(64),
+  // pulled in from the right edge by UI_PX(96).
+  lv_obj_align(corner_tray, LV_ALIGN_TOP_RIGHT, UI_PX(-96), UI_PX(64));
+#else
   lv_obj_align(corner_tray, LV_ALIGN_TOP_RIGHT, UI_PX(-56), UI_PX(14));  // inset clears the rounded corner
+#endif
+
+  /* --- Sleep-mode indicator: a PURPLE moon glyph shown while a sleep-tracking session
+   *     is active (Do-Not-Disturb + overnight movement logging). Leftmost tray child so
+   *     it sits at the far left of the icon group. Uses the MDI moon glyph in the
+   *     icons14/22 font, sized to match the caffeine mug (14px C6 / 22px S3). Flex skips
+   *     it while hidden. --- */
+  lbl_sleep_icon = lv_label_create(corner_tray);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_sleep_icon, &icons14, 0);
+#else
+  lv_obj_set_style_text_font(lbl_sleep_icon, &icons22, 0);
+#endif
+  lv_obj_set_style_text_color(lbl_sleep_icon, lv_color_hex(ui_deco_hex(0x9B8CFF)), 0);  // purple
+  { char u[5]; lv_label_set_text(lbl_sleep_icon, mdi_utf8(MDI_SLEEP, u)); }
+  lv_obj_add_flag(lbl_sleep_icon, LV_OBJ_FLAG_HIDDEN);
 
   /* --- BLE indicator: a BLUE Bluetooth glyph, hidden unless a phone is connected.
    *     First (leftmost) tray child, so it sits to the LEFT of the caffeine mug when
    *     both show, and slides into the corner when the mug is hidden. --- */
   lbl_ble_icon = lv_label_create(corner_tray);
+  // Built-in glyph fonts are FIXED-size (not UI_PX-scaled), so the 22px glyph that
+  // fits the S3 is oversized on the narrow C6 and clips into the voltage label /
+  // caffeine mug. Use a smaller glyph there; S3 keeps montserrat_22.
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_ble_icon, &lv_font_montserrat_14, 0);
+#else
   lv_obj_set_style_text_font(lbl_ble_icon, &lv_font_montserrat_22, 0);
+#endif
   lv_obj_set_style_text_color(lbl_ble_icon, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);  // blue, matches wifi
   lv_label_set_text(lbl_ble_icon, LV_SYMBOL_BLUETOOTH);
   lv_obj_add_flag(lbl_ble_icon, LV_OBJ_FLAG_HIDDEN);
@@ -128,52 +176,53 @@ static void watchface_create(void) {
    *     shown/dimmed by connection state, like the column copy). Sits between the BLE
    *     glyph and the caffeine mug; flex skips it while hidden so nothing shifts. --- */
   lbl_wifi_tray = lv_label_create(corner_tray);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_wifi_tray, &lv_font_montserrat_14, 0);   // narrow: shrink (fixed glyph)
+#else
   lv_obj_set_style_text_font(lbl_wifi_tray, &lv_font_montserrat_22, 0);
+#endif
   lv_obj_set_style_text_color(lbl_wifi_tray, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);  // blue
   lv_label_set_text(lbl_wifi_tray, LV_SYMBOL_WIFI);
   lv_obj_add_flag(lbl_wifi_tray, LV_OBJ_FLAG_HIDDEN);
 
-  /* --- Caffeine (keep-awake) indicator: a tiny GRAY coffee mug, hidden unless
-   *     caffeine is on. Last (rightmost) tray child, so it holds the corner. Built
-   *     from shapes (no coffee glyph in the symbol font), matching the shade's
-   *     toggle icon. --- */
-  caf_ind = lv_obj_create(corner_tray);
-  lv_obj_remove_style_all(caf_ind);
-  lv_obj_set_size(caf_ind, UI_PX(24), UI_PX(20));
-  lv_obj_clear_flag(caf_ind, LV_OBJ_FLAG_SCROLLABLE);
-  {
-    lv_obj_t *body = lv_obj_create(caf_ind);          // mug body
-    lv_obj_remove_style_all(body);
-    lv_obj_set_size(body, UI_PX(15), UI_PX(11));
-    lv_obj_align(body, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_bg_color(body, lv_color_hex(0x999999), 0);
-    lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(body, UI_PX(2), 0);
-    lv_obj_t *hd = lv_obj_create(caf_ind);            // ring handle
-    lv_obj_remove_style_all(hd);
-    lv_obj_set_size(hd, UI_PX(8), UI_PX(9));
-    lv_obj_align(hd, LV_ALIGN_BOTTOM_RIGHT, 0, UI_PX(-1));
-    lv_obj_set_style_border_color(hd, lv_color_hex(0x999999), 0);
-    lv_obj_set_style_border_width(hd, UI_PX(2), 0);
-    lv_obj_set_style_radius(hd, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(hd, LV_OPA_TRANSP, 0);
-    for (int i = 0; i < 2; i++) {                     // steam
-      lv_obj_t *st = lv_obj_create(caf_ind);
-      lv_obj_remove_style_all(st);
-      lv_obj_set_size(st, UI_PX(2), UI_PX(5));
-      lv_obj_align(st, LV_ALIGN_TOP_LEFT, UI_PX(3 + i * 6), 0);
-      lv_obj_set_style_bg_color(st, lv_color_hex(0x666666), 0);
-      lv_obj_set_style_bg_opa(st, LV_OPA_COVER, 0);
-      lv_obj_set_style_radius(st, 1, 0);
-    }
-  }
+  /* --- Mute indicator: the empty/no-sound speaker glyph, shown only when the watch is
+   *     muted. A gray at-a-glance cue, same treatment as the other tray icons (smaller
+   *     fixed glyph on the narrow C6 so it doesn't clip; full size on the S3). Flex
+   *     skips it while hidden so the tray collapses the gap. --- */
+  lbl_mute_icon = lv_label_create(corner_tray);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_mute_icon, &lv_font_montserrat_14, 0);
+#else
+  lv_obj_set_style_text_font(lbl_mute_icon, &lv_font_montserrat_22, 0);
+#endif
+  lv_obj_set_style_text_color(lbl_mute_icon, lv_color_hex(0x999999), 0);   // gray, like the mug
+  lv_label_set_text(lbl_mute_icon, LV_SYMBOL_MUTE);                        // empty speaker / no sound
+  lv_obj_add_flag(lbl_mute_icon, LV_OBJ_FLAG_HIDDEN);
+
+  /* --- Caffeine (keep-awake) indicator: a GRAY coffee-outline glyph (Material Design
+   *     Icons font), hidden unless caffeine is on. Last (rightmost) tray child, so it
+   *     holds the corner. Was hand-built from shapes (crude at the small corner size);
+   *     now the MDI glyph, sized to MATCH the WiFi/BLE icons (14px C6 / 22px S3) and
+   *     crisply anti-aliased at both. --- */
+  caf_ind = lv_label_create(corner_tray);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(caf_ind, &icons14, 0);
+#else
+  lv_obj_set_style_text_font(caf_ind, &icons22, 0);
+#endif
+  lv_obj_set_style_text_color(caf_ind, lv_color_hex(0x999999), 0);   // gray
+  { char u[5]; lv_label_set_text(caf_ind, mdi_utf8(MDI_COFFEE, u)); }
   lv_obj_add_flag(caf_ind, LV_OBJ_FLAG_HIDDEN);       // shown only when caffeine is on
 
   /* --- LEFT column: RED bell + unread count --- */
   lv_obj_t *lcol = make_stat_column(scr, 22, TOP_Y);
   wf_lcol = lcol;                           // kept for watchface_set_minimal
   lbl_bell_icon = lv_label_create(lcol);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_bell_icon, &lv_font_montserrat_14, 0);   // narrow panel: smaller stat icon
+#else
   lv_obj_set_style_text_font(lbl_bell_icon, &lv_font_montserrat_22, 0);
+#endif
   lv_obj_set_style_text_color(lbl_bell_icon, lv_color_hex(0xFF4D4D), 0);  // red
   lv_label_set_text(lbl_bell_icon, LV_SYMBOL_BELL);
   lbl_bell_cnt = lv_label_create(lcol);
@@ -218,7 +267,11 @@ static void watchface_create(void) {
   lv_obj_t *rcol = make_stat_column(scr, 78, TOP_Y);
   wf_rcol = rcol;                           // kept for watchface_set_minimal
   lbl_wifi_icon = lv_label_create(rcol);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_wifi_icon, &lv_font_montserrat_14, 0);   // narrow panel: smaller stat icon
+#else
   lv_obj_set_style_text_font(lbl_wifi_icon, &lv_font_montserrat_22, 0);
+#endif
   lv_obj_set_style_text_color(lbl_wifi_icon, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);  // blue
   lv_label_set_text(lbl_wifi_icon, LV_SYMBOL_WIFI);
   lbl_wifi_txt = lv_label_create(rcol);
@@ -231,7 +284,11 @@ static void watchface_create(void) {
    *     column as wifi; watchface_apply_indicator_layout() hides one pair and shows the
    *     other so the column holds exactly one indicator. Hidden by default. --- */
   lbl_ble_col_icon = lv_label_create(rcol);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(lbl_ble_col_icon, &lv_font_montserrat_14, 0);   // narrow panel: smaller stat icon
+#else
   lv_obj_set_style_text_font(lbl_ble_col_icon, &lv_font_montserrat_22, 0);
+#endif
   lv_obj_set_style_text_color(lbl_ble_col_icon, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);  // blue
   lv_label_set_text(lbl_ble_col_icon, LV_SYMBOL_BLUETOOTH);
   lv_obj_add_flag(lbl_ble_col_icon, LV_OBJ_FLAG_HIDDEN);
@@ -287,20 +344,26 @@ static void watchface_update(const RTC_DateTime &dt) {
 static void watchface_set_battery(int pct, bool charging, uint16_t mv) {
   lv_label_set_text_fmt(lbl_volt, "%u.%02uV", mv / 1000, (mv % 1000) / 10);
 
-  if (pct < 0) {  // no battery / not readable
+  if (pct < 0 && !charging) {  // no battery / not readable AND not on USB
     lv_obj_set_width(batt_fill, LV_PCT(0));
     lv_label_set_text(lbl_batt_pct, "USB");
     return;
   }
   if (pct > 100) pct = 100;
 
-  lv_obj_set_width(batt_fill, LV_PCT(pct < 8 ? 8 : pct));  // keep a sliver visible
-  lv_label_set_text_fmt(lbl_batt_pct, "%d%%", pct);
+  // While charging (USB attached) the %-from-voltage reads high and isn't the cell's
+  // true charge, so show "USB" instead of a misleading number — but still fill the
+  // icon (purple = charging) so it reads as "plugged in", not empty. A clamp keeps a
+  // visible sliver even at a low/unknown %.
+  int fill_pct = (pct < 0) ? 100 : (pct < 8 ? 8 : pct);
+  lv_obj_set_width(batt_fill, LV_PCT(fill_pct));
+  if (charging) lv_label_set_text(lbl_batt_pct, "USB");
+  else          lv_label_set_text_fmt(lbl_batt_pct, "%d%%", pct);
 
   lv_color_t fill;
-  if (charging)        fill = lv_color_hex(0x8080FF);   // purple while charging
-  else if (pct >= 60)  fill = lv_color_hex(0x33CC55);   // green: healthy
-  else if (pct >= 25)  fill = lv_color_hex(0xFFC233);   // yellow: middle
+  if (charging)        fill = lv_color_hex(0x8080FF);   // purple while charging / on USB
+  else if (pct >= 30)  fill = lv_color_hex(0x33CC55);   // green: healthy
+  else if (pct >= 15)  fill = lv_color_hex(0xFFC233);   // yellow: middle
   else                 fill = lv_color_hex(0xFF4D4D);   // red: low
   lv_obj_set_style_bg_color(batt_fill, fill, 0);
 }
@@ -335,6 +398,25 @@ static void watchface_set_caffeine(bool on) {
   watchface_realign_volt();
 }
 
+/* Show/hide the top-right muted-speaker icon. Re-anchors the voltage label since the
+ * tray's width changes when the icon appears/disappears. Reads the live mute setting. */
+static void watchface_set_mute(bool muted) {
+  if (!lbl_mute_icon) return;
+  if (muted) lv_obj_clear_flag(lbl_mute_icon, LV_OBJ_FLAG_HIDDEN);
+  else       lv_obj_add_flag(lbl_mute_icon, LV_OBJ_FLAG_HIDDEN);
+  watchface_realign_volt();
+}
+
+/* Show/hide the top-right sleep-mode glyph. Re-anchors the voltage label since the
+ * tray width changes when the icon appears/disappears. Driven from the loop off the
+ * live s_sleep_mode setting (watchface_refresh_sleep_badge). */
+static void watchface_set_sleep(bool on) {
+  if (!lbl_sleep_icon) return;
+  if (on) lv_obj_clear_flag(lbl_sleep_icon, LV_OBJ_FLAG_HIDDEN);
+  else    lv_obj_add_flag(lbl_sleep_icon, LV_OBJ_FLAG_HIDDEN);
+  watchface_realign_volt();
+}
+
 /* Last-known indicator states, so watchface_apply_indicator_layout() can repaint the
  * newly-shown copy correctly after a swap (the setters cache here; the layout fn replays). */
 static bool wf_ble_connected = false;
@@ -346,6 +428,7 @@ static void watchface_paint_ble_tray(bool connected) {
   if (!lbl_ble_icon) return;
   if (connected) lv_obj_clear_flag(lbl_ble_icon, LV_OBJ_FLAG_HIDDEN);
   else           lv_obj_add_flag(lbl_ble_icon, LV_OBJ_FLAG_HIDDEN);
+  watchface_realign_volt();   // tray width changed -> re-anchor voltage so it makes room
 }
 
 /* Paint the BLE indicator in the right stat column (icon dim/bright + status text),
@@ -378,6 +461,7 @@ static void watchface_paint_wifi_tray(bool connected) {
   if (!lbl_wifi_tray) return;
   if (connected) lv_obj_clear_flag(lbl_wifi_tray, LV_OBJ_FLAG_HIDDEN);
   else           lv_obj_add_flag(lbl_wifi_tray, LV_OBJ_FLAG_HIDDEN);
+  watchface_realign_volt();   // tray width changed -> re-anchor voltage so it makes room
 }
 
 /* Apply the swap-WiFi/BLE layout: pick which indicator owns the right stat column and

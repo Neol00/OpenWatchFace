@@ -26,13 +26,75 @@
  *  These symbols must have C linkage to match LVGL (compiled as C), hence the
  *  extern "C" wrapper. Compiled out entirely unless the CUSTOM allocator is on.
  * ========================================================================== */
+#include "board.h"   // BOARD_PLATFORM_TUYA — must precede the gate below
 #include <lvgl.h>
 
-#if LV_USE_STDLIB_MALLOC == LV_STDLIB_CUSTOM
+/* Two backends for the same nine lv_*_core symbols, picked by platform:
+ *   - ESP boards: heap_caps_malloc(MALLOC_CAP_SPIRAM)  (esp_heap_caps.h)
+ *   - Tuya T5:    tal_psram_malloc()                   (tal_memory.h)
+ * Both target external PSRAM. The T5 distinction is CRITICAL: on the T5, plain
+ * malloc()/tal_malloc() hits the small ~640 KB SRAM heap, while tal_psram_malloc()
+ * hits the 16 MB PSRAM — they're SEPARATE heaps. LVGL must use PSRAM or a heavy
+ * draw (layer buffers + caches) exhausts SRAM and the device silently resets. */
+#if (LV_USE_STDLIB_MALLOC == LV_STDLIB_CUSTOM)
 
+#if BOARD_PLATFORM_TUYA
+/* ---- Tuya T5 backend: external PSRAM via the TKL psram heap ----------------
+ * Use tkl_system_psram_malloc/free/realloc — the EXACT functions the SDK's own
+ * LVGL allocator uses (src/liblvgl/v9/port/lv_port_mem.c). NOT tal_psram_*: the
+ * tal_* abstraction layer wraps tkl_* with extra bookkeeping that is NOT safe to
+ * call from the LVGL worker render thread concurrently with the loop task —
+ * which is exactly what a ROUNDED/CIRCLE fill does (lv_draw_sw_fill allocates a
+ * radius mask buffer per draw via lv_malloc, on the worker thread; plain rects
+ * never allocate). That mismatch crashed every menu with circular buttons. tkl_*
+ * is the raw heap the SDK trusts for this. Declared directly to avoid the
+ * ENABLE_EXT_RAM-gated prototypes in tkl_memory.h; symbols link from the SDK. */
+extern "C" {
+  void *tkl_system_psram_malloc(size_t size);
+  void  tkl_system_psram_free(void *ptr);
+  void *tkl_system_psram_realloc(void *ptr, size_t size);
+}
+
+extern "C" {
+
+void lv_mem_init(void)   { /* PSRAM heap is brought up by the SDK at boot */ }
+void lv_mem_deinit(void) { /* nothing to tear down */ }
+
+lv_mem_pool_t lv_mem_add_pool(void *mem, size_t bytes) {
+  (void)mem; (void)bytes; return NULL;     /* one global PSRAM heap */
+}
+void lv_mem_remove_pool(lv_mem_pool_t pool) { (void)pool; }
+
+void *lv_malloc_core(size_t size)               { return tkl_system_psram_malloc(size); }
+void *lv_realloc_core(void *p, size_t new_size) { return tkl_system_psram_realloc(p, new_size); }
+void lv_free_core(void *p)                      { tkl_system_psram_free(p); }
+
+void lv_mem_monitor_core(lv_mem_monitor_t *mon_p) {
+  if (mon_p) { lv_mem_monitor_t z = {}; *mon_p = z; }
+}
+lv_result_t lv_mem_test_core(void) { return LV_RESULT_OK; }
+
+}  // extern "C"
+
+#else
+/* ---- ESP backend: external PSRAM via heap_caps ---------------------------- */
 #include "esp_heap_caps.h"
 
+/* Caps for every LVGL allocation. On a board WITH PSRAM (S3) point them at the
+ * external 8 MB so the big caches/layers live there and free up internal SRAM.
+ *
+ * On a board WITHOUT PSRAM (the C6 — BOARD_HAS_PSRAM 0) MALLOC_CAP_SPIRAM can
+ * NEVER be satisfied: heap_caps_malloc(MALLOC_CAP_SPIRAM) returns NULL for every
+ * request. That made the very first lv_malloc inside lv_init() (the layout list)
+ * return NULL, and lv_flex_init() then stored through that NULL pointer -> the
+ * "Store access fault @ 0xc" boot loop. So on a no-PSRAM board route LVGL to
+ * INTERNAL SRAM instead. The caches/layers in lv_conf.h are already shrunk under
+ * BOARD_HAS_PSRAM==0 so they fit the C6's ~512 KB SRAM. */
+#if BOARD_HAS_PSRAM
 #define LV_PSRAM_CAPS  (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define LV_PSRAM_CAPS  (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#endif
 
 extern "C" {
 
@@ -64,5 +126,7 @@ void lv_mem_monitor_core(lv_mem_monitor_t *mon_p) {
 lv_result_t lv_mem_test_core(void) { return LV_RESULT_OK; }
 
 }  // extern "C"
+
+#endif  // BOARD_PLATFORM_TUYA
 
 #endif  // LV_USE_STDLIB_MALLOC == LV_STDLIB_CUSTOM

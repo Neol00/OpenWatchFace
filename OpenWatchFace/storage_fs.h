@@ -25,8 +25,13 @@
  *  notif_archive_sd.h).
  * ========================================================================== */
 #pragma once
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/FS.h"
+#include "tuya/compat/FFat.h"
+#else
 #include <FS.h>
 #include <FFat.h>
+#endif
 #include "sd_card.h"
 
 static bool s_ffat_tried = false;   // have we attempted to mount FFat this boot?
@@ -38,9 +43,17 @@ static bool s_ffat_ok    = false;   // is FFat mounted and usable?
 static bool ffat_mount(void) {
   if (s_ffat_tried) return s_ffat_ok;
   s_ffat_tried = true;
+#if !BOARD_HAS_FFAT
+  // This board has no on-flash FAT partition (e.g. the T5 — its flash layout reserves no
+  // user FS, so DEV_INNER_FLASH never mounts). Don't attempt it (avoids a guaranteed-fail
+  // mount + a misleading log); persistence on such boards uses SD + the platform KV store.
+  s_ffat_ok = false;
+  return false;
+#else
   s_ffat_ok = FFat.begin(true, "/ffat", 10, "ffat");
   USBSerial.printf("[ffat] mount %s\n", s_ffat_ok ? "OK (flash storage ready)" : "FAILED");
   return s_ffat_ok;
+#endif
 }
 
 /* True if the SD card is the active backend right now (mounted). When false but FFat

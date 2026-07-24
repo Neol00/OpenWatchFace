@@ -29,16 +29,19 @@
  * screen and a UI_PX(46)=~19px strip is a hard-to-hit sliver — so the C6 uses a
  * fraction of the SCREEN HEIGHT for the panel (drags most of the way down) and a
  * much taller grab strip. */
-#if BOARD_HAS_PSRAM
+/* Gate on the SCREEN, not PSRAM (the S3-1.47 has PSRAM but the same slim 172x320
+ * panel as the C6, so it needs the narrow-panel shade). BOARD_SCREEN_NARROW =
+ * every slim portrait panel regardless of chip/memory. */
+#if !BOARD_SCREEN_NARROW
 #define QS_PANEL_H   UI_PX(368)
 #define QS_STRIP_H   UI_PX(46)
 #define QS_BTNS_VERTICAL 0           // toggles in a horizontal row (wide screen)
-#define QS_TEXT_FONT FONT_SMALL      // header/value font (S3: unchanged)
+#define QS_TEXT_FONT FONT_SMALL      // header/value font (S3-2.06: unchanged)
 #else
-#define QS_PANEL_H   ((int)(screenHeight * 82 / 100))   // C6: most of the screen height
-#define QS_STRIP_H   60                                  // C6: tall, easy-to-grab strip
+#define QS_PANEL_H   ((int)(screenHeight * 82 / 100))   // narrow: most of the screen height
+#define QS_STRIP_H   30                                 // narrow:
 #define QS_BTNS_VERTICAL 1           // toggles stacked vertically (narrow screen)
-#define QS_TEXT_FONT lv_font_montserrat_20  // C6: bigger, readable (panel has the room)
+#define QS_TEXT_FONT lv_font_montserrat_20  // narrow: bigger, readable (panel has the room)
 #endif
 #define QS_SCRIM_OPA   LV_OPA_COVER   // scrim is fully opaque black (flat fill = cheap; no per-frame blend)
 #define QS_BRIGHT_MIN_PCT 3   // slider floor (~raw 8, near-dark but never fully off); 100% = raw 255
@@ -103,9 +106,56 @@ static void qs_anim_done(lv_anim_t *a) {
   if (lv_obj_get_y(qs_panel) <= qs_closed_y() + 1) {
     lv_obj_add_flag(qs_scrim, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_bg_opa(qs_scrim, LV_OPA_TRANSP, 0);
-    lv_obj_invalidate(lv_scr_act());   // force the revealed watchface to repaint
-    qs_dirty = true;                   // ...and make the loop push that final frame
+    // Force the REVEALED content to repaint. The scrim/panel live on lv_layer_sys(), but
+    // the content underneath may be on lv_layer_top() (an open menu/app) OR lv_scr_act()
+    // (the watchface). Invalidating only lv_scr_act() (the old behavior) misses the case
+    // where a MENU is open over the watchface — its layer is never repainted, so the black
+    // scrim lingers until the next unrelated invalidation ("drag up twice to clear it").
+    // Invalidate EVERY visible root so the revealed content repaints on the next
+    // lv_timer_handler() (the very next loop iteration — the loop spins fast). We do NOT
+    // call lv_refr_now() here: qs_anim_done runs INSIDE lv_display_refr_timer (anim
+    // completion fires mid-refresh), and lv_refr_now re-enters that same function with no
+    // re-entrancy guard (it overwrites the global disp_refr) — corrupting the in-flight
+    // render. The next-tick repaint is enough; the bug was never timing, it was that the
+    // OLD code invalidated only lv_scr_act() and missed a menu open on lv_layer_top().
+    lv_disp_t *d = lv_disp_get_default();
+    if (d) {
+      lv_obj_invalidate(lv_scr_act());
+      lv_obj_t *top = lv_display_get_layer_top(d);
+      lv_obj_t *sys = lv_display_get_layer_sys(d);
+      if (top) lv_obj_invalidate(top);
+      if (sys) lv_obj_invalidate(sys);
+    }
+    qs_dirty = true;                   // (DIRECT-mode loop push; harmless in PARTIAL)
   }
+}
+
+/* Loop-side RECONCILER (safety net): guarantee the opaque scrim is hidden once the shade is
+ * logically closed and no longer animating, even if qs_anim_done never ran. The close anim can
+ * be interrupted WITHOUT firing its completed-cb — e.g. a PRESS during the close slide calls
+ * lv_anim_del(qs_panel, qs_anim_exec) (no qs_anim_done), or two close paths (scrim-tap +
+ * drag-release) race. In those cases the panel parks closed but the full-screen black scrim
+ * stays visible -> "sometimes the screen goes black until you drag again". This runs on the
+ * LOOP thread (NOT mid-refresh, so invalidating is safe), is idempotent, and cheap: it only
+ * acts on the edge where the scrim is still visible but the shade is closed + not animating.
+ * Call once per loop iteration. */
+static inline void quick_shade_reconcile(void) {
+  if (!qs_panel || !qs_scrim) return;                       // shade not built yet (pre-init)
+  if (qs_open || qs_dragging) return;                       // still interactive -> leave it
+  if (lv_anim_get(qs_panel, qs_anim_exec)) return;          // close anim still running -> let it finish
+  if (lv_obj_has_flag(qs_scrim, LV_OBJ_FLAG_HIDDEN)) return;// already hidden -> nothing to do
+  // Closed, settled, but scrim still up: hide it and repaint every revealed root.
+  lv_obj_add_flag(qs_scrim, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_opa(qs_scrim, LV_OPA_TRANSP, 0);
+  lv_disp_t *d = lv_disp_get_default();
+  if (d) {
+    lv_obj_invalidate(lv_scr_act());
+    lv_obj_t *top = lv_display_get_layer_top(d);
+    lv_obj_t *sys = lv_display_get_layer_sys(d);
+    if (top) lv_obj_invalidate(top);
+    if (sys) lv_obj_invalidate(sys);
+  }
+  qs_dirty = true;
 }
 
 /* Animate the panel to a target Y (open=0 or closed=-H) with an ease-out snap. */
@@ -126,64 +176,44 @@ static void qs_animate_to(int32_t target) {
 static void quick_shade_close(void) { qs_animate_to(qs_closed_y()); }
 static bool quick_shade_is_open(void) { return qs_open; }
 
+/* Hard, SYNCHRONOUS close — no animation. Use when something modal must take the
+ * screen RIGHT NOW (alarm/timer/ring overlay) and the shade can't be left mid-
+ * slide underneath it: a running close anim + the loop's qs_dirty frame pushes
+ * keep mutating qs_panel/qs_scrim while the sys-layer modal is up, which freezes/
+ * crashes the UI. This kills any in-flight anim, parks the panel closed, hides the
+ * scrim, and clears all interactive state so quick_shade_active() goes false at
+ * once. LVGL-thread only (same as the rest of this module). */
+static void quick_shade_force_close(void) {
+  if (!qs_panel || !qs_scrim) return;        // not built yet (pre-init)
+  lv_anim_del(qs_panel, qs_anim_exec);       // stop any open/close slide (no completed-cb)
+  qs_open     = false;
+  qs_dragging = false;
+  lv_obj_set_y(qs_panel, qs_closed_y());     // park closed immediately
+  lv_obj_add_flag(qs_scrim, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_opa(qs_scrim, LV_OPA_TRANSP, 0);
+  qs_dirty = true;                           // one frame to clear the revealed content
+}
+
 /* True whenever the shade is open or being dragged — i.e. it's interactive and
  * on screen. The loop pushes a frame every iteration while this holds, so widgets
  * INSIDE the shade (the slider knob, the toggles) update live even on the bare
  * watchface, which otherwise has nothing to trigger a framebuffer push. */
 static inline bool quick_shade_active(void) { return qs_open || qs_dragging; }
 
-/* Draw a small coffee-cup icon (body + ring handle + two steam dashes) into the
- * caffeine button. LVGL's symbol font has no coffee glyph, so we build it from a
- * few white shapes — no font change needed. The button's bg color signals state. */
+/* Put the coffee-outline icon (Material Design Icons font, 28px to match the mute
+ * speaker glyph beside it) into the caffeine button. Was hand-built from white shapes
+ * (no coffee glyph in the symbol font); now the MDI glyph for a crisp, consistent
+ * look. The button's bg color signals state; the glyph is click-transparent so a tap
+ * anywhere on it still reaches the button. */
 static void qs_build_coffee(lv_obj_t *btn) {
-  lv_obj_t *c = lv_obj_create(btn);
-  lv_obj_remove_style_all(c);
-  lv_obj_set_size(c, UI_PX(34), UI_PX(30));
+  lv_obj_t *c = lv_label_create(btn);
+  lv_obj_set_style_text_font(c, &icons28, 0);
+  lv_obj_set_style_text_color(c, lv_color_white(), 0);
+  { char u[5]; lv_label_set_text(c, mdi_utf8(MDI_COFFEE, u)); }
   lv_obj_center(c);
-  lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-  // The coffee icon is decorative overlay on the button. By default these child
-  // objects sit ON TOP of the button and SWALLOW a tap that lands on them — so
-  // pressing the mug itself (dead center) never reached the button. Make the icon
-  // click-transparent: not clickable, and bubble any event up to the parent button.
+  // Decorative overlay: don't let the glyph swallow a tap aimed at the button.
   lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(c, LV_OBJ_FLAG_EVENT_BUBBLE);
-
-  lv_obj_t *body = lv_obj_create(c);          // cup body
-  lv_obj_remove_style_all(body);
-  lv_obj_set_size(body, UI_PX(22), UI_PX(18));
-  lv_obj_align(body, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-  lv_obj_set_style_bg_color(body, lv_color_white(), 0);
-  lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(body, UI_PX(4), 0);
-
-  lv_obj_t *h = lv_obj_create(c);             // ring handle
-  lv_obj_remove_style_all(h);
-  lv_obj_set_size(h, UI_PX(12), UI_PX(14));
-  lv_obj_align(h, LV_ALIGN_BOTTOM_RIGHT, 0, UI_PX(-2));
-  lv_obj_set_style_border_color(h, lv_color_white(), 0);
-  lv_obj_set_style_border_width(h, UI_PX(3), 0);
-  lv_obj_set_style_radius(h, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(h, LV_OPA_TRANSP, 0);
-
-  for (int i = 0; i < 2; i++) {               // steam
-    lv_obj_t *s = lv_obj_create(c);
-    lv_obj_remove_style_all(s);
-    lv_obj_set_size(s, UI_PX(3), UI_PX(8));
-    lv_obj_align(s, LV_ALIGN_TOP_LEFT, UI_PX(5 + i * 8), 0);
-    lv_obj_set_style_bg_color(s, lv_color_hex(0xBBBBBB), 0);
-    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s, UI_PX(2), 0);
-  }
-
-  // Make every shape click-transparent so a tap anywhere on the icon reaches the
-  // button. Each child must clear CLICKABLE and bubble, so an event chains child ->
-  // c -> button. (Done in one sweep over c's whole subtree.)
-  uint32_t kids = lv_obj_get_child_count(c);
-  for (uint32_t i = 0; i < kids; i++) {
-    lv_obj_t *k = lv_obj_get_child(c, i);
-    lv_obj_clear_flag(k, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(k, LV_OBJ_FLAG_EVENT_BUBBLE);
-  }
 }
 
 /* Paint both toggle buttons to match their state: accent bg = engaged. The mute
@@ -203,14 +233,12 @@ static void qs_refresh_toggles(void) {
 static void qs_caf_cb(lv_event_t *e) {
   (void)e;
   caffeine_set(!caffeine_get());
-  haptics_pulse(15);
-  qs_refresh_toggles();
+  qs_refresh_toggles();              // buzz comes from the global click hook now
 }
 static void qs_mute_cb(lv_event_t *e) {
   (void)e;
   settings_set_mute(!settings_get_mute());
-  haptics_pulse(15);
-  qs_refresh_toggles();
+  qs_refresh_toggles();              // buzz comes from the global click hook now
 }
 
 /* Recolor the resident shade to the current accent. The shade is built once at
@@ -246,6 +274,20 @@ static void qs_sync_slider(void) {
   int pct = qs_raw_to_pct(settings_get_brightness());
   if (qs_slider) lv_slider_set_value(qs_slider, pct, LV_ANIM_OFF);
   if (qs_val)    lv_label_set_text_fmt(qs_val, "%d%%", pct);
+}
+
+/* Programmatic OPEN (no touch drag) — the button-nav layer's DOWN shortcut on the
+ * watchface. Mirrors what a drag-past-threshold release does: scrim up + opaque,
+ * slider synced to the live brightness, then the same ease-out snap to y=0 (which
+ * also sets qs_open). Touch boards never call this. */
+static void quick_shade_open(void) {
+  if (!qs_panel || !qs_scrim) return;   // not built yet (pre-init)
+  if (qs_open) return;
+  lv_anim_del(qs_panel, qs_anim_exec);  // cancel an in-flight close snap, if any
+  lv_obj_clear_flag(qs_scrim, LV_OBJ_FLAG_HIDDEN);
+  qs_scrim_show();
+  qs_sync_slider();
+  qs_animate_to(qs_open_y());
 }
 
 /* The drag tracker — attached to BOTH the top strip (to open) and the panel (to
@@ -291,13 +333,24 @@ static void qs_scrim_cb(lv_event_t *e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) quick_shade_close();
 }
 
-/* Live brightness as the slider moves (applies + persists, same as the old
- * Brightness sub-app). */
+/* Brightness from the slider. The % readout tracks the finger LIVE (just a label — no QSPI), but
+ * WHEN the panel brightness is actually written differs by platform:
+ *   - ESP/Maix: live on every move (their backlight write is cheap / off the display bus).
+ *   - TUYA (T5): on RELEASE only. The CO5300 brightness (0x51) goes over the SAME QSPI bus that
+ *     streams the framebuffer; writing it on every drag step contends with the flush DMA and
+ *     collapses the slider to ~5fps. Deferring the write to release keeps the drag smooth; the live
+ *     % label still gives feedback, and the panel snaps to the chosen level the instant you let go. */
 static void qs_slider_cb(lv_event_t *e) {
   lv_obj_t *sl = (lv_obj_t *)lv_event_get_target(e);
   int pct = lv_slider_get_value(sl);          // 67..100
-  settings_set_brightness(qs_pct_to_raw(pct));
-  if (qs_val) lv_label_set_text_fmt(qs_val, "%d%%", pct);
+  if (qs_val) lv_label_set_text_fmt(qs_val, "%d%%", pct);   // live readout (cheap, no QSPI)
+#if BOARD_PLATFORM_TUYA
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)
+    settings_set_brightness(qs_pct_to_raw(pct));            // apply once, when the finger lifts
+#else
+  settings_set_brightness(qs_pct_to_raw(pct));             // live preview while dragging
+#endif
 }
 
 /* Build the shade once. Call from setup() after the display/menu exist. */
@@ -334,7 +387,15 @@ static void quick_shade_init(void) {
   lv_obj_set_style_text_font(qs_hdr, &QS_TEXT_FONT, 0);
   lv_obj_set_style_text_color(qs_hdr, lv_color_hex(ui_accent_hex()), 0);
   lv_label_set_text(qs_hdr, LV_SYMBOL_EYE_OPEN "  Brightness");
+#if BOARD_SCREEN_ROUND
+  // ROUND: the panel's top-left corner is clipped by the bezel, so the usual UI_PX(32) inset
+  // puts the leading sun glyph under the curve (it disappears). Push the header further right
+  // so the whole "<glyph> Brightness" string clears the arc. (The % value is TOP_RIGHT-anchored
+  // and already visible, so it's left untouched.)
+  lv_obj_align(qs_hdr, LV_ALIGN_TOP_LEFT, UI_PX(72), UI_PX(54));
+#else
   lv_obj_align(qs_hdr, LV_ALIGN_TOP_LEFT, UI_PX(32), UI_PX(54));
+#endif
 
   qs_val = lv_label_create(qs_panel);
   lv_obj_set_style_text_font(qs_val, &QS_TEXT_FONT, 0);
@@ -362,7 +423,9 @@ static void quick_shade_init(void) {
 #endif
   lv_obj_set_style_bg_color(qs_slider, lv_color_hex(ui_accent_hex()), LV_PART_INDICATOR);
   lv_obj_set_style_bg_color(qs_slider, lv_color_hex(ui_accent_hex()), LV_PART_KNOB);
-  lv_obj_add_event_cb(qs_slider, qs_slider_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(qs_slider, qs_slider_cb, LV_EVENT_VALUE_CHANGED, nullptr);  // live % readout
+  lv_obj_add_event_cb(qs_slider, qs_slider_cb, LV_EVENT_RELEASED, nullptr);       // apply (Tuya: on release)
+  lv_obj_add_event_cb(qs_slider, qs_slider_cb, LV_EVENT_PRESS_LOST, nullptr);     // apply if the press is lost
   qs_sync_slider();
 
   // --- quick toggles: Caffeine (keep-awake, LEFT) + Mute (sound off / still

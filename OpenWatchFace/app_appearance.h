@@ -122,7 +122,13 @@ static void app_open_appearance(void) {
   // offsets (icon @20, name @60, switch @right) authored for THIS exact width, so
   // any rescale (LV_PCT/UI_PX) shifted the math and clipped names like "Voltage
   // reading" into the switch. Keep it byte-for-byte as before.
-  lv_obj_set_size(col, 374, 408);
+  // WIDTH stays byte-for-byte fixed for the reason above. The HEIGHT must not:
+  // 408 px from y=84 needs 492 px of screen, which the 502-px 2.06 has and the
+  // 448-px S3-1.8 does not — the container overhung the bottom, so the last row
+  // stayed clipped however far it scrolled. Derive it from the real screen,
+  // keeping the same 10 px bottom margin the 2.06 had (502-84-408 = 10).
+  lv_obj_set_width(col, 374);
+  lv_obj_set_height(col, (int)screenHeight - 84 - 10);
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 84);
   lv_obj_set_style_pad_all(col, 6, 0);
 #endif
@@ -133,10 +139,13 @@ static void app_open_appearance(void) {
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                         LV_FLEX_ALIGN_START);
   lv_obj_set_style_pad_row(col, UI_PX(22), 0);
+  // Empty scroll runway at the end of the list so the LAST row clears the bottom
+  // bezel when scrolled fully down (scaled, not the old flat 28 px — that was a
+  // 2.06 constant and left the final row clipping on the shorter S3-1.8).
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_pad_bottom(col, UI_PX(78), 0);
 #else
-  lv_obj_set_style_pad_bottom(col, 28, 0);
+  lv_obj_set_style_pad_bottom(col, UI_PX(56), 0);
 #endif
 
   // ---- MONOCHROME ACCENT (toggle above the swatches, as requested) ----

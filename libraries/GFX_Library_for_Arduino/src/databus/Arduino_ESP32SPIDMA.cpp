@@ -136,14 +136,26 @@ bool Arduino_ESP32SPIDMA::begin(int32_t speed, int8_t dataMode)
       .data5_io_num = -1,
       .data6_io_num = -1,
       .data7_io_num = -1,
-      .max_transfer_sz = (ESP32SPIDMA_MAX_PIXELS_AT_ONCE * 16) + 8,
+      // LOCAL (OpenWatchFace): big enough for a whole async tile in ONE DMA transfer
+      // (172 x up to ~120 lines x 2 B = ~41 KB). The stock value (ESP32SPIDMA_MAX_PIXELS
+      // *16+8 ~= 16 KB) forced multi-segment, and multi-segment async tiles rendered as
+      // a stale/black band the height of one buffer; one transfer per tile avoids it.
+      .max_transfer_sz = 48 * 1024,
       .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
       .intr_flags = 0};
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
-  esp_err_t ret = spi_bus_initialize((spi_host_device_t)_spi_num, &buscfg, ESP32SPIDMA_DMA_CHANNEL);
+  // LOCAL FIX (OpenWatchFace): resolve the IDF host by IDENTITY, exactly like the
+  // Arduino core (esp32-hal-spi.c: `host = (num == FSPI) ? SPI2_HOST : SPI3_HOST`).
+  // The stock arithmetic `_spi_num - 1` is WRONG on the C6: Arduino FSPI == 0 there,
+  // and IDF SPI1_HOST == 0 is the FLASH controller — so `(spi_host_device_t)0` grabbed
+  // the flash bus (already initialized WITH the flash device attached), giving the
+  // "SPI bus already initialized" abort and then a crash when freeing it. FSPI must map
+  // to SPI2_HOST, HSPI to SPI3_HOST, regardless of the Arduino enum's numeric value.
+#ifdef SPI3_HOST
+  spi_host_device_t _spidma_host = (_spi_num == FSPI) ? SPI2_HOST : SPI3_HOST;
 #else
-  esp_err_t ret = spi_bus_initialize((spi_host_device_t)(_spi_num - 1), &buscfg, ESP32SPIDMA_DMA_CHANNEL);
+  spi_host_device_t _spidma_host = SPI2_HOST;  // C6/C3/H2: single general-purpose SPI host
 #endif
+  esp_err_t ret = spi_bus_initialize(_spidma_host, &buscfg, ESP32SPIDMA_DMA_CHANNEL);
   if (ret != ESP_OK)
   {
     ESP_ERROR_CHECK(ret);
@@ -162,24 +174,27 @@ bool Arduino_ESP32SPIDMA::begin(int32_t speed, int8_t dataMode)
       .input_delay_ns = 0,
       .spics_io_num = -1, // avoid use system CS control
       .flags = (_miso < 0) ? (uint32_t)SPI_DEVICE_NO_DUMMY : 0,
-      .queue_size = 1,
-      .pre_cb = nullptr,
-      .post_cb = nullptr};
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
-  ret = spi_bus_add_device((spi_host_device_t)_spi_num, &devcfg, &_handle);
-#else
-  ret = spi_bus_add_device((spi_host_device_t)(_spi_num - 1), &devcfg, &_handle);
-#endif
+      // LOCAL ADDITION (OpenWatchFace C6-1.47): queue_size>1 so writePixelsAsync() can
+      // hold several DMA tile segments in flight; pre/post callbacks drive CS + the
+      // flush-ready callback for the async path. Both no-op for sync transactions
+      // (.user == NULL), so all the normal blocking paths are unchanged.
+      .queue_size = ASYNC_MAX_SEG,
+      .pre_cb = Arduino_ESP32SPIDMA::_async_pre_cb,
+      .post_cb = Arduino_ESP32SPIDMA::_async_post_cb};
+  ret = spi_bus_add_device(_spidma_host, &devcfg, &_handle); // LOCAL FIX: resolved host (see above)
   if (ret != ESP_OK)
   {
     ESP_ERROR_CHECK(ret);
     return false;
   }
 
-  if (!_is_shared_interface)
-  {
-    spi_device_acquire_bus(_handle, portMAX_DELAY);
-  }
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): do NOT permanently acquire the bus, even
+  // in the non-shared case. spi_device_acquire_bus() forbids the queued/interrupt API
+  // (spi_device_queue_trans) for its whole duration — and writePixelsAsync() uses that
+  // queued API. The IDF spi_master arbitrates per-transaction between this LCD device
+  // and the microSD device that shares this host, so the permanent acquire isn't
+  // needed for correctness; dropping it is what lets the async flush + a 2nd device
+  // (SD) coexist. (Original: if (!_is_shared_interface) spi_device_acquire_bus(...);)
 
   memset(&_spi_tran, 0, sizeof(_spi_tran));
 
@@ -206,7 +221,14 @@ void Arduino_ESP32SPIDMA::beginWrite()
   _data_buf_bit_idx = 0;
   _buffer[0] = 0;
 
-  if (_is_shared_interface)
+  // LOCAL (OpenWatchFace C6): acquire the IDF bus across the WHOLE CS bracket while sync_only
+  // (SD coexists on this host). The display drives DC/CS via raw GPIO across MANY transactions
+  // per bracket; without holding the bus, the IDF lets a microSD transaction interleave between
+  // them -> both CS asserted -> garbled panel. Holding the bus makes the IDF block SD until
+  // endWrite releases. Tracked so endWrite releases iff we acquired. (Normal async mode does NOT
+  // acquire — incompatible with the queued DMA API.)
+  _bus_acquired = (_is_shared_interface || _sync_only);
+  if (_bus_acquired)
   {
     spi_device_acquire_bus(_handle, portMAX_DELAY);
   }
@@ -229,9 +251,10 @@ void Arduino_ESP32SPIDMA::endWrite()
     flush_data_buf();
   }
 
-  if (_is_shared_interface)
+  if (_bus_acquired)
   {
     spi_device_release_bus(_handle);
+    _bus_acquired = false;
   }
 
   CS_HIGH();
@@ -1024,6 +1047,136 @@ GFX_INLINE void Arduino_ESP32SPIDMA::POLL_START()
 GFX_INLINE void Arduino_ESP32SPIDMA::POLL_END()
 {
   spi_device_polling_end(_handle, portMAX_DELAY);
+}
+
+// ====================================================================
+// LOCAL ADDITION (OpenWatchFace C6-1.47): ASYNC tile write.
+// The caller (my_disp_flush) has already set the address window with sync polling
+// transactions and left DC HIGH (data) + the device's CS still HIGH. We take CS LOW
+// in the pre_cb of the first segment, stream the (already panel-byte-order, DMA-capable)
+// pixel buffer as up to ASYNC_MAX_SEG queued DMA transactions, and return immediately.
+// The wire drains under DMA while LVGL renders the next tile; the last segment's post_cb
+// raises CS and calls done_cb(done_arg) (lv_disp_flush_ready) from ISR context.
+// ====================================================================
+bool Arduino_ESP32SPIDMA::writePixelsAsync(const uint8_t *data, uint32_t len,
+                                           void (*done_cb)(void *), void *done_arg)
+{
+  // HYBRID: while SD I/O owns the shared host, refuse async so the caller flushes synchronously
+  // (a held bus / blocking transaction can't corrupt against the SD device). See set_sync_only.
+  if (_sync_only)
+  {
+    return false;
+  }
+  if (!len)
+  {
+    if (done_cb)
+    {
+      done_cb(done_arg);
+    }
+    return true;
+  }
+
+  // One DMA transaction per tile when possible: SEG matches the bus max_transfer_sz
+  // (48 KB), so a full partial tile goes out as a SINGLE queued transfer. Multi-segment
+  // async tiles rendered as a stale band; keeping it to one segment avoids that and is
+  // faster (one IRQ). Still a multiple of 2 for whole RGB565 pixels.
+  const uint32_t SEG = 48 * 1024; // bytes (== bus max_transfer_sz)
+  uint32_t nseg = (len + SEG - 1) / SEG;
+  if (nseg > (uint32_t)ASYNC_MAX_SEG)
+  {
+    return false; // too big for one CS bracket — caller uses the blocking path
+  }
+
+  waitAsync(); // only one async tile may be in flight at a time
+  _async_done_cb = done_cb;
+  _async_done_arg = done_arg;
+
+  for (uint32_t i = 0; i < nseg; i++)
+  {
+    spi_transaction_t *t = &_async_tran[i];
+    AsyncSeg *s = &_async_seg[i];
+    s->bus = this;
+    s->first = (i == 0);
+    s->last = (i == nseg - 1);
+
+    uint32_t off = i * SEG;
+    uint32_t l = len - off;
+    if (l > SEG)
+    {
+      l = SEG;
+    }
+
+    memset(t, 0, sizeof(*t));
+    t->tx_buffer = data + off;
+    t->length = l << 3; // bits
+    t->user = s;
+
+    if (spi_device_queue_trans(_handle, t, portMAX_DELAY) != ESP_OK)
+    {
+      waitAsync(); // reap whatever queued, leave the bus clean
+      return false;
+    }
+    _async_pending++;
+  }
+  return true;
+}
+
+// LOCAL ADDITION (OpenWatchFace C6-1.47): one dummy byte on THIS device with every CS on the
+// bus HIGH, so the IDF's device-switch reconfig (SD 20 MHz -> LCD 80 MHz) happens during a
+// transaction neither the panel nor the SD card is listening to. See header comment.
+void Arduino_ESP32SPIDMA::resyncBus(void)
+{
+  _spi_tran.length = 8;
+  _spi_tran.tx_data[0] = 0x00;
+  _spi_tran.flags = SPI_TRANS_USE_TXDATA;
+  POLL_START();
+  POLL_END();
+}
+
+// LOCAL ADDITION (OpenWatchFace C6-1.47): raise the panel's raw-GPIO CS. See header comment.
+void Arduino_ESP32SPIDMA::forceCsIdle(void)
+{
+  CS_HIGH();
+}
+
+void Arduino_ESP32SPIDMA::waitAsync()
+{
+  while (_async_pending)
+  {
+    spi_transaction_t *done;
+    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
+    _async_pending--;
+  }
+}
+
+// Both callbacks run in the SPI interrupt for EVERY transaction on this device; sync
+// transactions have .user == NULL and fall straight through. CS is written via the raw
+// port registers (NOT CS_LOW/CS_HIGH — those are fine here but we keep it register-direct
+// to stay ISR-safe and match the QSPI async path).
+void Arduino_ESP32SPIDMA::_async_pre_cb(spi_transaction_t *t)
+{
+  AsyncSeg *s = (AsyncSeg *)t->user;
+  if (s && s->first && s->bus->_cs != GFX_NOT_DEFINED)
+  {
+    *(s->bus->_csPortClr) = s->bus->_csPinMask; // CS LOW
+  }
+}
+
+void Arduino_ESP32SPIDMA::_async_post_cb(spi_transaction_t *t)
+{
+  AsyncSeg *s = (AsyncSeg *)t->user;
+  if (s && s->last)
+  {
+    Arduino_ESP32SPIDMA *b = s->bus;
+    if (b->_cs != GFX_NOT_DEFINED)
+    {
+      *(b->_csPortSet) = b->_csPinMask; // CS HIGH
+    }
+    if (b->_async_done_cb)
+    {
+      b->_async_done_cb(b->_async_done_arg);
+    }
+  }
 }
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)

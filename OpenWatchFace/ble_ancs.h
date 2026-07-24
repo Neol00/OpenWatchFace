@@ -756,10 +756,25 @@ static bool ancs_background_check(uint32_t budget_ms) {
   bool we_started_ble = false;
   if (!ble_is_up()) { ble_begin(); we_started_ble = true; }   // start advertising; iOS reconnects
 
-  uint32_t t0 = millis();
+  // DYNAMIC EXIT — don't sit out the full budget when the verdict is already in. iOS
+  // replays any pending-notification backlog IMMEDIATELY after Notification Source is
+  // subscribed (see the subscribe chain above), so once s_ancs_ns_subbed is up, a short
+  // quiet window with nothing landing means "nothing pending" — sleep NOW. budget_ms
+  // stays as the hard cap for the iPhone-never-reconnected case only. A backlog item
+  // mid-flight at the quiet cutoff isn't lost: iOS replays it again on the next fresh
+  // subscribe (next check wake).
+  const uint32_t ANCS_SUBBED_QUIET_MS = 1500;
+  uint32_t t0 = millis(), subbed_at = 0;
   bool got = false;
   while (millis() - t0 < budget_ms) {
     if (s_ancs_added_total != before) { got = true; break; }  // a notification landed
+    if (s_ancs_ns_subbed) {
+      if (!subbed_at) subbed_at = millis() | 1;               // first seen subscribed (|1: 0 is the sentinel)
+      else if (millis() - subbed_at >= ANCS_SUBBED_QUIET_MS) {
+        USBSerial.println("[ancs] subscribed + quiet -> nothing pending, ending check early");
+        break;                                                 // decided: nothing pending
+      }
+    }
     delay(50);                                                 // let the NimBLE task run
   }
 

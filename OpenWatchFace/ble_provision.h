@@ -32,6 +32,7 @@
 #pragma once
 #include <Arduino.h>
 #include <lvgl.h>
+#include <esp_heap_caps.h>    // heap_caps_get_free_size — ble_begin()'s OOM guard
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
@@ -94,6 +95,9 @@ static void ble_svc_changed_check(const ble_gap_conn_desc *desc) {
 /* ---- state (some written from the NimBLE task, read by the loop) ---- */
 static bool                 s_ble_up        = false;   // stack initialized + advertising
 static volatile bool        s_ble_connected = false;
+static volatile bool        s_ble_forgetting = false;  // a bond-forget is mid-flight: suppress
+                                                       // onDisconnect's auto-re-advertise so the
+                                                       // unpaired phone can't reconnect first
 static volatile bool        s_ble_show_key  = false;   // show the pair code overlay
 static volatile uint32_t    s_ble_passkey   = 0;       // 6-digit code to display
 static BLEServer           *s_ble_server     = nullptr;
@@ -167,7 +171,11 @@ class BleServerCB : public BLEServerCallbacks {
     ancs_reset();                             // forget discovered ANCS handles for this conn
     ams_reset();                              // ...and AMS (media) handles
     gb_reset();                               // ...and any half-received Gadgetbridge line
-    if (s_ble_up) BLEDevice::startAdvertising();
+    // Don't re-advertise while a forget is in progress: a still-bonded phone would
+    // see the advert and reconnect within ms, before ble_gap_unpair() finishes — the
+    // bond then re-persists and the delete appears to fail. ble_bond_forget restores
+    // advertising once the unpair is done.
+    if (s_ble_up && !s_ble_forgetting) BLEDevice::startAdvertising();
   }
 };
 
@@ -276,11 +284,31 @@ static bool ble_take_dirty(void) { bool d = s_ble_dirty; s_ble_dirty = false; re
  * list immediately, without leaving and re-entering the screen. */
 static bool ble_take_bond_dirty(void) { bool d = s_ble_bond_dirty; s_ble_bond_dirty = false; return d; }
 
+/* Minimum free INTERNAL SRAM to attempt a BLE bring-up. The NimBLE controller +
+ * host need ~45 KB of internal heap; if init can't get it, the controller never
+ * syncs and BLEDevice::init()'s unbounded `while(!m_synced)` busy-wait trips the
+ * task WDT (observed: enable with ~35 KB free -> WDT reset). Refusing below this
+ * floor turns that crash into a loud log + BLE staying off. */
+#define BLE_MIN_FREE_INTERNAL (55 * 1024)
+
 /* Bring up the BLE peripheral (idempotent). */
 static void ble_begin(void) {
   if (s_ble_up) return;
 
-  BLEDevice::init(DEVICE_BOARD);   // GAP name the phone sees = the board model (BOARD_NAME)
+  // OOM guard — see BLE_MIN_FREE_INTERNAL above. Only the FIRST bring-up needs the
+  // full budget from the general heap; after a ble_end() the controller memory stays
+  // reserved (deinit(false)), so re-enables are cheap — but by then this check passes
+  // trivially since that reserved memory isn't counted as free anyway.
+  size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  if (free_int < BLE_MIN_FREE_INTERNAL) {
+    USBSerial.printf("[ble] REFUSED: %u KB internal free < %u KB needed for controller+host "
+                     "(init would WDT in while(!m_synced))\n",
+                     (unsigned)(free_int / 1024), (unsigned)(BLE_MIN_FREE_INTERNAL / 1024));
+    return;                                   // s_ble_up stays false; ble_is_up() reports truth
+  }
+
+  USBSerial.printf("[ble] begin: %u KB internal free\n", (unsigned)(free_int / 1024));
+  BLEDevice::init(deviceRadioName().c_str());   // GAP name = per-unit "WatchFace-AB12" (MAC suffix)
   settings_apply_ble_txp();     // user's TX-power tier (controller resets it on init)
   BLEDevice::setSecurityCallbacks(&s_cb_security);
   ancs_install_gap_handler();   // observe inbound ANCS notifications (no core patch needed)
@@ -539,6 +567,14 @@ static bool ble_bond_label(int i, char *buf, size_t cap) {
   return ble_bond_addr_str(i, buf, cap);   // never connected since this feature: show MAC
 }
 
+/* Re-enable advertising after a forget and clear the suppress flag. Called on EVERY
+ * exit path of ble_bond_forget once it has stopped advertising, so the watch is
+ * always discoverable again whether the unpair succeeded or failed. */
+static void ble_forget_finish(void) {
+  s_ble_forgetting = false;
+  if (s_ble_up) BLEDevice::startAdvertising();
+}
+
 /* Forget (unpair) bond index i. Returns true if removed. */
 static bool ble_bond_forget(int i) {
   if (!s_ble_up) return false;
@@ -553,6 +589,12 @@ static bool ble_bond_forget(int i) {
   // peer's records (CCCDs etc.), resurrecting the "deleted" bond. If this bond IS the
   // live connection (match by identity address), drop the link by HANDLE first
   // (reliable) and let the disconnect settle before deleting the stored bond.
+  // Suppress the auto-re-advertise in onDisconnect AND actively stop advertising, so
+  // the phone we're about to unpair can't see an advert and reconnect before the
+  // unpair lands (which is what made deleting the live/only bond fail).
+  s_ble_forgetting = true;
+  BLEDevice::stopAdvertising();
+
   if (s_ble_server && s_ble_connected) {
     struct ble_gap_conn_desc d;
     if (ble_gap_conn_find(s_ble_server->getConnId(), &d) == 0 &&
@@ -567,7 +609,7 @@ static bool ble_bond_forget(int i) {
     delay(100);
     rc = ble_gap_unpair(&addrs[i]);
   }
-  if (rc != 0) { USBSerial.printf("[ble] unpair FAILED rc=%d\n", rc); return false; }
+  if (rc != 0) { USBSerial.printf("[ble] unpair FAILED rc=%d\n", rc); ble_forget_finish(); return false; }
 
   // Verify the bond is really gone — a still-encrypted peer can re-persist its
   // records between the delete and our return, which the UI would misread as success.
@@ -577,6 +619,7 @@ static bool ble_bond_forget(int i) {
     for (int k = 0; k < m; k++)
       if (ble_addr_cmp(&after[k], &addrs[i]) == 0) {
         USBSerial.println("[ble] unpair: bond re-appeared (peer link still up?)");
+        ble_forget_finish();
         return false;
       }
 
@@ -590,8 +633,71 @@ static bool ble_bond_forget(int i) {
     key[0] = 'g'; key[1] = 'v';
     prefs.remove(key);
   }
+  ble_forget_finish();   // unpaired cleanly -> resume advertising for the next phone
   return true;
 }
+
+/* ---- prune orphan per-peer NVS keys (NVS-leak fix) -------------------------
+ * We write "bn<mac>" (cached peer name) and "gv<mac>" (GATT schema version) per peer
+ * IDENTITY address, but they were only removed on an explicit user "forget" of a LIVE
+ * bond. Any address that isn't a current bond at that moment — an iPhone reconnecting
+ * under a rotating/unresolved address, a transient or failed pairing, a bond dropped by
+ * the phone side — left its key pair behind FOREVER. Over weeks these accumulate and fill
+ * the tiny 20 KB NVS partition, at which point the WiFi driver can't write its PHY
+ * calibration and fails with ret=101 (ESP_ERR_NVS_NOT_ENOUGH_SPACE) — the reported bug.
+ *
+ * Fix: at boot, walk every bn gv key in the "watch" namespace and delete any whose MAC
+ * is NOT one of the current NimBLE bonds (capped at BLE_BOND_MAX=3). Self-heals units that
+ * already leaked, and permanently caps these keys at less than 3 phones. Must run AFTER the NimBLE
+ * stack is up so ble_store_util_bonded_peers is valid. ESP/NVS only — the Tuya uses a
+ * different KV store and doesn't have this partition. */
+#if !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_MAIX
+#include <nvs.h>
+static void ble_prune_orphan_peer_keys(void) {
+  if (!s_ble_up) return;   // need the bond list; nothing to prune if the stack isn't up
+
+  // Current bonds -> a small set of "aabbccddeeff" mac strings (lowercase, our key order).
+  ble_addr_t bonds[BLE_BOND_MAX];
+  int nb = 0;
+  // If the bond query FAILS, bail — don't prune against an empty list, which would delete
+  // the keys of genuinely-bonded phones (harmless-ish since they'd re-create on next connect,
+  // but pointless churn). Only prune when we can trust the bond list.
+  if (ble_store_util_bonded_peers(bonds, &nb, BLE_BOND_MAX) != 0) return;
+  char bond_mac[BLE_BOND_MAX][13];
+  for (int i = 0; i < nb; i++) {
+    const uint8_t *v = bonds[i].val;
+    snprintf(bond_mac[i], sizeof(bond_mac[i]), "%02x%02x%02x%02x%02x%02x",
+             v[5], v[4], v[3], v[2], v[1], v[0]);
+  }
+
+  // Iterate the "watch" namespace. Collect orphan keys FIRST, then remove — deleting a key
+  // mid-iteration can invalidate the iterator. (Keys are "bnXXXXXXXXXXXX" / "gvXXXXXXXXXXXX".)
+  // Cap the batch so the buffer stays modest; a badly-leaked unit just drains over a few
+  // boots (each pass removes another batch until only the <=3 real bonds remain).
+  char to_remove[64][16];
+  int  nrem = 0;
+  nvs_iterator_t it = nullptr;
+  esp_err_t rc = nvs_entry_find("nvs", "watch", NVS_TYPE_ANY, &it);
+  while (rc == ESP_OK && it && nrem < (int)(sizeof(to_remove) / sizeof(to_remove[0]))) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    if ((strncmp(info.key, "bn", 2) == 0 || strncmp(info.key, "gv", 2) == 0) &&
+        strlen(info.key) == 14) {                 // 2-char prefix + 12 hex = per-peer key
+      const char *mac = info.key + 2;
+      bool bonded = false;
+      for (int i = 0; i < nb; i++) if (strcmp(mac, bond_mac[i]) == 0) { bonded = true; break; }
+      if (!bonded) { strlcpy(to_remove[nrem], info.key, sizeof(to_remove[nrem])); nrem++; }
+    }
+    rc = nvs_entry_next(&it);
+  }
+  if (it) nvs_release_iterator(it);
+
+  for (int i = 0; i < nrem; i++) prefs.remove(to_remove[i]);
+  if (nrem) USBSerial.printf("[ble] pruned %d orphan peer NVS key(s) (kept %d bond(s))\n", nrem, nb);
+}
+#else
+static inline void ble_prune_orphan_peer_keys(void) {}   // Tuya/Maix: different KV store
+#endif
 
 /* Apply the saved toggle preference: bring BLE up or down to match. Call at boot
  * and whenever the WiFi&BLE switch changes. */
@@ -626,7 +732,15 @@ static void ble_ui_tick(void) {
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 16);
 
     lv_obj_t *k = lv_label_create(s_ble_key_box);
+    // The 6-digit code is the thing the user has to read and type, so make it big.
+    // Built-in montserrat fonts are fixed-size (not UI_PX-scaled), so the narrow
+    // panel's FONT_LABEL renders it small — bump to a large glyph there. S3 keeps
+    // its original FONT_LABEL.
+#if BOARD_SCREEN_NARROW
+    lv_obj_set_style_text_font(k, &lv_font_montserrat_28, 0);
+#else
     lv_obj_set_style_text_font(k, &FONT_LABEL, 0);
+#endif
     lv_obj_set_style_text_color(k, lv_color_white(), 0);
     lv_label_set_text_fmt(k, "%06u", (unsigned)s_ble_passkey);
     lv_obj_align(k, LV_ALIGN_CENTER, 0, 14);

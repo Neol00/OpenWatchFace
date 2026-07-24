@@ -18,6 +18,12 @@
 #pragma once
 #include <lvgl.h>
 
+/* Defined in the .ino: drains any in-flight async display-flush DMA so the SPI bus + draw
+ * buffers are idle. No-op on boards without the async path. Declared board-neutrally here
+ * (sd_card.h only declares it on the C6) so app_screen_begin can fence before tearing down a
+ * screen. */
+void display_bus_drain(void);
+
 /* ---- state ---- */
 static lv_obj_t *menu_scr   = nullptr;   // the menu overlay (full screen)
 static lv_obj_t *app_scr    = nullptr;   // a currently-open sub-app screen
@@ -53,6 +59,26 @@ static bool      menu_open  = false;
 #define MENU_TILES_PER_PAGE (MENU_COLS * MENU_ROWS)
 #define MENU_PAGE_COUNT  ((MENU_ITEM_COUNT + MENU_TILES_PER_PAGE - 1) / MENU_TILES_PER_PAGE)
 
+#if MENU_COLS > 1
+/* Grid track descriptors for the multi-column launcher pages (see app_menu_init).
+ * FILE SCOPE ON PURPOSE: lv_obj_set_grid_dsc_array() stores the POINTER and reads
+ * it on every layout pass — it does not copy — so these must outlive the function
+ * that installs them. Every page uses the same MENU_COLS x MENU_ROWS geometry, so
+ * one shared pair serves them all.
+ * int32_t is the API's own parameter type (const int32_t[]); on LVGL v9 lv_coord_t
+ * is the same, but spelling it this way avoids depending on that alias.
+ * Each track is LV_GRID_CONTENT: size to the tile placed in it. The array is one
+ * longer than the track count for the LV_GRID_TEMPLATE_LAST terminator. */
+static int32_t menu_grid_cols[MENU_COLS + 1];
+static int32_t menu_grid_rows[MENU_ROWS + 1];
+static void menu_grid_dsc_init(void) {
+  for (int i = 0; i < MENU_COLS; i++) menu_grid_cols[i] = LV_GRID_CONTENT;
+  for (int i = 0; i < MENU_ROWS; i++) menu_grid_rows[i] = LV_GRID_CONTENT;
+  menu_grid_cols[MENU_COLS] = LV_GRID_TEMPLATE_LAST;
+  menu_grid_rows[MENU_ROWS] = LV_GRID_TEMPLATE_LAST;
+}
+#endif
+
 static lv_obj_t *menu_pager  = nullptr;  // the horizontal scroll-snap container of pages
 static lv_obj_t *menu_dots   = nullptr;  // page-indicator dots row
 static int       menu_page   = 0;        // last-shown page (remembered across open/close)
@@ -75,6 +101,13 @@ static bool (*nav_back_intercept)(void) = nullptr;
  * level (sub-app -> menu -> clock; see app_menu_back()), which frees the whole
  * bottom of the screen for content. */
 static lv_obj_t *app_screen_begin(const char *title) {
+  // Fence any in-flight async display-flush DMA BEFORE mutating the screen tree. On the C6 the
+  // flush queues a tile DMA and returns with the panel CS held low until the transfer-done ISR;
+  // tearing down app_scr + rendering a new screen into the SAME alternating draw buffers while
+  // that DMA is still reading one of them corrupts the in-flight transfer = garbled panel that
+  // compounds as you nav deeper (rebuild after rebuild). Draining first makes the buffers/bus
+  // idle so the rebuild is clean. No-op on the S3 (sync flush).
+  display_bus_drain();
   if (app_scr) { lv_obj_del(app_scr); app_scr = nullptr; }      // replace current sub-app
   if (menu_scr) lv_obj_add_flag(menu_scr, LV_OBJ_FLAG_HIDDEN);  // hide menu
   nav_back_intercept = nullptr;   // each screen re-arms its own BOOT-back hook if it wants one
@@ -110,7 +143,15 @@ static lv_obj_t *app_screen_begin(const char *title) {
   lv_obj_set_style_text_font(hint, &MENU_HINT_FONT, 0);   // per-board (small on C6)
   lv_obj_set_style_text_color(hint, lv_color_hex(0x777777), 0);
   lv_label_set_text(hint, LV_SYMBOL_LEFT " BOOT");
+#if BOARD_SCREEN_ROUND
+  // Round face: the top-left CORNER is clipped by the curved bezel, so the hint clips out
+  // the side. Every header has empty space ABOVE the title, so park the hint TOP-CENTER in
+  // that band (above the title) where the round face is at full width. The title sits at
+  // TOP_MID +UI_PX(40), so a hint at +UI_PX(12) clears it.
+  lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, UI_PX(12));
+#else
   lv_obj_align(hint, LV_ALIGN_TOP_LEFT, UI_PX(16), UI_PX(14));
+#endif
   return app_scr;
 }
 
@@ -233,6 +274,11 @@ static void app_open_timer(void);
 static void app_open_stopwatch(void);
 static void app_open_find_phone(void);
 static void app_open_files(void);
+static void app_open_fitness(void);
+static void app_open_sleep(void);
+static void app_open_sleep_data(void);
+static void app_open_sleep_trends(void);
+static void app_open_sleep_night(void);
 
 /* ---------- back-navigation stack ----------
  * Each full-screen sub-app is built by a `screen_fn` (calls app_screen_begin()).
@@ -275,13 +321,16 @@ static void nav_back(void) {
  * it opens and a fixed icon color. */
 struct MenuItem {
   const char *name;
-  const char *symbol;       // LVGL built-in symbol
+  const char *symbol;       // LVGL built-in symbol (used when icon_cp == 0)
   uint32_t    icon_color;   // fixed per-app icon tint (label stays white)
   screen_fn   open;         // screen this tile opens
+  uint32_t    icon_cp;      // 0 = use `symbol` in MENU_TILE_ICON_FONT; else this MDI
+                            // codepoint, drawn in the icons34 MDI font (migration path
+                            // away from the limited built-in LV_SYMBOL_* set)
 };
 static const MenuItem MENU_ITEMS[] = {
   { "Notifications", LV_SYMBOL_BELL,         0xFF3030, app_open_notifications },
-  { "Timer",         LV_SYMBOL_LOOP,         0xFF99FF, app_open_timer },
+  { "Timer",         LV_SYMBOL_LOOP,         0xFF99FF, app_open_timer, MDI_WATCH },
   { "Appearance",    LV_SYMBOL_TINT,         0xFF9F0A, app_open_appearance },
   { "Power",         LV_SYMBOL_BATTERY_FULL, 0x32D74B, app_open_power },
   { "WiFi & BLE",    LV_SYMBOL_WIFI,         0x33A0FF, app_open_wifi_ble },
@@ -289,6 +338,13 @@ static const MenuItem MENU_ITEMS[] = {
   { "Find Phone",    LV_SYMBOL_CALL,         0x00C2A8, app_open_find_phone },
   { "Files",         LV_SYMBOL_DRIVE,        0x9B8CFF, app_open_files },
   { "About",         LV_SYMBOL_LIST,         0xFFFF80, app_open_about },
+#if BOARD_HAS_IMU_QMI8658
+  /* Both are IMU-driven: Fitness is the hardware step counter, Sleep tracks
+   * overnight movement. A board without a QMI8658 (e.g. the S3-1.47) would only
+   * ever show 0 steps / never detect sleep, so omit the tiles entirely there. */
+  { "Fitness",       LV_SYMBOL_LOOP,         0x32D74B, app_open_fitness, MDI_RUN_FAST },
+  { "Sleep",         LV_SYMBOL_POWER,        0x9B8CFF, app_open_sleep, MDI_SLEEP },
+#endif
 };
 static const int MENU_ITEM_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
 
@@ -301,13 +357,30 @@ static void menu_tile_cb(lv_event_t *e) {
   if (it && it->open) nav_open(it->open);
 }
 
+/* Set a tile's icon label from a MenuItem: a built-in LV_SYMBOL in the per-board
+ * MENU_TILE_ICON_FONT (montserrat_34), OR — when item->icon_cp is set — a Material
+ * Design Icons glyph in the 34px icons34 MDI font. Same tint either way. */
+static void menu_tile_set_icon(lv_obj_t *icon, const MenuItem *item) {
+  lv_obj_set_style_text_color(icon, lv_color_hex(ui_deco_hex(item->icon_color)), 0);
+  if (item->icon_cp) {
+    lv_obj_set_style_text_font(icon, &icons34, 0);
+    char u[5];
+    lv_label_set_text(icon, mdi_utf8(item->icon_cp, u));
+  } else {
+    lv_obj_set_style_text_font(icon, &MENU_TILE_ICON_FONT, 0);
+    lv_label_set_text(icon, item->symbol);
+  }
+}
+
 /* Build ONE app tile (icon + caption) into `parent`, sized w x h. The caller sizes
  * tiles so MENU_COLS fit across and MENU_ROWS fit down. The icon FONT is the
  * per-board MENU_TILE_ICON_FONT. Layout adapts to the tile shape:
  *   - WIDE tile (w > h, e.g. the C6's full-width column rows): icon on the LEFT,
  *     name to its RIGHT (a list row).
  *   - SQUARE-ish tile (the S3 grid): icon on top, name underneath. */
-static void menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h) {
+/* Returns the tile object so a grid-layout caller can place it in an explicit
+ * cell (lv_obj_set_grid_cell); flex-layout callers can ignore the return. */
+static lv_obj_t *menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h) {
   lv_obj_t *tile = lv_btn_create(parent);
   lv_obj_set_size(tile, w, h);
   lv_obj_set_style_bg_color(tile, lv_color_hex(0x1A1A1A), 0);
@@ -315,6 +388,9 @@ static void menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h
   lv_obj_set_style_shadow_width(tile, 0, 0);
   lv_obj_set_style_pad_all(tile, 0, 0);
   lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(tile, HAPTICS_NO_BUZZ_FLAG);   // opening an app is silent (it's an lv_btn,
+                                                 // so the global haptic hook would otherwise
+                                                 // buzz it like a real button — see haptics.h)
   lv_obj_add_event_cb(tile, menu_tile_cb, LV_EVENT_CLICKED, (void *)item);
 
   if (w > h) {
@@ -326,9 +402,7 @@ static void menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h
     lv_obj_set_style_pad_column(tile, w / 12, 0);
 
     lv_obj_t *icon = lv_label_create(tile);
-    lv_obj_set_style_text_font(icon, &MENU_TILE_ICON_FONT, 0);
-    lv_obj_set_style_text_color(icon, lv_color_hex(ui_deco_hex(item->icon_color)), 0);
-    lv_label_set_text(icon, item->symbol);
+    menu_tile_set_icon(icon, item);
 
     lv_obj_t *name = lv_label_create(tile);
     lv_obj_set_style_text_font(name, &FONT_LABEL, 0);
@@ -337,9 +411,7 @@ static void menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h
   } else {
     // SQUARE tile: icon on top, name underneath (the S3 grid look).
     lv_obj_t *icon = lv_label_create(tile);
-    lv_obj_set_style_text_font(icon, &MENU_TILE_ICON_FONT, 0);
-    lv_obj_set_style_text_color(icon, lv_color_hex(ui_deco_hex(item->icon_color)), 0);
-    lv_label_set_text(icon, item->symbol);
+    menu_tile_set_icon(icon, item);
 
     lv_obj_t *name = lv_label_create(tile);
     lv_obj_set_style_text_color(name, lv_color_white(), 0);
@@ -354,15 +426,27 @@ static void menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, int h
     lv_obj_set_width(name, w - 4);
     lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -(h / 12));
 #else
-    // S3-2.06: the ORIGINAL fixed look — montserrat_34 icon @ +18 from the top,
-    // montserrat_12 caption pinned 12 px up from the bottom, 100 px wide. (Restored
-    // verbatim from the pre-refactor menu so the grid looks exactly as before.)
-    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 18);
+    // S3-2.06 look: montserrat_34 icon near the top, montserrat_12 caption pinned
+    // just up from the bottom. The offsets were originally HARD-CODED for that
+    // board's 104 px tile on a 410 px panel (icon +18, caption -12, width 100).
+    //
+    // The caption WIDTH especially must derive from the tile, not be a constant:
+    // a label wider than its parent makes the tile demand more width than we set,
+    // so the flex row needs more space than the tile size suggests and ROW_WRAP
+    // drops the last column onto a new row. That is why shrinking the tile alone
+    // never fixed the "3 columns became 2" bug on the 368 px S3-1.8 — the tile got
+    // smaller but its 100 px caption did not, so the row still overflowed.
+    //
+    // Derive all three from the tile box (w/h). On a 104 px tile these evaluate to
+    // ~100 / 18 / 12 — i.e. the S3-2.06 keeps its original look — while a smaller
+    // tile now scales its contents down with it instead of overflowing.
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, h * 18 / 104);
     lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
-    lv_obj_set_width(name, 100);
-    lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_width(name, w - 4);
+    lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -(h * 12 / 104));
 #endif
   }
+  return tile;
 }
 
 /* Light up the page dot for `page`, dim the rest. Null-safe. */
@@ -420,8 +504,16 @@ static void app_menu_init(void) {
   // the rest. The dots live in that strip — BELOW the pager — so they can never
   // overlap a tile, and the tiles get the full remaining height (no shrinking).
   const int qs_dots_strip = 22;                 // bottom strip height for the page dots
+#if BOARD_SCREEN_ROUND
+  // ROUND panel (T5 466x466): pull the whole 3x3 grid UP toward the "Apps" header so the
+  // bottom row clears the "< BOOT" hint (was clipping Files). Tiles stay FULL SIZE — only
+  // the grid's vertical position moves; the "Apps" title is NOT moved.
+  const int qs_pager_top  = UI_PX(40);          // first tile row sits right under "Apps"
+  const int qs_pager_h    = (int)screenHeight - qs_pager_top - qs_dots_strip;
+#else
   const int qs_pager_top  = UI_PX(40);
   const int qs_pager_h    = (int)screenHeight - qs_pager_top - qs_dots_strip;
+#endif
   menu_pager = lv_obj_create(menu_scr);
   lv_obj_remove_style_all(menu_pager);
   lv_obj_set_width(menu_pager, LV_PCT(100));
@@ -448,20 +540,78 @@ static void app_menu_init(void) {
   // tiles RELIABLY fit across without the flex ROW_WRAP wrapping one to the next line
   // (the bug where COLS=3 only showed 2). Integer rounding + scroll-snap slack made a
   // tight fit overflow by a pixel or two and wrap; the -MENU_TILE_GAP slack prevents it.
+  //
+  // MENU_TILE_BORDER_SLACK: a tile is an lv_btn, and LVGL's default button style
+  // carries a BORDER (and outline) whose width is NOT covered by lv_obj_set_size()
+  // or by the tile's own pad_all(0) — the drawn box is a couple of px wider than
+  // the size we set. On the 410-wide S3-2.06 the leftover slack swallowed that; on
+  // a 368-wide panel it did not, and the 3rd column wrapped to a 4th row that then
+  // ran off the bottom. Reserve a few px PER TILE so the fit math is honest on any
+  // panel width instead of relying on there happening to be slack.
+  const int MENU_TILE_BORDER_SLACK = 4;   // per tile, both axes
+  // The page's REAL content box: pad_all(side_pad) on every side, plus the extra
+  // top padding added below (side_pad + UI_PX(20)) on non-round, non-narrow boards.
+  // The old math subtracted only 2*side_pad and ignored that extra top pad, so the
+  // vertical fit was overstated by ~UI_PX(20) — one half of the clipping.
+#if BOARD_SCREEN_ROUND || BOARD_SCREEN_NARROW
+  const int page_pad_top = side_pad;
+#else
+  const int page_pad_top = side_pad + UI_PX(20);
+#endif
   int avail_w = page_w - 2 * side_pad - MENU_TILE_GAP;   // usable width inside the page
-  int avail_h = page_h - 2 * side_pad - MENU_TILE_GAP;   // usable height inside the page
-  int fit_w = (avail_w - (MENU_COLS - 1) * MENU_TILE_GAP) / MENU_COLS;
-  int fit_h = (avail_h - (MENU_ROWS - 1) * MENU_TILE_GAP) / MENU_ROWS;
+  int avail_h = page_h - page_pad_top - side_pad - MENU_TILE_GAP;  // usable height
+  int fit_w = (avail_w - (MENU_COLS - 1) * MENU_TILE_GAP) / MENU_COLS - MENU_TILE_BORDER_SLACK;
+  int fit_h = (avail_h - (MENU_ROWS - 1) * MENU_TILE_GAP) / MENU_ROWS - MENU_TILE_BORDER_SLACK;
   int tile_sz = (fit_w < fit_h) ? fit_w : fit_h;   // square side = the limiting axis
   if (tile_sz < 32) tile_sz = 32;
-#if !BOARD_SCREEN_NARROW
-  // S3-2.06: the ORIGINAL menu used FIXED 104x104 tiles. Computing the size from the
-  // tall pager made them far bigger than 104, so MENU_COLS no longer fit across (3
-  // cols wrapped to 2). Pin the S3 back to the original 104 — but cap to fit_w so a
-  // higher MENU_COLS still fits the panel width. (C6 keeps its computed size.)
-  tile_sz = (fit_w < 104) ? fit_w : 104;
+
+#if BOARD_SCREEN_ROUND
+  // ROUND (T5): full 104 px tiles sat a touch tight; shrink VERY slightly to 96 so the
+  // grid is a bit more compact (the user wanted only a small reduction). Cap to fit_w.
+  tile_sz = (fit_w < 96) ? fit_w : 96;
+#elif !BOARD_SCREEN_NARROW
+  // The ORIGINAL menu used FIXED 104x104 tiles, and the S3-2.06 look is defined by
+  // that size — so 104 stays the PREFERRED size. But it is only a PREFERENCE: cap it
+  // to the computed fit on BOTH axes (tile_sz above is already min(fit_w, fit_h)), so
+  // a panel that can't afford 104 shrinks instead of overflowing. Previously this
+  // capped to fit_w ONLY, which is why a shorter panel (S3-1.8, 448 tall) kept 102 px
+  // tiles that didn't fit 3 rows vertically and pushed a row off the bottom.
+  if (tile_sz > 104) tile_sz = 104;
 #endif
+
+  // HARD ANTI-WRAP GUARANTEE — runs LAST, after every per-board cap above, so
+  // nothing can re-inflate the tile past what actually fits.
+  //
+  // Everything above is a PREDICTION of LVGL's flex box model (page padding +
+  // per-track gaps + each tile's own border/outline). If that prediction is off by
+  // even ONE pixel, ROW_WRAP silently pushes the last column onto a new row — which
+  // is precisely the "3 columns became 2, with extra rows running off the bottom"
+  // bug. Rather than trust the estimate, SHRINK until the grid provably fits,
+  // measuring the way LVGL lays it out: N tiles + (N-1) gaps inside the content box.
+  //
+  // WRAP_SAFETY is a whole-row/column reserve (not per-tile) absorbing the rounding
+  // and border/outline the per-tile slack may still under-count. It costs a couple
+  // of px of tile size and removes an entire class of layout bug.
+  {
+    const int WRAP_SAFETY = MENU_TILE_GAP;      // one extra gap's worth, per axis
+    const int inner_w = page_w - 2 * side_pad;                  // real content width
+    const int inner_h = page_h - page_pad_top - side_pad;       // real content height
+    while (tile_sz > 32 &&
+           (MENU_COLS * (tile_sz + MENU_TILE_BORDER_SLACK)
+            + (MENU_COLS - 1) * MENU_TILE_GAP) > (inner_w - WRAP_SAFETY)) {
+      tile_sz--;
+    }
+    while (tile_sz > 32 &&
+           (MENU_ROWS * (tile_sz + MENU_TILE_BORDER_SLACK)
+            + (MENU_ROWS - 1) * MENU_TILE_GAP) > (inner_h - WRAP_SAFETY)) {
+      tile_sz--;
+    }
+  }
   int tile_w = tile_sz, tile_h = tile_sz;
+
+#if MENU_COLS > 1
+  menu_grid_dsc_init();   // fill the shared grid track descriptors (see their note)
+#endif
 
   for (int pg = 0; pg < MENU_PAGE_COUNT; pg++) {
     lv_obj_t *page = lv_obj_create(menu_pager);
@@ -477,23 +627,85 @@ static void app_menu_init(void) {
     lv_obj_set_flex_align(page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 #else
-    // Multi-column grids (S3): wrapping row, columns CENTERED horizontally, but the
-    // ROWS TOP-aligned (3rd arg = track cross-place = START) so the grid hugs the top
-    // like the original menu — not vertically centered, which left a big gap under the
-    // "Apps" title and crammed the last row against the BOOT hint.
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(page, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_START);
+    // Multi-column grids (S3): an EXPLICIT GRID of exactly MENU_COLS x MENU_ROWS.
+    //
+    // This deliberately does NOT use LV_FLEX_FLOW_ROW_WRAP. A wrapping flex row
+    // reflows whenever the tiles + gaps + ANY child's requested width exceed the
+    // row, so a single mis-estimated pixel silently moved the 3rd tile onto a 4th
+    // row (the long-standing "3 columns show as 2, extra rows clip off the bottom"
+    // bug on the 368 px S3-1.8). Repeated attempts to fix that by re-deriving the
+    // tile size could not work: flex asks the CHILD how much width it wants, so any
+    // child that wants more re-wraps regardless of the tile size we set.
+    //
+    // A grid places each child at an EXPLICIT (col,row) cell by index. The track
+    // count is fixed, so the layout cannot reflow — worst case a cell's content is
+    // clipped, never re-arranged. That makes MENU_COLS x MENU_ROWS a structural
+    // guarantee instead of an arithmetic prediction.
+    //
+    // Tracks are LV_GRID_CONTENT (each sizes to the tile placed in it) so the
+    // existing tile_w/tile_h sizing still drives the look. The descriptor arrays
+    // are file-scope statics (menu_grid_cols/rows, defined above): LVGL KEEPS THE
+    // POINTER rather than copying, so they must outlive this function — a local
+    // array here would dangle the moment app_menu_init() returns.
+    lv_obj_set_grid_dsc_array(page, menu_grid_cols, menu_grid_rows);
+    // Whole-grid placement inside the page: columns CENTERED horizontally, rows
+    // START-aligned so the grid hugs the top like the original menu (centering it
+    // vertically left a gap under the "Apps" title and crammed the last row into
+    // the BOOT hint).
+    lv_obj_set_grid_align(page, LV_GRID_ALIGN_CENTER, LV_GRID_ALIGN_START);
 #endif
     lv_obj_set_style_pad_row(page, MENU_TILE_GAP, 0);
     lv_obj_set_style_pad_column(page, MENU_TILE_GAP, 0);
     lv_obj_set_style_pad_all(page, side_pad, 0);
+#if BOARD_SCREEN_ROUND
+    // ROUND (T5): keep the grid HIGH so all three rows + the BOOT hint fit on the
+    // shorter usable height of a round face. Just a small gap below the "Apps" title
+    // (no big UI_PX(20) push-down — that shoved the bottom row into the BOOT hint).
+    lv_obj_set_style_pad_top(page, side_pad, 0);
+#elif !BOARD_SCREEN_NARROW
+    // Push the top-aligned grid DOWN a little so the first row isn't crammed against
+    // the "Apps" title. Pure top padding — the grid stays top-anchored (a lone tile
+    // still starts at the top), it just starts lower. C6 untouched.
+    //
+    // The push-down is BUDGETED against the REAL leftover space, not a flat
+    // constant. UI_PX(20) alone was tuned on the 2.06, which has ~60 px of slack
+    // below the grid. The shorter S3-1.8 has only ~30 px, so the same nudge pushed
+    // the bottom row down onto the "< BOOT" hint.
+    //
+    // Rule: keep a guaranteed BOTTOM clearance for the hint first, and only spend
+    // what is genuinely left over on the top nudge. A roomy panel still gets the
+    // full 20 px (2.06 keeps its exact original look); a tight panel gives the top
+    // nudge up rather than crowd the hint, which is what pulls the grid back up
+    // toward the "Apps" title.
+    {
+      const int grid_h    = MENU_ROWS * (tile_h + MENU_TILE_BORDER_SLACK)
+                            + (MENU_ROWS - 1) * MENU_TILE_GAP;
+      const int slack     = page_h - side_pad - grid_h;  // free space under the grid
+      const int hint_room = UI_PX(44);                   // reserved for "< BOOT"
+      int push = slack - hint_room;                      // whatever survives that
+      if (push > UI_PX(20)) push = UI_PX(20);            // never more than the original
+      if (push < 0) push = 0;                            // tight panel: hug the title
+      lv_obj_set_style_pad_top(page, side_pad + push, 0);
+    }
+#endif
 
     int first = pg * MENU_TILES_PER_PAGE;
     int last  = first + MENU_TILES_PER_PAGE;
     if (last > MENU_ITEM_COUNT) last = MENU_ITEM_COUNT;
-    for (int i = first; i < last; i++)
-      menu_build_tile(page, &MENU_ITEMS[i], tile_w, tile_h);
+    for (int i = first; i < last; i++) {
+      lv_obj_t *tile = menu_build_tile(page, &MENU_ITEMS[i], tile_w, tile_h);
+#if MENU_COLS > 1
+      // Explicit cell for the grid layout: index within the page -> (col,row).
+      // This is what makes MENU_COLS columns structural — the tile is PLACED at
+      // its column, it is not flowed into whatever space happens to be left.
+      const int slot = i - first;
+      lv_obj_set_grid_cell(tile,
+                           LV_GRID_ALIGN_CENTER, slot % MENU_COLS, 1,
+                           LV_GRID_ALIGN_CENTER, slot / MENU_COLS, 1);
+#else
+      (void)tile;   // single-column boards use the COLUMN flex flow above
+#endif
+    }
   }
 
   // Page-indicator dots (only meaningful with >1 page, but harmless with one).
@@ -516,38 +728,29 @@ static void app_menu_init(void) {
   // Align AFTER the dots are added: the row is LV_SIZE_CONTENT, so its size is only
   // known once it has children. Aligning before (size 0) put it in the wrong place.
   // Anchor 8px BELOW the bottom edge, in the strip reserved below the pager.
+#if BOARD_SCREEN_ROUND
+  // Round face: lift the dots well clear of the curved bottom edge, sitting them in
+  // the reserved strip just under the last tile row (above the BOOT hint).
+  lv_obj_align(menu_dots, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-44));
+#else
   lv_obj_align(menu_dots, LV_ALIGN_BOTTOM_MID, 0, 8);
-
-  // TEMP diag: print the REAL post-layout coords of the last tile vs the dots.
-  lv_obj_update_layout(menu_scr);
-  {
-    lv_obj_t *pg0 = lv_obj_get_child(menu_pager, 0);
-    int tiles = pg0 ? lv_obj_get_child_count(pg0) : 0;
-    lv_obj_t *lastTile = (pg0 && tiles) ? lv_obj_get_child(pg0, tiles - 1) : nullptr;
-    int tile_y = lastTile ? lv_obj_get_y(lastTile) : -1;
-    int tile_h = lastTile ? lv_obj_get_height(lastTile) : -1;
-    int page_abs_y = pg0 ? lv_obj_get_y(pg0) : -1;
-    int pager_y = lv_obj_get_y(menu_pager);
-    int pager_h = lv_obj_get_height(menu_pager);
-    int dots_y = lv_obj_get_y(menu_dots);
-    int dots_h = lv_obj_get_height(menu_dots);
-    USBSerial.printf("[menudiag2] pager y=%d h=%d -> bottom=%d | lastTile y=%d h=%d "
-                     "(abs bottom~%d) | dots y=%d h=%d\n",
-                     pager_y, pager_h, pager_y + pager_h,
-                     tile_y, tile_h, pager_y + tile_y + tile_h,
-                     dots_y, dots_h);
-  }
+#endif
 
   // No on-screen close button — BOOT toggles menu<->clock and backs out of apps.
   lv_obj_t *hint = lv_label_create(menu_scr);
   lv_obj_set_style_text_font(hint, &MENU_HINT_FONT, 0);
   lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
   lv_label_set_text(hint, LV_SYMBOL_LEFT " BOOT");
-#if BOARD_HAS_PSRAM
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-10));   // S3: bottom-center
+#if BOARD_SCREEN_ROUND
+  // Round face: the very bottom-center is the lowest point of the circle; pull the
+  // hint up into the visible band so it isn't clipped by the curved bezel.
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-18));
+#elif !BOARD_SCREEN_NARROW
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-10));   // wide panel: bottom-center
 #else
-  // C6: the bottom row of the page grid reaches the bottom edge, so a bottom hint
-  // overlaps the last app. Put it in the top-left corner instead (out of the grid).
+  // Narrow panel (C6-1.47 / S3-1.47): the bottom row of the page grid reaches the
+  // bottom edge, so a bottom hint overlaps the last app. Put it in the top-left
+  // corner instead (out of the grid). Gated on the SCREEN, not PSRAM.
   lv_obj_align(hint, LV_ALIGN_TOP_LEFT, UI_PX(8), UI_PX(8));
 #endif
 

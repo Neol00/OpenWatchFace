@@ -62,7 +62,7 @@ static void pl_cleanup_cb(lv_event_t *e) {
 static void pl_cmd_cb(lv_event_t *e) {
   PlayerCmd cmd = (PlayerCmd)(uintptr_t)lv_event_get_user_data(e);
   player_send_command(cmd);
-  haptics_pulse(10);
+  // buzz comes from the global click hook now
   // NO optimistic state flip: that could desync the button if the command didn't
   // take or the watch's assumed state was already wrong. Instead we trust the phone
   // — its real PlaybackInfo update (which AMS pushes when playback actually changes)

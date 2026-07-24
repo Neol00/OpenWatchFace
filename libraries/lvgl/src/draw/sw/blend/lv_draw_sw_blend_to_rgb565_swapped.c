@@ -349,12 +349,20 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_color_to_rgb565_swapped(lv_draw_sw_b
                 }
 
                 for(; x <= w - 2; x += 2) {
-                    uint16_t mask16 = *((uint16_t *)&mask[x]);
-                    if(mask16 == 0xFFFF) {
+                    /* OpenWatchFace LOCAL PATCH: read the two mask bytes
+                     * individually, NOT as *(uint16_t*)&mask[x]. The mask is the A8
+                     * glyph/edge buffer; for icon glyphs it comes from LVGL's default
+                     * font draw-buf handler whose base/stride is byte-granular, so
+                     * &mask[x] is frequently ODD. An unaligned 16-bit load HARD-FAULTS
+                     * on Cortex-M33 (Tuya T5 / BK7258) while ESP Xtensa-RISCV tolerates
+                     * it -> crashed every menu the instant an icon glyph's full-opacity
+                     * mask blended. Byte reads are alignment-safe, same result. */
+                    uint8_t m0 = mask[x + 0], m1 = mask[x + 1];
+                    if(m0 == 0xFF && m1 == 0xFF) {
                         dest_buf_u16[x + 0] = color16_swapped;
                         dest_buf_u16[x + 1] = color16_swapped;
                     }
-                    else if(mask16 != 0) {
+                    else if(m0 != 0 || m1 != 0) {
                         uint16_t px0 = lv_color_swap_16(dest_buf_u16[x + 0]); /* Swap destination */
                         uint16_t px1 = lv_color_swap_16(dest_buf_u16[x + 1]); /* Swap destination */
 

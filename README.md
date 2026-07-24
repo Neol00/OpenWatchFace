@@ -7,10 +7,17 @@ Android via the Gadgetbridge app), deep-sleep power management with a timed
 background-fetch wake, and a Player that mirrors and controls iPhone or Android
 media — all in a single Arduino translation unit on top of LVGL.
 
-> **Supported hardware:** two boards, selected at compile time via a small board
-> abstraction layer (`board.h` + `board_*.h`):
+> **Supported hardware:** several devices, selected at compile time via a small board
+> abstraction layer (`board.h` + `board_*.h`). Full list and per-device install guides:
+> **[docs/devices/](docs/devices/README.md)**. The main targets:
 > - **Waveshare ESP32-S3-Touch-AMOLED-2.06** — 410×502 CO5300 AMOLED, FT3168 touch,
 >   PCF85063 RTC, **AXP2101 PMU**, 8 MB PSRAM. The original/primary target.
+> - **Waveshare ESP32-S3-Touch-AMOLED-1.8** — 368×448 **SH8601** AMOLED, FT3168 touch,
+>   PCF85063 RTC, **AXP2101 PMU**, QMI8658 IMU, ES8311 audio, 8 MB PSRAM / 16 MB flash.
+>   Very close sibling of the 2.06 (same SoC and I2C peripherals); the panel driver,
+>   the resolution and the ES8311 pin map are what differ. **Hardware V1** — Waveshare
+>   also ships a **V2** of this board with a CO5300 panel instead; see the note at the
+>   top of `board_ws_s3_touch_amoled_18.h` for the one-line switch.
 > - **Waveshare ESP32-C6-Touch-LCD-1.47** — 172×320 JD9853 LCD, AXS5106L touch,
 >   **no PMU** (battery sensed over an ADC divider), **no PSRAM**, 512 KB SRAM.
 >
@@ -43,15 +50,7 @@ media — all in a single Arduino translation unit on top of LVGL.
 
 ## Table of contents
 - [Screenshots](#screenshots)
-- [Installation](#installation)
-  - [1. Install the Arduino IDE](#1-install-the-arduino-ide)
-  - [2. Place the bundled libraries](#2-place-the-bundled-libraries)
-  - [3. Install the ESP32 core (Espressif Systems)](#3-install-the-esp32-core-espressif-systems)
-  - [4. Unzip the esp32-s3-libs.zip and install it](#4-unzip-the-esp32-s3-libszip-and-install-it)
-  - [5. Apply the library patches](#5-apply-the-library-patches)
-  - [6. Select your board (board.h + partition file)](#6-select-your-board-boardh--partition-file)
-  - [7. Board settings & compile](#7-board-settings--compile)
-- [Hardware](#hardware)
+- [Installation](#installation) — **per-device guides** in [`docs/devices/`](docs/devices/README.md)
 - [Architecture overview](#architecture-overview)
 - [Deep sleep & the timed wake](#deep-sleep--the-timed-wake)
 - [The notification pipeline](#the-notification-pipeline)
@@ -63,272 +62,34 @@ media — all in a single Arduino translation unit on top of LVGL.
 - [Experimental: overclocking & undervolting](#experimental-overclocking--undervolting)
 - [Apps](#apps)
   - [Controls — the BOOT button](#controls--the-boot-button)
-- [Build & flash](#build--flash)
-- [Repo layout](#repo-layout)
 - [Credits & licensing](#credits--licensing)
 
 ---
 
 ## Installation
 
-Full build guide, start to finish. It targets the Waveshare
-**ESP32-S3-Touch-AMOLED-2.06** (the primary board); the **ESP32-C6-Touch-LCD-1.47** is
-also supported — pick its board entry and matching settings instead (see the
-supported-hardware note above). The steps below show the S3.
+**Installation is per-device.** Each supported board has its own complete guide
+libraries, patches, board & partition selection, build settings, tunable options and
+flashing, so you only follow the steps that apply to the hardware you own.
 
-This repo ships the **exact library versions** the firmware was built against, in
-`libraries/`, so you don't hunt for versions — you copy them into place and
-patch them. The only thing installed separately is the ESP32 core itself (it's large and
-comes from the Boards Manager).
+### → [Pick your device](docs/devices/README.md)
 
-### 1. Install the Arduino IDE
+| Device | SoC | Display | Install guide |
+|---|---|---|---|
+| Waveshare ESP32-S3-Touch-AMOLED-2.06 | ESP32-S3R8 | 410×502 CO5300 AMOLED | [Guide](docs/devices/s3-touch-amoled-2.06.md) |
+| Waveshare ESP32-S3-Touch-AMOLED-1.8 | ESP32-S3R8 | 368×448 SH8601 AMOLED | [Guide](docs/devices/s3-touch-amoled-1.8.md) |
+| Waveshare ESP32-C6-Touch-LCD-1.47 | ESP32-C6 | 172×320 JD9853 LCD | [Guide](docs/devices/c6-touch-lcd-1.47.md) |
+| Waveshare ESP32-S3-Touch-LCD-1.47 | ESP32-S3 | 172×320 JD9853 LCD | [Guide](docs/devices/s3-touch-lcd-1.47.md) |
+| Waveshare T5-E1-Touch-AMOLED-1.75 | Tuya T5-E1 | 466×466 CO5300 AMOLED | [Guide](docs/devices/tuya-t5-amoled-1.75.md) |
+| Sipeed MaixCam-Pro | SG2002 (Linux) | MaixCDK-owned panel | [Guide](docs/devices/maixcam-pro.md) |
+| Fossil Gen 4 (firefish/ray) | Wear 2100 | 390×390 AMOLED | [Guide](docs/devices/fossil-gen4.md) |
 
-Install **Arduino IDE 2.x** from <https://www.arduino.cc/en/software> (Windows or Linux).
-Launch it once so it creates your sketchbook folder (the place your libraries live):
+Most boards build in the **Arduino IDE** against the bundled libraries in
+`libraries/` (the exact versions the firmware was built against) plus the ESP32 core
+from the Boards Manager. The MaixCam and Fossil ports use their own toolchains.
 
-- **Windows:** `C:\Users\<you>\Documents\Arduino\`
-- **Linux:** `~/Arduino/`
-
-> You can confirm/change this path in the IDE under **File → Preferences → Sketchbook
-> location**. Everything below assumes the default.
-
-### 2. Place the bundled libraries
-
-Unzip `libraries.zip` into a temporary location.
-Place the **contents** of `libraries/` folder into your Arduino
-**`libraries/`** folder, so the library folders and `lv_conf.h` land directly inside it.
-
-The result must look like this (note `lv_conf.h` sits **next to** the `lvgl` folder, not
-inside it — LVGL requires that):
-
-```
-<sketchbook>/libraries/
-├── lv_conf.h                     ← must be a sibling of lvgl/
-├── lvgl/
-├── GFX_Library_for_Arduino/
-├── Arduino_DriveBus/
-├── SensorLib/
-├── XPowersLib/
-└── Mylibrary/                    ← board pin map (pin_config.h)
-```
-
-**Windows** (PowerShell — adjust the source path to where you cloned this repo):
-```powershell
-Copy-Item -Recurse -Force ".\libraries\*" `
-          "$HOME\Documents\Arduino\libraries\"
-```
-
-**Linux** (bash):
-```bash
-cp -r ./libraries/* ~/Arduino/libraries/
-```
-
-> If your `libraries/` folder already has an older `lvgl` / `GFX_Library_for_Arduino`,
-> **remove or overwrite** them — the firmware needs these exact versions (LVGL 9.5.0,
-> Arduino_GFX 1.6.5; full list in the sketch header).
-
-### 3. Install the ESP32 core (Espressif Systems)
-
-The ESP32 core is **not** bundled (it's large) — install it from the Boards Manager.
-**Use the Espressif Systems core, _not_ the legacy "Arduino ESP32 Boards" entry.**
-
-1. **Tools → Board → Board Manager**, search and add:
-```
-esp32
-```
-2. Install the entry **"esp32" by Espressif Systems**, version **3.3.8** (pick 3.3.8 in
-   the version dropdown — the patches target that exact version).
-
-> ⚠️ There are two similarly-named entries. Choose **esp32 by _Espressif Systems_**.
-> Do **not** install "Arduino ESP32 Boards (by Arduino)" — it's a different package and
-> the BLE patch path / board definition won't match.
-
-This is also the step that puts the ESP32 core (with its `BLE` library) on disk at:
-
-- **Windows:** `C:\Users\<you>\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.8`
-- **Linux:** `~/.arduino15/packages/esp32/hardware/esp32/3.3.8`
-
-You'll point the patch step at that folder next.
-
-### 4. Unzip the esp32-s3-libs.zip and install it
-
-Unzip `esp32-s3-libs.zip` to a temporary location. 
-Delete the old directory
-
-**Windows**
-```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\esp32s3-libs"
-```
-
-**Linux**
-```bash
-rm -rf ~/.arduino15/packages/esp32/tools/esp32s3-libs
-```
-
-place the unzipped `esp32-s3-libs` folder inside:
- 
-**Windows**
-```powershell
-%LOCALAPPDATA%\Arduino15\packages\esp32\tools\
-```
-
-**Linux**
-```bash
-~/.arduino15/packages/esp32/tools/
-```
-
-### 5. Apply the library patches
-
-The firmware relies on modifications to LVGL, Arduino_GFX, and the ESP32
-core (its `BLE` and `ESP_I2S` libraries plus `Esp.cpp`). They live outside the sketch, so they must be applied once — without
-them the build fails or the watch misbehaves (crash on BLE toggle, single-core
-rendering, no screen cache). Full details and a per-patch table are in
-[`patches/README.md`](patches/README.md).
-
-The apply scripts **dry-run first and abort without changing anything** if a patch
-wouldn't apply cleanly (usually a version mismatch — install the exact versions in steps
-2–3), and they're safe to re-run (already-applied patches are skipped).
-
-**Windows** (PowerShell — needs `git` on PATH, which the toolchain provides):
-```powershell
-cd .\patches
-./apply_patches.ps1
-```
-
-**Linux** (bash — needs the `patch` tool, e.g. `sudo apt install patch`):
-```bash
-cd ./patches
-./apply_patches.sh ~/Arduino/libraries \
-  ~/.arduino15/packages/esp32/hardware/esp32/3.3.8
-```
-
-> Prefer to do it by hand? Each patch is a standard `patch -p1` unified diff; see the
-> manual instructions in [`patches/README.md`](patches/README.md).
-
-After patching, **clear the Arduino build cache** so the patched libraries recompile
-(otherwise a stale cache silently hides the changes):
-- **Windows:** delete `%LOCALAPPDATA%\arduino\sketches\*`
-- **Linux:** delete `~/.cache/arduino/sketches/*`
-
-### 6. Select your board (board.h + partition file)
-
-Two things in the sketch folder must match the board you're flashing:
-
-**a) Pick the board in `board.h`.** Open `OpenWatchFace/board.h` and set the
-`BOARD_SELECT` line to your board:
-
-```c
-#define BOARD_SELECT  BOARD_ID_S3_206   // <-- change to your board
-//   BOARD_ID_S3_206  — Waveshare ESP32-S3-Touch-AMOLED-2.06
-//   BOARD_ID_C6_147  — Waveshare ESP32-C6-Touch-LCD-1.47
-```
-
-Everything else (pin map, drivers, PSRAM/PMU feature flags, screen geometry) follows
-from that one line.
-
-**b) Put the right partition table in place.** The sketch builds against
-`partitions.csv`, but the per-board table ships under a board-specific name. **Copy the
-one for your board and rename the copy to `partitions.csv`** (overwrite the existing
-one), in the `OpenWatchFace/` folder:
-
-| Board | Copy this file | → rename to |
-|---|---|---|
-| S3-2.06 | `partitions_s3_32mb.csv` | `partitions.csv` |
-| C6-1.47 | `partitions_c6_8mb.csv`  | `partitions.csv` |
-
-**Windows** (PowerShell — S3 shown; use the C6 source for the C6):
-```powershell
-Copy-Item -Force ".\OpenWatchFace\partitions_s3_32mb.csv" ".\OpenWatchFace\partitions.csv"
-```
-
-**Linux** (bash):
-```bash
-cp -f ./OpenWatchFace/partitions_s3_32mb.csv ./OpenWatchFace/partitions.csv
-```
-
-> Both `board.h` **and** the partition file must match the same board — a mismatch
-> (e.g. the S3's 32 MB table on the C6's 8 MB flash) fails to flash or boots to a
-> black screen.
-
-### 7. Board settings & compile
-
-Open **`OpenWatchFace/OpenWatchFace.ino`** in the Arduino IDE. The **exact
-board settings are documented in a comment block at the very top of that file** — set
-**Tools →** to match it. For the **S3** that is:
-
-**S3 — ESP32-S3-Touch-AMOLED-2.06:**
-
-| Setting | Value |
-|---|---|
-| Board | **Waveshare ESP32-S3-Touch-AMOLED-2.06** |
-| Erase All Flash Before Sketch Upload | **Enabled** (first flash only) |
-| Events Run On | **Core 0** |
-| Flash Mode | **QIO 120 MHz** |
-| Arduino Runs On | **Core 1** |
-| Flash Size | **32MB** (fixed by the board) |
-| Partition | **Custom** (uses `partitions.csv` in the sketch folder) |
-| PSRAM | **Enabled** |
-| Upload Mode | **UART0 / Hardware CDC** |
-
-**C6 — ESP32-C6-Touch-LCD-1.47:**
-
-There's no dedicated board entry for this one, so use the generic **ESP32C6 Dev Module**:
-
-| Setting | Value |
-|---|---|
-| Board | **ESP32C6 Dev Module** |
-| Erase All Flash Before Sketch Upload | **Enabled** (first flash only) |
-| Flash Size | **8MB** |
-| Partition Scheme | **Custom** (uses `partitions.csv` in the sketch folder) |
-
-> Leave the other ESP32C6 Dev Module options at their defaults. The C6 is single-core
-> with no PSRAM, so there are no Core / PSRAM settings to set.
-
-> The **top-of-file comment in the .ino is the source of truth** — if it ever differs
-> from this table, follow the file. The custom partition is required: `app0` must stay
-> pinned at `0x10000` or the watch boots to a **black screen** (see the .ino note).
-
-Then **Verify** (compile) and **Upload**.
-
-- **First-time clock set:** connect to a WiFi network to sync the RTC automatically,
-  or set `FORCE_TIME_SET` to 1, set your current time, and flash. The PCF85063 RTC
-  is battery-backed and keeps time after that (NTP re-syncs it whenever WiFi is up,
-  and an Android phone pushes time over BLE on every Gadgetbridge connect).
-- **Upload trouble?** Hold **BOOT**, tap **RST**, release **BOOT** → download mode, then
-  upload again.
-- **microSD recommended:** format a card FAT32 and insert it for notification history,
-  WiFi credentials, and battery-health logging (the watch falls back to on-flash storage
-  without one — see [Storage](#storage-sd-card-vs-flash)).
-
----
-
-## Hardware
-
-### S3 — ESP32-S3-Touch-AMOLED-2.06 (primary)
-
-| Part | Chip | Bus | Notes |
-|------|------|-----|-------|
-| MCU | ESP32-S3R8 | — | dual-core LX7, 8 MB OPI PSRAM, 512 KB internal SRAM, 32 MB flash |
-| Display | CO5300 AMOLED 410×502 | QSPI @ 80 MHz | command-driven (no autonomous scan-out) |
-| Touch | FT3168 capacitive | I²C | shared bus |
-| RTC | PCF85063 | I²C | battery-backed; keeps time across power loss |
-| IMU | QMI8658 | I²C | shared bus |
-| PMU / charger | AXP2101 | I²C | per-rail LDO control; drives deep-sleep power gating |
-
-### C6 — ESP32-C6-Touch-LCD-1.47
-
-| Part | Chip | Bus | Notes |
-|------|------|-----|-------|
-| MCU | ESP32-C6 | — | single-core RISC-V, **no PSRAM**, 512 KB SRAM |
-| Display | JD9853 LCD 172×320 | SPI | narrow-screen UI layout |
-| Touch | AXS5106L capacitive | I²C | shared bus (release-debounced — see note) |
-| RTC | PCF85063 | I²C | battery-backed |
-| Battery | — | ADC | **no PMU**: charge state/voltage sensed on an ADC divider |
-
-> On the C6 the AXS5106L can briefly report finger-up mid-touch; touch input is
-> release-debounced in the read callback so it doesn't fire spurious double-taps.
-> With no PSRAM, the line framebuffer is sized for internal SRAM and the PSRAM-only
-> render paths are compiled out.
+> **Shared reference:** the out-of-tree library patches are documented once in
+> [`patches/README.md`](patches/README.md); every Arduino device page links to it.
 
 ---
 
@@ -343,10 +104,9 @@ FreeRTOS tasks split the work across the two cores:
 | **Core 1** | `loop()` + all LVGL / display / touch | UI must never block; it owns LVGL exclusively |
 | **Core 0** | network task (WiFi + HTTPS + NTP) and the NimBLE host task | these *block* for seconds; keeping them off core 1 keeps the UI smooth |
 
-The cores never call LVGL from core 0. The network and BLE tasks write into shared
-stores under `store_lock()` and raise `volatile` flags; the loop reads those flags and
-does all the actual UI (popups, bell refresh). This single rule — *only the loop
-touches LVGL* — is what keeps the design safe without heavy locking.
+The network and BLE tasks write into shared stores under `store_lock()` and raise `volatile` 
+flags; the loop reads those flags and does all the actual UI (popups, bell refresh). This single rule 
+*only the loop touches LVGL* — is what keeps the design safe without heavy locking.
 
 ---
 
@@ -423,9 +183,12 @@ deep sleep ──timer fires──► cold boot
    sleep **without ever initializing the display**. The screen stays black, drawing
    almost no current.
 
-The awake/asleep durations from these checks feed a duty-cycle learner
+The watch's awake/asleep split feeds a duty-cycle learner
 (`calib_note_awake_ms` / `calib_note_sleep_s`) used to estimate the sleep-floor
-current shown in the Power app.
+current shown in the Power app. The split is measured from the RTC epoch gap between
+`drain_update()` calls (short gap = awake, long gap = a deep-sleep interval), so it works
+regardless of whether periodic background checks are enabled — which is what lets the
+sleep-floor (and therefore battery-health) learning actually converge.
 
 ### Peripheral-rail gating (the AXP2101 dance — S3 only)
 This applies to the **S3** (the C6 has no PMU; it instead latches the backlight/reset
@@ -580,8 +343,8 @@ In both cases the newest-32 notification **cache** also lives in NVS, so the
 instant-wake popup path needs no mount; the archive (SD or FFat) is the source of
 truth the Notifications app and bell read.
 
-> **Recommendation: use a microSD card (FAT32).** It gives you a much larger
-> notification history, keeps WiFi credentials and the battery-health log off the
+> **Recommendation: use a microSD card (FAT32).** (Does not work if formatted in Windows default formatter)
+> It gives you a much larger notification history, keeps WiFi credentials and the battery-health log off the
 > wear-sensitive app flash, and survives reflashing the firmware. The watch works
 > fully without one, but a card is the better experience.
 
@@ -593,9 +356,15 @@ Two **opt-in, compile-time** tuning knobs sit behind self-test "canaries" that
 auto-revert before instability can corrupt anything. **Both default OFF**, so the
 stock build is byte-for-byte the known-good baseline.
 
-> **Scope:** overclocking is **S3-only**. Undervolting exists on both boards but uses
-> a different mechanism per chip (S3 trims the on-die LDO `dig_dbias`; the C6, which has
-> no AXP2101, trims the PMU's `hp_dbias` instead). The descriptions below are the S3.
+> **Scope:** overclocking now works on **both boards**, via the same BBPLL trick (the
+> S3 and C6 share the identical feedback-divider register and `PLL = 40·(div+4)`
+> formula; the IDF's "C6 SPLL is fixed at 480 MHz" is a software policy, not a hardware
+> lock). Only the CPU re-lock differs: **S3** is `CPU = PLL/2` (260/280/300 MHz) and
+> **C6** is `CPU = SPLL/3` (173/187/200 MHz, up from the 160 MHz stock ceiling). The
+> code path is board-gated in `overclock.h`. Undervolting also exists on both boards but
+> uses a different mechanism per chip (S3 trims the on-die LDO `dig_dbias`; the C6, which
+> has no AXP2101, trims the PMU's `hp_dbias` instead). The descriptions below are the S3
+> unless noted.
 
 ### Overclocking (`overclock.h`)
 
@@ -611,14 +380,23 @@ stock build is byte-for-byte the known-good baseline.
 > not). So overclocking is only usable with **WiFi and BLE turned off** — which for a
 > watch whose whole point is the phone link means it's a bench-test feature, not a mode
 > you'd run day to day. It also moves the USB 48 MHz clock off-spec (~300 MHz kills USB;
-> reboot to flash). Ships **disabled** (`OVERCLOCK_ENABLE 0`); the real, radio-safe
-> performance wins are the async DMA flush and the PSRAM screen cache, not this.
+> reboot to flash). The **C6** has separate AHB/APB/MSPI dividers (the S3 doesn't), which
+> *sounds* like it could hold APB at spec — but they only step in coarse ratios that can't
+> match a non-integer SPLL bump, so the C6 loses the radios for the same reason. Ships
+> **disabled** (`OVERCLOCK_ENABLE 0`); the real, radio-safe performance wins are the async
+> DMA flush and the PSRAM screen cache (S3), not this.
 
-Pushes the CPU past the stock 240 MHz ceiling. The ESP32-S3 derives the CPU clock from
-the **BBPLL**, so the bump retunes *only* the PLL feedback divider via an exact
-IDF register recipe (`PLL = 40·(div+4)`, `CPU = PLL/2`, landing on a 20 MHz grid;
-e.g. 260/280/300 MHz). Memory is **not** re-divided, so flash and PSRAM ride up with
-the PLL (~+8% at 260 MHz) — which is also why too high a clock corrupts RAM/flash.
+Pushes the CPU past the stock ceiling (S3 240 MHz, C6 160 MHz). Both chips derive the
+CPU clock from the **BBPLL**, so the bump retunes *only* the PLL feedback divider via an
+exact IDF register recipe (`PLL = 40·(div+4)`, landing on a fixed grid). The only
+per-chip difference is the CPU divide: **S3** `CPU = PLL/2` (e.g. 260/280/300 MHz) and
+**C6** `CPU = SPLL/3` (e.g. 173/187/200 MHz). Memory is **not** re-divided, so flash
+(and PSRAM, S3) ride up with the PLL — which is also why too high a clock corrupts
+RAM/flash. On the **C6** there *are* separate PCR dividers for AHB/APB/MSPI, but they
+only step in coarse ratios (AHB ÷12/24/48, APB ÷1/2/4), so a non-integer SPLL bump can't
+be pulled back to exactly the stock bus speed — APB/flash still ride up ~8–25% and the
+radio is still expected to drop (same outcome as the S3, below). The C6 is also a single
+RISC-V core with less voltage margin, so its stable window is narrower.
 
 How it stays safe:
 - **Never at boot.** Overclocking is button-triggered from the Power app, so the watch
@@ -629,9 +407,10 @@ How it stays safe:
   cache disabled, so the whole switch routine lives in IRAM and uses only inline
   `clk_ll_*` / ROM calls — executing from flash here would crash mid-switch.
 - **RAM-corruption canary.** Right after the bump it re-runs a trusted compute self-test
-  **and** a 64 KB PSRAM write/read pattern; **any** miscompare → it immediately reverts
-  to stock 480/240 and flags the failure. So an unstable clock can't silently corrupt
-  memory — it's caught and undone within milliseconds.
+  **and** (where the chip has PSRAM — S3) a 64 KB PSRAM write/read pattern; **any**
+  miscompare → it immediately reverts to stock (S3 480/240, C6 480/160) and flags the
+  failure. So an unstable clock can't silently corrupt memory — it's caught and undone
+  within milliseconds. (The C6 has no PSRAM, so only the compute self-test runs there.)
 - **Hang recovery.** A stage marker in RTC-noinit memory survives a reset; if a switch
   hangs hard, tap **RST** (keep power) and the next boot reports where it died and comes
   up stock. A higher clock also wants more core voltage, so it temporarily forces the
@@ -700,18 +479,12 @@ The watch has one physical control, the **BOOT** button. Everything else is touc
 
 ---
 
-## Build & flash
-
-The complete, step-by-step build guide — IDE, libraries, ESP32 core, patches, board
-settings — is in **[Installation](#installation)** near the top of this README. This
-section is just the reference detail behind it.
-
 ### Out-of-tree library patches
 A fresh library install will **not** have the modifications this firmware relies on, so
 without them the build fails or the watch misbehaves (crash on BLE toggle, single-core
 rendering, no PSRAM screen cache). They are shipped as ready-to-apply unified diffs in
-[`patches/`](patches/) with an apply script for Windows and Linux — see
-[Installation → Apply the library patches](#5-apply-the-library-patches) and
+[`patches/`](patches/) with an apply script for Windows and Linux — see the
+"Apply the library patches" step in your [device guide](docs/devices/README.md) and
 [`patches/README.md`](patches/README.md). All are GPL-compatible:
 
 | Patch | File | Library / license | Effect |
@@ -744,17 +517,15 @@ library's license, and all are GPL-compatible).
 | [Arduino_DriveBus](https://github.com/XKArduino/Arduino_DriveBus) | 1.0.1 | Xk_w | GPL-3.0 |
 | [SensorLib](https://github.com/lewisxhe/SensorLib) | 0.4.1 | Lewis He | MIT |
 | [XPowersLib](https://github.com/lewisxhe/XPowersLib) | 0.3.3 | Lewis He | MIT |
-| `Mylibrary` (`pin_config.h`) | — | Waveshare | Waveshare board support (GPIO map) |
 
-The **ESP32 Arduino core** (Espressif Systems, v3.3.8, Apache-2.0) is installed
+The **ESP32 Arduino core** (Espressif Systems, v3.3.11, Apache-2.0) is installed
 separately via the Boards Manager (see [Installation](#installation)); the patches this
 project makes to it (the bundled `BLE` and `ESP_I2S` libraries, and `Esp.cpp`) are in
 [`patches/`](patches/).
 
 ### Hardware & references
 
-- Hardware: **Waveshare ESP32-S3-Touch-AMOLED-2.06**; this firmware builds on Waveshare's
-  reference CO5300 / FT3168 / PCF85063 / AXP2101 init.
+- Hardware: **Waveshare**; this firmware builds on Waveshare's references.
 - Apple **ANCS** (Apple Notification Center Service) and **AMS** (Apple Media Service)
   are Apple-defined BLE services used by the notification and player integrations.
 
@@ -765,4 +536,4 @@ Created by **Noel Ejemyr**.
 > Modified-library notice (per the bundled libraries' license terms): the changes this
 > project makes to LVGL, Arduino_GFX, and the ESP32 core (`BLE`, `ESP_I2S`, `Esp.cpp`)
 > are described and provided as unified-diff patches in [`patches/`](patches/), each
-> marked in-source with a `LOCAL PATCH (ESP32-S3-WatchFace)` comment.
+> marked in-source with a `LOCAL PATCH (OpenWatchFace)` comment.

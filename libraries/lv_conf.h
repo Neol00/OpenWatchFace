@@ -1,6 +1,6 @@
 /**
  * @file lv_conf.h
- * Configuration file for v9.3.0
+ * Configuration file for v9.5.0
  */
 
 /*
@@ -22,6 +22,15 @@
 #include "my_include.h"
 #endif
 
+/* Pull in the board flags EARLY so the per-board allocator + OS selections below see
+ * BOARD_PLATFORM_TUYA / BOARD_HAS_PSRAM / BOARD_DUAL_CORE. board.h has a name-based
+ * include guard, so this is safe even though it's also included again lower down. */
+#ifndef __ASSEMBLY__
+#if !defined(__has_include) || __has_include("board.h")
+#include "board.h"
+#endif
+#endif
+
 /*====================
    COLOR SETTINGS
  *====================*/
@@ -40,18 +49,17 @@
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
  */
-/* LOCAL PATCH (ESP32-S3-WatchFace): allocator is per-board. A board WITH PSRAM
- * (S3-2.06) routes all LVGL allocations to PSRAM via the CUSTOM backend in
- * lv_psram_alloc.cpp (frees the 64 KB SRAM pool, lets caches grow). A board with
- * NO PSRAM (C6-1.47) MUST use the BUILTIN SRAM pool — the CUSTOM allocator there
- * calls heap_caps_malloc(MALLOC_CAP_SPIRAM), which returns NULL with no PSRAM and
- * crashes lv_init() (store fault at 0xc in lv_flex_init). board.h is included
- * above (for LV_USE_OS), so BOARD_HAS_PSRAM is available here. */
-#if BOARD_HAS_PSRAM
+/* LOCAL PATCH (OpenWatchFace): allocator is per-platform. The ESP boards
+ * route all LVGL allocations to PSRAM via the CUSTOM backend in lv_psram_alloc.cpp
+ * (frees the 64 KB SRAM pool, lets caches grow), using ESP-only heap_caps_*.
+ *
+ * Both ESP and the Tuya T5 use LV_STDLIB_CUSTOM, but with DIFFERENT backends in
+ * lv_psram_alloc.cpp: ESP uses heap_caps_malloc(MALLOC_CAP_SPIRAM); the T5 uses
+ * tal_psram_malloc(). This MATTERS: on the T5, plain malloc()/CLIB pulls from the
+ * small ~640 KB SRAM heap (tal_malloc), NOT PSRAM — the two are SEPARATE heaps with
+ * separate APIs. Routing LVGL through CLIB exhausts SRAM on a heavy draw (layer
+ * buffers + caches) -> NULL -> silent reset. tal_psram_malloc hits the 16 MB PSRAM. */
 #define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
-#else
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_BUILTIN
-#endif
 
 /** Possible values
  * - LV_STDLIB_BUILTIN:     LVGL's built in implementation
@@ -80,7 +88,7 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB).
-     * LOCAL PATCH (ESP32-S3-WatchFace): this branch is only taken on a board with
+     * LOCAL PATCH (OpenWatchFace): this branch is only taken on a board with
      * NO PSRAM (the C6-1.47 — the S3 uses the CUSTOM/PSRAM allocator and never
      * touches this pool). 64 KB was too small there: the watch face + the menu
      * pager + a heavy app screen (e.g. Power, with charts + toggle rows) all share
@@ -107,7 +115,7 @@
  *====================*/
 
 /** Default display refresh, input device read and animation step period. */
-#define LV_DEF_REFR_PERIOD  8       /**< [ms] ~125 Hz target — throttle removed so the real rate
+#define LV_DEF_REFR_PERIOD  8       /**< [ms] throttle removed so the real rate
                                          is hardware-limited (render+push), not capped here. Was 33
                                          (=30 Hz cap, felt ~15). Idle stays cheap: the present-gate
                                          only pushes when something is dirty. */
@@ -128,18 +136,16 @@
  * - LV_OS_MQX
  * - LV_OS_SDL2
  * - LV_OS_CUSTOM */
-/* LOCAL PATCH (ESP32-S3-WatchFace): OS layer is per-board. On a DUAL-CORE board
+/* LOCAL PATCH (OpenWatchFace): OS layer is per-board. On a DUAL-CORE board
  * (S3-2.06) enable FreeRTOS threads so the SW renderer can use both cores (the
  * band-split fork). On a SINGLE-CORE board (C6-1.47) that's pointless and the
  * LVGL FreeRTOS port pulls in FreeRTOS's "atomic.h" which isn't on that core's
  * include path -> use LV_OS_NONE there. board.h resolves to the sketch folder
  * (always on the Arduino include path). */
+#if !defined(__has_include) || __has_include("board.h")
 #include "board.h"
-#if BOARD_DUAL_CORE
-#define LV_USE_OS   LV_OS_FREERTOS
-#else
-#define LV_USE_OS   LV_OS_NONE
 #endif
+#define LV_USE_OS   LV_OS_FREERTOS
 
 #if LV_USE_OS == LV_OS_CUSTOM
     #define LV_OS_CUSTOM_INCLUDE <stdint.h>
@@ -175,15 +181,15 @@
  * and can't be drawn in chunks. */
 
 /** The target buffer size for simple layer chunks. */
-/* LOCAL PATCH (ESP32-S3-WatchFace): board-gated. A "simple layer" is allocated on
+/* LOCAL PATCH (OpenWatchFace): board-gated. A "simple layer" is allocated on
  * demand the first time a widget with style_opa<255 or a non-normal blend mode
- * renders. The full 256 KB target would instantly OOM a no-PSRAM board (C6, 512 KB
+ * renders. The full 128 KB target would OOM a no-PSRAM board (C6, 512 KB
  * SRAM). LVGL renders simple layers in CHUNKS, so a smaller target just means more
  * passes, not a visual difference. PSRAM board (S3) keeps the big buffer. */
 #if BOARD_HAS_PSRAM
-#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (256 * 1024)    /**< [bytes]*/
+#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (128 * 1024)    /**< [bytes]*/
 #else
-#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (8 * 1024)      /**< [bytes] no-PSRAM: chunked */
+#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (16 * 1024)     /**< [bytes] no-PSRAM: chunked */
 #endif
 
 /* Limit the max allocated memory for simple and transformed layers.
@@ -232,8 +238,20 @@
 
     /** Set number of draw units.
      *  - > 1 requires operating system to be enabled in `LV_USE_OS`.
-     *  - > 1 means multiple threads will render the screen in parallel. */
+     *  - > 1 means multiple threads will render the screen in parallel.
+     *  2 enables the band_split_task parallel renderer (lv_draw.c LOCAL PATCH): each big
+     *  FILL/LABEL/etc task is cloned into two clip-halves that two worker threads paint at
+     *  once. Real 2-core win on dual-SMP boards (S3-2.06, Tuya T5) — but ONLY if the two
+     *  workers land on DIFFERENT cores (see lv_freertos.c affinity patch); otherwise both
+     *  halves run on one core and there's no gain (just split overhead).
+     *  LOCAL PATCH (OpenWatchFace): per-board via BOARD_DUAL_CORE (board.h, included above).
+     *  Single-core boards (C6-1.47) FAIL TO BOOT with 2 — and would gain nothing anyway —
+     *  so they get 1. Defaults to 1 when board.h isn't on the include path. */
+    #if defined(BOARD_DUAL_CORE) && BOARD_DUAL_CORE
+    #define LV_DRAW_SW_DRAW_UNIT_CNT    2
+    #else
     #define LV_DRAW_SW_DRAW_UNIT_CNT    1
+    #endif
 
     /** Use Arm-2D to accelerate software (sw) rendering. */
     #define LV_USE_DRAW_ARM2D_SYNC      0
@@ -383,16 +401,21 @@
     #define LV_VG_LITE_STROKE_CACHE_CNT 32
 #endif
 
-/** Accelerate blends, fills, etc. with STM32 DMA2D */
 #define LV_USE_DRAW_DMA2D 0
-
 #if LV_USE_DRAW_DMA2D
-    #define LV_DRAW_DMA2D_HAL_INCLUDE "stm32h7xx_hal.h"
+    /* Beken backend shim (NOT the STM32 HAL). Provides OWF_TUYA_DMA2D_BACKEND + bridge.
+     * Bare name: it sits in lvgl/src/draw/dma2d/ — the SAME directory as
+     * lv_draw_dma2d_private.h, which is where `#include LV_DRAW_DMA2D_HAL_INCLUDE` runs,
+     * so a quoted include finds it directory-relative with no -I dependence. */
+    #define LV_DRAW_DMA2D_HAL_INCLUDE "owf_tuya_dma2d_hal.h"
 
-    /* if enabled, the user is required to call `lv_draw_dma2d_transfer_complete_interrupt_handler`
-     * upon receiving the DMA2D global interrupt
-     */
-    #define LV_USE_DRAW_DMA2D_INTERRUPT 0
+    /* Interrupt-driven completion: our Beken ISR calls
+     * lv_draw_dma2d_transfer_complete_interrupt_handler(). With LV_USE_OS (FreeRTOS) this
+     * gives true async — the CPU does other draw work / sleeps during the transfer.
+     * 1 = async (CPU does other draw work / sleeps during the transfer). Requires the
+     * Beken DMA2D completion ISR (owf_tuya_dma2d_backend.cpp) to signal LVGL. Set 0 for a
+     * synchronous polling fallback (no ISR) if ever debugging the interrupt path. */
+    #define LV_USE_DRAW_DMA2D_INTERRUPT 1
 #endif
 
 /** Draw using cached OpenGLES textures */
@@ -429,7 +452,7 @@
 
     /** - 1: Enable printing timestamp;
      *  - 0: Disable printing timestamp. */
-    #define LV_LOG_USE_TIMESTAMP 1
+    #define LV_LOG_USE_TIMESTAMP 0
 
     /** - 1: Print file and line number of the log;
      *  - 0: Do not print file and line number of the log. */
@@ -494,15 +517,15 @@
  *  If size is not set to 0, the decoder will fail to decode when the cache is full.
  *  If size is 0, the cache function is not enabled and the decoded memory will be
  *  released immediately after use. */
-/* LOCAL PATCH (ESP32-S3-WatchFace): board-gated. This is a GROWTH CEILING for the
+/* LOCAL PATCH (OpenWatchFace): board-gated. This is a GROWTH CEILING for the
  * image-decoder cache, not a static allocation — but on a no-PSRAM board (C6) it is
  * a landmine: the moment any app decodes an image the cache can grow toward 500 KB
  * and OOM the 512 KB SRAM. Set to 0 there so decoded images are released
  * immediately after use (no caching) instead of accumulating. PSRAM board keeps it. */
 #if BOARD_HAS_PSRAM
-#define LV_CACHE_DEF_SIZE       512000
+#define LV_CACHE_DEF_SIZE       128000
 #else
-#define LV_CACHE_DEF_SIZE       0
+#define LV_CACHE_DEF_SIZE       4096
 #endif
 
 /** Default number of image header cache entries. The cache is used to store the headers of images
@@ -522,7 +545,11 @@
 #define LV_COLOR_MIX_ROUND_OFS  0
 
 /** Add 2 x 32-bit variables to each `lv_obj_t` to speed up getting style properties */
-#define LV_OBJ_STYLE_CACHE      512000
+#if BOARD_HAS_PSRAM
+#define LV_OBJ_STYLE_CACHE      128000
+#else
+#define LV_OBJ_STYLE_CACHE      4096
+#endif
 
 /** Add `id` field to `lv_obj_t` */
 #define LV_USE_OBJ_ID           1
@@ -1380,13 +1407,13 @@
 
 #if LV_BUILD_DEMOS
     /** Show some widgets. This might be required to increase `LV_MEM_SIZE`. */
-    #define LV_USE_DEMO_WIDGETS 1
+    #define LV_USE_DEMO_WIDGETS 0
     
     /** Demonstrate usage of encoder and keyboard. */
     #define LV_USE_DEMO_KEYPAD_AND_ENCODER 0
     
     /** Benchmark your system */
-    #define LV_USE_DEMO_BENCHMARK 1
+    #define LV_USE_DEMO_BENCHMARK 0
 
     #if LV_USE_DEMO_BENCHMARK
         /** Use fonts where bitmaps are aligned 16 byte and has Nx16 byte stride */
@@ -1398,10 +1425,10 @@
     #define LV_USE_DEMO_RENDER 0
     
     /** Stress test for LVGL */
-    #define LV_USE_DEMO_STRESS 1
+    #define LV_USE_DEMO_STRESS 0
     
     /** Music player demo */
-    #define LV_USE_DEMO_MUSIC 1
+    #define LV_USE_DEMO_MUSIC 0
     #if LV_USE_DEMO_MUSIC
         #define LV_DEMO_MUSIC_SQUARE    0
         #define LV_DEMO_MUSIC_LANDSCAPE 0

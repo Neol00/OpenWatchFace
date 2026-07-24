@@ -16,16 +16,16 @@
 
 .PARAMETER Esp32CoreDir
   The installed ESP32 core root (contains `libraries\BLE`).
-  Default: $env:LOCALAPPDATA\Arduino15\packages\esp32\hardware\esp32\3.3.8
+  Default: $env:LOCALAPPDATA\Arduino15\packages\esp32\hardware\esp32\3.3.10
 
 .EXAMPLE
   ./apply_patches.ps1
-  ./apply_patches.ps1 -LibrariesDir "D:\Arduino\libraries" -Esp32CoreDir "D:\esp32\3.3.8"
+  ./apply_patches.ps1 -LibrariesDir "D:\Arduino\libraries" -Esp32CoreDir "D:\esp32\3.3.10"
 #>
 [CmdletBinding()]
 param(
   [string]$LibrariesDir = (Join-Path $HOME "Documents\Arduino\libraries"),
-  [string]$Esp32CoreDir = (Join-Path $env:LOCALAPPDATA "Arduino15\packages\esp32\hardware\esp32\3.3.8")
+  [string]$Esp32CoreDir = (Join-Path $env:LOCALAPPDATA "Arduino15\packages\esp32\hardware\esp32\3.3.10")
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,7 +97,7 @@ foreach ($j in $jobs) {
 
 if ($hardFail) {
   Write-Host "`nAborting: at least one patch does not apply cleanly. Nothing was changed." -ForegroundColor Red
-  Write-Host "Most likely your library version differs. Required: LVGL 9.5.0, Arduino_GFX 1.6.5, ESP32 core 3.3.8." -ForegroundColor Red
+  Write-Host "Most likely your library version differs. Required: LVGL 9.5.0, Arduino_GFX 1.6.5, ESP32 core 3.3.10." -ForegroundColor Red
   exit 1
 }
 

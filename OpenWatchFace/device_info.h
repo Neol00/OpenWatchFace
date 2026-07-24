@@ -9,11 +9,15 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_mac.h"   // per-unit MAC via tkl_wifi_get_mac
+#else
 #include "esp_mac.h"   // esp_efuse_mac_get_default — per-unit MAC octets for the radio name
+#endif
 
-#define DEVICE_NAME    "OpenWatchFace"        // full product name (chip-neutral; supports non-ESP32 boards)
-#define DEVICE_SHORT   "WatchFace"            // short form for radio names (BLE/Gadgetbridge — kept stable so paired phones don't need re-pairing)
-#define DEVICE_VERSION "1.2.0"                // firmware version
+#define DEVICE_NAME    "OpenWatchFace"        // full product name
+#define DEVICE_SHORT   "WatchFace"            // short form
+#define DEVICE_VERSION "1.3.0"                // firmware version
 #define DEVICE_AUTHOR  "Noel Ejemyr"          // project author
 #define DEVICE_VENDOR  "Waveshare"            // hardware vendor
 #define DEVICE_BOARD   BOARD_NAME             // board model — follows the selected board (board.h)

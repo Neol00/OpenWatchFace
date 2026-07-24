@@ -48,6 +48,47 @@ public:
   void writeIndexedPixelsDouble(uint8_t *data, uint16_t *idx, uint32_t len) override;
   void writeYCbCrPixels(uint8_t *yData, uint8_t *cbData, uint8_t *crData, uint16_t w, uint16_t h) override;
 
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): ASYNC tile write for the JD9853 flush.
+  // Queues the pixel data as <=ASYNC_MAX_SEG DMA transactions and returns as soon as
+  // they're queued (~us) — the CPU is then free to let LVGL render the next tile while
+  // the wire drains. `data` MUST already be in panel byte order (the LVGL flush swaps
+  // it) and live in DMA-capable RAM. CS is taken LOW here and raised from the post_cb
+  // ISR, which then calls done_cb(done_arg) (i.e. lv_disp_flush_ready). The caller must
+  // have set the address window (sync) immediately before. DC stays HIGH (data).
+  // Returns false if the area is too big for ASYNC_MAX_SEG segments -> caller falls
+  // back to the blocking draw path. NOTE: requires the device NOT hold the bus via
+  // spi_device_acquire_bus (begin() drops the permanent acquire), because the queued
+  // API is incompatible with a held bus.
+  bool writePixelsAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg);
+  void waitAsync(); // block until no async write is in flight (reaps queued results)
+
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): HYBRID async/sync mode. The microSD shares this
+  // SPI host; the async path (queued DMA + raw-GPIO CS) corrupts the panel when the SD device
+  // coexists on the bus. While SD I/O is in progress the SD layer sets sync_only(true): then
+  // writePixelsAsync() returns false so the LVGL flush takes its BLOCKING path (one full
+  // synchronous transaction, no queued DMA in flight), keeping the bus single-owner. Cleared
+  // (false) when SD is idle to restore the async FPS win. Caller drains in-flight DMA before
+  // setting true. */
+  void set_sync_only(bool on) { _sync_only = on; }
+  bool sync_only(void) const { return _sync_only; }
+
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): re-latch this device's bus config after ANOTHER
+  // device (the microSD) used the shared host. The IDF spi_master reconfigures the bus
+  // registers (clock divider 20->80 MHz, timing) at the START of the first transaction after
+  // a device switch — but this display's CS is RAW GPIO, pulled LOW in beginWrite() BEFORE
+  // that first transaction, so a reconfig glitch on SCLK is clocked into the panel and shifts
+  // its command stream (=> corrupted CASET/RASET => sliced/garbled lines). This sends ONE
+  // dummy byte on this device while every CS on the bus is HIGH (panel and SD both ignore it),
+  // so the reconfig happens during a transaction nobody hears; the next real CS bracket then
+  // starts with the bus already configured for the display. Call after each SD bus release.
+  void resyncBus(void);
+
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): force the panel's raw-GPIO CS HIGH. Belt-and-
+  // braces before SD bus use: if ANY code path ever left the panel CS low, every SD byte
+  // would also be clocked into the panel (ESP-IDF sdspi_share rule #1: all other devices'
+  // CS must be deasserted during SD traffic). Idempotent, ~ns cost.
+  void forceCsIdle(void);
+
 protected:
   void flush_data_buf();
   GFX_INLINE void WRITE8BIT(uint8_t d);
@@ -92,6 +133,30 @@ private:
   };
 
   uint16_t _data_buf_bit_idx = 0;
+
+  // LOCAL ADDITION (OpenWatchFace C6-1.47): async tile write state. Up to
+  // ASYNC_MAX_SEG queued DMA segments sharing ONE CS bracket; pre_cb drops CS on the
+  // first segment, post_cb raises it on the last + fires the done callback. .user ==
+  // NULL on every sync transaction so the callbacks no-op for the normal paths.
+  struct AsyncSeg
+  {
+    Arduino_ESP32SPIDMA *bus;
+    bool first;
+    bool last;
+  };
+  static void _async_pre_cb(spi_transaction_t *t);
+  static void _async_post_cb(spi_transaction_t *t);
+  // A full-height C6 tile (172 x BOARD_PARTIAL_BUF_LINES px) at 2 bytes/px, split into
+  // ESP32SPIDMA_MAX_PIXELS_AT_ONCE*2-byte (2 KB) segments: 172*70*2 = 24080 B / 2048
+  // ~= 12 segments worst case. 16 gives headroom; the array cost is tiny.
+  static const int ASYNC_MAX_SEG = 16;
+  spi_transaction_t _async_tran[ASYNC_MAX_SEG];
+  AsyncSeg _async_seg[ASYNC_MAX_SEG];
+  volatile uint8_t _async_pending = 0; // queued-but-unreaped async transactions
+  volatile bool _sync_only = false;    // HYBRID: true while SD I/O owns the bus -> no async
+  bool _bus_acquired = false;          // did beginWrite take spi_device_acquire_bus? (release in endWrite)
+  void (*_async_done_cb)(void *) = nullptr;
+  void *_async_done_arg = nullptr;
 };
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)

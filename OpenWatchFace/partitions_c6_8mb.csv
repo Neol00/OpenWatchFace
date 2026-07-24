@@ -7,18 +7,26 @@
 #       up this file (rename to partitions.csv per build), OR
 #   (b) add a build.partitions entry — see board_ws_c6_touch_lcd_147.h notes.
 #
+# NO OTA: app1 was removed (flashing is always by cable to app0), freeing its 3 MB
+# slot for a 1 MB EXTENDED NVS partition ("nvsext" — the firmware's Preferences
+# store, see BOARD_NVS_EXT_LABEL in the board header) with the remainder going to
+# the on-flash FAT filesystem. Same scheme as the two S3 tables.
+#
 # CRITICAL — the same fixed-offset rules as the 32 MB table apply (or BLACK
 # SCREEN): partition table at 0x8000, boot_app0 at 0xe000 (so otadata at 0xe000),
-# the app .bin at 0x10000 (so app0 starts at exactly 0x10000). NVS stays 20 KB.
+# the app .bin at 0x10000 (so app0 starts at exactly 0x10000). The head nvs stays
+# 20 KB for the system consumers (WiFi PHY/cal, BLE bonds); Preferences live in
+# "nvsext".
 #
-# Sizing: the compiled app is ~2.15 MB, so 2 MB slots are TOO SMALL. Dual 3 MB
-# OTA slots give ~40% headroom and keep OTA possible; the rest is on-flash FAT.
-# app partitions start on a 64 KB (0x10000) boundary; nothing exceeds 0x800000.
+# Sizing: the compiled app is ~2.15 MB, so app0 keeps the 3 MB slot (~40%
+# headroom). nvsext 0x310000..0x410000 (1 MB), FFat fills the rest up to the
+# coredump: 0x410000..0x7F0000 = 0x3E0000 (~3.875 MB FAT, up from ~1.875 MB).
+# Nothing exceeds 0x800000.
 #
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x5000,
 otadata,    data, ota,      0xe000,    0x2000,
 app0,       app,  ota_0,    0x10000,   0x300000,
-app1,       app,  ota_1,    0x310000,  0x300000,
-ffat,       data, fat,      0x610000,  0x1E0000,
+nvsext,     data, nvs,      0x310000,  0x100000,
+ffat,       data, fat,      0x410000,  0x3E0000,
 coredump,   data, coredump, 0x7F0000,  0x10000,

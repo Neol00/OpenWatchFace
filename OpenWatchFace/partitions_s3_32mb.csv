@@ -1,8 +1,10 @@
 # partitions.csv — custom 32 MB layout for ESP32-S3-WatchFace
 #
 # Total flash on the Waveshare ESP32-S3-Touch-AMOLED-2.06 = 32 MB (0x2000000).
-# The flashed app .bin is ~1.9 MB; the 8 MB app slots give ~6 MB headroom and
-# keep OTA possible (two slots). The remainder is a large on-flash FAT filesystem.
+# NO OTA: app1 was removed (no over-the-air updates used; flashing is always by
+# cable to app0), freeing its 4 MB slot for a 1 MB EXTENDED NVS partition
+# ("nvsext" — the firmware's Preferences store, see BOARD_NVS_EXT_LABEL) with
+# the remainder going to the on-flash FAT filesystem.
 #
 # CRITICAL — why these offsets are NOT free to change:
 #   The ESP32 Arduino build flashes fixed addresses that the partition table must
@@ -12,10 +14,9 @@
 #       0xe000  boot_app0.bin   -> so otadata MUST be at 0xe000
 #       0x10000 the app .bin    -> so app0 MUST start at exactly 0x10000
 #   That pins the head: nvs (0x9000..0xe000 = 20 KB) + otadata (0xe000..0x10000)
-#   then app0 at 0x10000. NVS therefore can't be enlarged past 20 KB here — a
-#   bigger nvs would push app0 off 0x10000 and brick the boot (the earlier
-#   black-screen bug). For more NVS, add a SECOND nvs partition AFTER the apps and
-#   point the code at it; the head nvs stays 20 KB.
+#   then app0 at 0x10000. The head nvs therefore stays 20 KB — it still serves
+#   the SYSTEM consumers of the default "nvs" partition (WiFi PHY/cal data,
+#   NimBLE bond store). The firmware's own Preferences data lives in "nvsext".
 #
 # Other rules: app partitions start on a 64 KB (0x10000) boundary; nothing exceeds
 # 0x2000000. This table fills the 32 MB exactly.
@@ -24,6 +25,6 @@
 nvs,        data, nvs,      0x9000,    0x5000,
 otadata,    data, ota,      0xe000,    0x2000,
 app0,       app,  ota_0,    0x10000,   0x400000,
-app1,       app,  ota_1,    0x410000,  0x400000,
-ffat,       data, fat,      0x810000,  0x17E0000,
+nvsext,     data, nvs,      0x410000,  0x100000,
+ffat,       data, fat,      0x510000,  0x1AE0000,
 coredump,   data, coredump, 0x1FF0000, 0x10000,

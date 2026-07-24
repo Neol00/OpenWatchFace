@@ -37,9 +37,10 @@ static void tmr_fmt(uint32_t s, char *buf, size_t n) {
 #if BOARD_SCREEN_NARROW
 #  define TMR_BTN_H        UI_PX(72)
 #  define TMR_BTN_FONT     lv_font_montserrat_14
-   // Widths sized to the C6's ~92%-of-172px column (~158px usable). Full-width
-   // buttons nearly fill it; paired buttons split it with the row's 8px gap.
-#  define TMR_FULL_W        150
+   // Widths sized to the C6's ~92%-of-172px column. The column has ~6px inner pad
+   // each side, so usable interior is ~146px — 150 overran it and the full-width
+   // Start button clipped off both edges. 140 leaves a safe margin.
+#  define TMR_FULL_W        140
 #  define TMR_PAIR_W         71   // two equal halves (-1m/+1m, -10s/+10s)
 #  define TMR_PAIR_WIDE_W    92   // Resume/Pause (the wider of the run-mode pair)
 #  define TMR_PAIR_NARROW_W  54   // +1:00 (the narrower of the run-mode pair)
@@ -130,8 +131,11 @@ static void alarm_fire_ex(const char *title, const char *subtitle, bool fromTime
   s_alarm_from_timer = fromTimer;
   s_alarm_from_clock = false;            // almclk_fire() re-sets this after the call
   s_alarm_dirty = true;
-  haptics_play(HAPTICS_HEARTBEAT, true);
-  alarm_sound_start();
+
+  // The quick-shade can't be left open/animating under the modal overlay: its live
+  // anim + the loop's frame pushes keep mutating the shade on lv_layer_sys() while
+  // the alarm overlay is up, which freezes/crashes the UI. Hard-close it first.
+  quick_shade_force_close();
 
   alarm_scr = lv_obj_create(lv_layer_sys());   // above apps, menu AND the shade
   lv_obj_remove_style_all(alarm_scr);
@@ -167,6 +171,19 @@ static void alarm_fire_ex(const char *title, const char *subtitle, bool fromTime
   lv_label_set_text(h, alarm_touch_dismiss() ? "Tap or press BOOT to dismiss"
                                              : "Press BOOT to dismiss");
   lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-44));
+
+  // PAINT THE OVERLAY NOW, before the (potentially blocking) haptics/audio bring-up
+  // below. On a deep-sleep timer/alarm wake the chip cold-boots and the FIRST loop
+  // iteration calls us, then alarm_sound_start() synchronously brings up the SDK media
+  // stack — which blocks the loop before its next lv_timer_handler(), leaving the
+  // overlay half-drawn and the watch frozen (the reported symptom). Flushing the full
+  // overlay to the glass here means the ring screen is always complete first, no matter
+  // how long the audio path takes to come up. Two passes: one renders, one settles any
+  // deferred invalidate/layout. No-op cost on the warm/interactive path.
+  ui_pump_frame(2);
+
+  haptics_play(HAPTICS_HEARTBEAT, true);
+  alarm_sound_start();
 }
 
 /* Timer alarm: "Time's up!" + the timer's duration. Dismiss cancels the timer. */
@@ -183,11 +200,14 @@ static void alarm_fire(void) {
  * one by one as each overlay is dismissed. */
 static void almclk_fire(void) {
   if (g_alarm_active) return;
-  int i = almclk_due_index();
-  if (i < 0) { almclk_rearm(); return; }   // stale NVS master (e.g. the CSV was
-                                           // edited on a PC) — self-heal and move on
+  // Suppress while the user is in the alarm-settings screens (list/editor) — stepping the
+  // time through the current minute shouldn't trigger a ring.
+  if (nav_current == app_open_alarmclock || nav_current == app_open_alarmedit) return;
+  int i = almclk_match_now();              // any enabled alarm whose HH:MM == now, not yet rung
+  if (i < 0) return;
   uint8_t h = s_almcs[i].h, m = s_almcs[i].m;
-  almclk_fired(i);
+  almclk_mark_rang();                      // ring ONCE for this minute
+  almclk_fired(i);                         // one-shot off / repeat advances its target
   char sub[24]; snprintf(sub, sizeof sub, "Alarm  %02u:%02u", h, m);
   alarm_fire_ex("Wake up!", sub, false);   // not a countdown: dismiss cancels nothing
   s_alarm_from_clock = true;
@@ -273,7 +293,9 @@ static void tmr_rep_cb(lv_timer_t *t) {
   (void)t;
   if (s_tmr_rep_step == 0 || !tmr_big) { tmr_rep_stop(); return; }
   tmr_stage_add(s_tmr_rep_step);
-  haptics_pulse(6);                      // light tick so a fast ramp still feels discrete
+  // Hold-repeat fires LONG_PRESSED_REPEAT, which the global click hook does NOT cover,
+  // so keep an explicit tick here — at the same low level as every other UI buzz.
+  haptics_pulse(HAPTICS_CLICK_MS);
   tmr_refresh();
   lv_timer_set_period(s_tmr_rep_tmr, tmr_rep_gap(millis() - s_tmr_rep_t0));
 }
@@ -283,7 +305,9 @@ static void tmr_rep_cb(lv_timer_t *t) {
 static void tmr_adjust_press_cb(lv_event_t *e) {
   int32_t step = (int32_t)(intptr_t)lv_event_get_user_data(e);
   tmr_stage_add(step);
-  haptics_pulse(12);
+  // This pill is wired to PRESSED (not CLICKED), so the global click hook never fires
+  // for it — keep an explicit tap tick, at the shared low level.
+  haptics_pulse(HAPTICS_CLICK_MS);
   tmr_refresh();
   tmr_rep_stop();                        // clear any stale hold (defensive)
   s_tmr_rep_step = step;
@@ -297,8 +321,7 @@ static void tmr_start_cb(lv_event_t *e) {
   (void)e;
   if (s_tmr_set_s == 0) return;
   timer_start(s_tmr_set_s);
-  haptics_pulse(25);
-  app_open_timer();                      // rebuild into run mode
+  app_open_timer();                      // rebuild into run mode (buzz: global click hook)
 }
 static void tmr_pauseresume_cb(lv_event_t *e) {
   (void)e;
@@ -409,8 +432,14 @@ static void app_open_timer(void) {
     tmr_adjust_btn(a2, "-10s", -10, TMR_PAIR_W);
     tmr_adjust_btn(a2, "+10s",  10, TMR_PAIR_W);
 
-    // Start (accent).
-    tmr_btn(col, LV_SYMBOL_PLAY "  Start", tmr_start_cb, nullptr, ui_accent_hex(), TMR_FULL_W);
+    // Start (accent). On narrow panels make it noticeably taller than the adjust
+    // pills so it's the obvious primary action and easy to hit.
+    lv_obj_t *start_b =
+        tmr_btn(col, LV_SYMBOL_PLAY "  Start", tmr_start_cb, nullptr, ui_accent_hex(), TMR_FULL_W);
+#if BOARD_SCREEN_NARROW
+    lv_obj_set_height(start_b, UI_PX(96));
+#endif
+    (void)start_b;
   } else {
     // -------- RUN MODE --------
     tmr_bar = lv_bar_create(col);
@@ -420,12 +449,24 @@ static void app_open_timer(void) {
     lv_obj_set_style_bg_color(tmr_bar, lv_color_hex(ui_accent_hex()), LV_PART_INDICATOR);
     lv_bar_set_range(tmr_bar, 0, 100);
 
+    const char *pause_txt = timer_is_paused() ? LV_SYMBOL_PLAY "  Resume"
+                                               : LV_SYMBOL_PAUSE "  Pause";
+#if BOARD_SCREEN_NARROW
+    // Narrow panels can't fit Pause + "+1:00" side by side (they clipped the edges),
+    // so stack every run-mode button in its own full-width row, slightly taller.
+    lv_obj_t *pr = tmr_btn(col, pause_txt, tmr_pauseresume_cb, nullptr, ui_accent_hex(), TMR_FULL_W);
+    lv_obj_t *ad = tmr_btn(col, "+1:00",   tmr_addmin_cb,      nullptr, 0x1F1F1F,        TMR_FULL_W);
+    lv_obj_t *cn = tmr_btn(col, LV_SYMBOL_TRASH "  Cancel", tmr_cancel_cb, nullptr, 0x5A1A1A, TMR_FULL_W);
+    lv_obj_set_height(pr, UI_PX(88));
+    lv_obj_set_height(ad, UI_PX(88));
+    lv_obj_set_height(cn, UI_PX(88));
+#else
     lv_obj_t *r1 = tmr_row(col);
-    tmr_btn(r1, timer_is_paused() ? LV_SYMBOL_PLAY "  Resume" : LV_SYMBOL_PAUSE "  Pause",
-            tmr_pauseresume_cb, nullptr, ui_accent_hex(), TMR_PAIR_WIDE_W);
+    tmr_btn(r1, pause_txt, tmr_pauseresume_cb, nullptr, ui_accent_hex(), TMR_PAIR_WIDE_W);
     tmr_btn(r1, "+1:00", tmr_addmin_cb, nullptr, 0x1F1F1F, TMR_PAIR_NARROW_W);
 
     tmr_btn(col, LV_SYMBOL_TRASH "  Cancel", tmr_cancel_cb, nullptr, 0x5A1A1A, TMR_FULL_W);
+#endif
   }
 
   // Touch-dismiss toggle (alarm can be silenced by a tap, not only BOOT).
@@ -440,6 +481,12 @@ static void app_open_timer(void) {
   lv_obj_t *tl = lv_label_create(tr);
   lv_obj_set_style_text_font(tl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(tl, lv_color_hex(0xCCCCCC), 0);
+#if BOARD_SCREEN_NARROW
+  // Too long for one line on the narrow panel — wrap it instead of clipping the edges.
+  lv_obj_set_width(tl, LV_PCT(100));
+  lv_label_set_long_mode(tl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
+#endif
   lv_label_set_text(tl, "Touch can dismiss alarm");
   lv_obj_t *sw = lv_switch_create(tr);
 #if BOARD_SCREEN_NARROW
@@ -520,7 +567,6 @@ static void sw_startstop_cb(lv_event_t *e) {
     sw_start_ms = millis();
     sw_running = true;
   }
-  haptics_pulse(15);
   if (sw_pp_btn)
     lv_label_set_text(sw_pp_btn, sw_running ? LV_SYMBOL_PAUSE "  Stop"
                                             : LV_SYMBOL_PLAY  "  Start");
@@ -529,14 +575,12 @@ static void sw_lap_cb(lv_event_t *e) {
   (void)e;
   if (sw_running && sw_lap_n < 20) {
     sw_laps[sw_lap_n++] = sw_elapsed_ms();
-    haptics_pulse(12);
     sw_rebuild_laps();
   }
 }
 static void sw_reset_cb(lv_event_t *e) {
   (void)e;
   sw_running = false; sw_accum_ms = 0; sw_lap_n = 0;
-  haptics_pulse(15);
   sw_refresh();
   sw_rebuild_laps();
 }
@@ -622,15 +666,21 @@ static void almc_fmt_in(char *buf, size_t n, uint32_t target) {
   else   snprintf(buf, n, "Rings in %lum", (unsigned long)(m ? m : 1));
 }
 
-/* Editor refresh: the big HH:MM + this alarm's own "rings in" hint. */
+/* Editor refresh: the big HH:MM + this alarm's own "rings in" hint.
+ * The hint is computed LIVE from the alarm's CURRENT h/m/rep/days via almclk_next_epoch(),
+ * NOT from the stored a->target. a->target is only re-armed on commit (button release), so
+ * formatting the hint from it left "Rings in" stale while stepping the time up/down — it
+ * showed the old time's countdown against the new HH:MM. Recomputing here keeps them in sync
+ * on every tap. */
 static void almc_refresh(void) {
   AlmClk *a = almc_ed();
   if (!almc_time_lbl || !a) return;
   lv_label_set_text_fmt(almc_time_lbl, "%02u:%02u", a->h, a->m);
   if (!almc_next_lbl) return;
   if (!a->en)         { lv_label_set_text(almc_next_lbl, "Alarm off"); return; }
-  if (!a->target)     { lv_label_set_text(almc_next_lbl, "No repeat days selected"); return; }
-  char b[40]; almc_fmt_in(b, sizeof b, a->target);
+  uint32_t when = almclk_next_epoch(a);   // live next-fire for the CURRENT h/m/days
+  if (!when)          { lv_label_set_text(almc_next_lbl, "No repeat days selected"); return; }
+  char b[40]; almc_fmt_in(b, sizeof b, when);
   lv_label_set_text(almc_next_lbl, b);
 }
 
@@ -655,7 +705,9 @@ static void almc_step_cb(lv_event_t *e) {
   mins %= 1440; if (mins < 0) mins += 1440;
   a->h = (uint8_t)(mins / 60);
   a->m = (uint8_t)(mins % 60);
-  haptics_pulse(8);
+  // Covers the LONG_PRESSED_REPEAT hold (the global click hook only sees taps); the
+  // debounce swallows the duplicate on a plain tap. Shared low level.
+  haptics_pulse(HAPTICS_CLICK_MS);
   almc_refresh();
 }
 static void almc_commit_cb(lv_event_t *e) {
@@ -710,8 +762,7 @@ static void almc_day_cb(lv_event_t *e) {
   uint8_t bit = (uint8_t)(intptr_t)lv_event_get_user_data(e);
   if (lv_obj_has_state(b, LV_STATE_CHECKED)) a->days |=  (1 << bit);
   else                                       a->days &= ~(1 << bit);
-  haptics_pulse(8);
-  almclk_save_csv();
+  almclk_save_csv();              // buzz: global click hook
   almclk_rearm();
   almc_refresh();
 }
@@ -722,8 +773,7 @@ static void almc_delete_cb(lv_event_t *e) {
   s_almc_edit = -1;
   almclk_save_csv();
   almclk_rearm();
-  haptics_pulse(15);
-  nav_back();               // back to the list, rebuilt without this alarm
+  nav_back();               // back to the list, rebuilt without this alarm (buzz: global hook)
 }
 
 static void almc_cleanup_cb(lv_event_t *e) {
@@ -758,6 +808,11 @@ static void almc_add_cb(lv_event_t *e) {
 }
 
 static void app_open_alarmclock(void) {
+  // Make sure the alarm list is loaded from storage before the user can edit it. The boot
+  // deferred-load normally does this, but if the user opens Alarms first, s_almc_loaded would
+  // still be false -> almclk_rearm() would no-op and an edit wouldn't arm/persist the wake.
+  if (!s_almc_loaded) almclk_load();
+
   app_screen_begin("Alarms");
 
   lv_obj_t *col = lv_obj_create(app_scr);

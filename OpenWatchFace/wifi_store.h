@@ -25,7 +25,11 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/esp_heap_caps.h"
+#else
 #include "esp_heap_caps.h"   // heap_caps_calloc — the network list lives in PSRAM
+#endif
 #include "sd_card.h"
 #include "storage_fs.h"
 

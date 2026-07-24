@@ -29,7 +29,26 @@
  * instead. FONT_TIME_IS_CUSTOM tells the watch face whether the clock font has
  * only digits (custom) or a full glyph set (stock). */
 
-#if BOARD_HAS_PSRAM
+/* Gate on the SCREEN, not PSRAM: the font tier is a function of panel SIZE, and a
+ * board can have PSRAM AND a small panel (the S3-1.47: PSRAM, but a 172x320 panel
+ * like the C6). Keying off BOARD_SCREEN_NARROW gives every slim portrait panel the
+ * small tier regardless of chip/memory. (Was BOARD_HAS_PSRAM, which only worked
+ * while the 2.06 was the lone PSRAM board.) */
+#if BOARD_DISPLAY_GC9A01_SPI
+/* GC9A01 240x240 (the S3 Super Mini DIY build) — gate on the DISPLAY, not on
+ * BOARD_SCREEN_ROUND: the T5-E1's AMOLED is round too but full-size, so
+ * roundness says nothing about the font tier. This panel is ~half the 410-wide
+ * reference, so each font is "a little over half" its reference size (110->48
+ * clock, 28->16, 20->12, 24->14). The clock uses the LARGEST stock Montserrat
+ * (48; built-in fonts stop there — no custom generated glyph set on this
+ * board), full glyph range -> FONT_TIME_IS_CUSTOM 0. */
+#define FONT_TIME  lv_font_montserrat_48    // HH:MM (stock font; full glyph set)
+#define FONT_TIME_IS_CUSTOM 0
+#define FONT_LABEL lv_font_montserrat_16
+#define FONT_SMALL lv_font_montserrat_12
+#define FONT_ABOUT_BODY lv_font_montserrat_12
+#define FONT_TOP   lv_font_montserrat_14
+#elif !BOARD_SCREEN_NARROW
 /* S3-2.06 (large panel): the original, unchanged set. */
 LV_FONT_DECLARE(montserrat_clock_110);
 #define FONT_TIME  montserrat_clock_110     // enormous HH:MM (custom: digits+colon only)
@@ -39,7 +58,8 @@ LV_FONT_DECLARE(montserrat_clock_110);
 #define FONT_ABOUT_BODY lv_font_montserrat_20  // About screen body (== FONT_SMALL on S3)
 #define FONT_TOP   lv_font_montserrat_24    // the top-row value text (%, date, day)
 #else
-/* C6-1.47 (small panel): stock Montserrat tier (~42% of the reference sizes). */
+/* Slim portrait panel (C6-1.47 / S3-1.47, 172x320): stock Montserrat tier
+ * (~42% of the reference sizes). */
 #define FONT_TIME  lv_font_montserrat_48    // HH:MM (stock font; full glyph set)
 #define FONT_TIME_IS_CUSTOM 0
 #define FONT_LABEL lv_font_montserrat_12
@@ -47,3 +67,22 @@ LV_FONT_DECLARE(montserrat_clock_110);
 #define FONT_ABOUT_BODY lv_font_montserrat_12
 #define FONT_TOP   lv_font_montserrat_10
 #endif
+
+/* ---- Shared MDI icon fonts at the UI's three glyph sizes ----
+ * icons22 is the notification font (full range). icons14 / icons28 carry the smaller
+ * set of UI glyphs used outside notifications (e.g. the coffee-outline corner + shade
+ * icons). All three are the same Material Design Icons typeface, so a glyph looks
+ * identical across sizes. Declared here, the single home for the MDI fonts. */
+LV_FONT_DECLARE(icons14);
+LV_FONT_DECLARE(icons28);
+LV_FONT_DECLARE(icons34);   // app-menu tile size (matches MENU_TILE_ICON_FONT montserrat_34)
+
+/* Material Design Icons codepoints used by the UI (outside the notif categories).
+ * Look glyphs up on pictogrammers.com/library/mdi. Add the codepoint to the relevant
+ * icons*.c --range and regenerate when introducing a new one. */
+#define MDI_COFFEE          0xF0176   // coffee cup — caffeine indicator
+#define MDI_MINI_DISK       0xF0A06   // small hard disk — Flash (FFat) volume
+#define MDI_MINI_SD         0xF0A05   // small SD card — SD Card volume
+#define MDI_WATCH           0xF0897   // smartwatch — Timer/Stopwatch/Alarm app tile.
+#define MDI_RUN_FAST        0xF111F   // running figure — Fitness app tile
+#define MDI_SLEEP           0xF0594   // moon (sleep) — Sleep app tile + face DND badge

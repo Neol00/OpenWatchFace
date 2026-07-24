@@ -18,8 +18,13 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/freertos/FreeRTOS.h"
+#include "tuya/compat/freertos/semphr.h"
+#else
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#endif
 
 /* Guards the shared notification/WiFi stores (UI core 1 dismiss/clear vs network
  * core 0 add/save). */

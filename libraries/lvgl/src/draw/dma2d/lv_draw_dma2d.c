@@ -23,6 +23,15 @@
 
 #define DRAW_UNIT_ID_DMA2D 5
 
+#if OWF_TUYA_DMA2D_BACKEND
+/* Beken BK7258 backend bridge (implemented in owf_tuya_dma2d_backend.cpp). Declared here
+ * because the LVGL headers don't know about it. */
+void owf_dma2d_backend_init(void);
+void owf_dma2d_backend_deinit(void);
+void owf_dma2d_backend_start(const void * conf);
+bool owf_dma2d_backend_busy(void);
+#endif
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -74,6 +83,10 @@ void lv_draw_dma2d_init(void)
     lv_thread_sync_init(&draw_dma2d_unit->interrupt_signal);
 #endif
 
+#if OWF_TUYA_DMA2D_BACKEND
+    /* Beken BK7258: bring up the DMA2D engine + ISR via the driver (no STM32 RCC/NVIC). */
+    owf_dma2d_backend_init();
+#else
     /* enable the DMA2D clock */
 #if defined(STM32F4) || defined(STM32F7) || defined(STM32U5) || defined(STM32L4)
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2DEN;
@@ -90,10 +103,14 @@ void lv_draw_dma2d_init(void)
 
     /* enable the interrupt */
     NVIC_EnableIRQ(DMA2D_IRQn);
+#endif /* OWF_TUYA_DMA2D_BACKEND */
 }
 
 void lv_draw_dma2d_deinit(void)
 {
+#if OWF_TUYA_DMA2D_BACKEND
+    owf_dma2d_backend_deinit();
+#else
     /* disable the interrupt */
     NVIC_DisableIRQ(DMA2D_IRQn);
 
@@ -105,6 +122,7 @@ void lv_draw_dma2d_deinit(void)
 #elif defined(STM32H7RS) || defined(STM32N6)
     RCC->AHB5ENR &= ~RCC_AHB5ENR_DMA2DEN;
 #endif
+#endif /* OWF_TUYA_DMA2D_BACKEND */
 
 #if LV_DRAW_DMA2D_ASYNC
     lv_result_t res = lv_thread_sync_delete(&g_unit->interrupt_signal);
@@ -132,6 +150,12 @@ lv_draw_dma2d_output_cf_t lv_draw_dma2d_cf_to_dma2d_output_cf(lv_color_format_t 
         case LV_COLOR_FORMAT_RGB888:
             return LV_DRAW_DMA2D_OUTPUT_CF_RGB888;
         case LV_COLOR_FORMAT_RGB565:
+#if OWF_TUYA_DMA2D_BACKEND
+        /* Tuya T5 renders in RGB565_SWAPPED (panel byte order). The pixel layout is the
+         * same RGB565; the byte order is handled by the Beken DMA2D output byte-reverse,
+         * set in the backend. So map SWAPPED to the same RGB565 output enum here. */
+        case LV_COLOR_FORMAT_RGB565_SWAPPED:
+#endif
             return LV_DRAW_DMA2D_OUTPUT_CF_RGB565;
         case LV_COLOR_FORMAT_ARGB1555:
             return LV_DRAW_DMA2D_OUTPUT_CF_ARGB1555;
@@ -157,6 +181,11 @@ uint32_t lv_draw_dma2d_color_to_dma2d_color(lv_draw_dma2d_output_cf_t cf, lv_col
 
 void lv_draw_dma2d_configure_and_start_transfer(const lv_draw_dma2d_configuration_t * conf)
 {
+#if OWF_TUYA_DMA2D_BACKEND
+    /* Beken BK7258: translate the config to the driver API and start (async). */
+    owf_dma2d_backend_start(conf);
+}
+#else
     /* number of lines register */
     DMA2D->NLR = (conf->w << DMA2D_NLR_PL_Pos) | (conf->h << DMA2D_NLR_NL_Pos);
 
@@ -204,6 +233,7 @@ void lv_draw_dma2d_configure_and_start_transfer(const lv_draw_dma2d_configuratio
 #endif
                 ;
 }
+#endif /* OWF_TUYA_DMA2D_BACKEND */
 
 #if LV_DRAW_DMA2D_CACHE
 void lv_draw_dma2d_invalidate_cache(const lv_draw_dma2d_cache_area_t * mem_area)
@@ -234,6 +264,14 @@ static int32_t evaluate_cb(lv_draw_unit_t * draw_unit, lv_draw_task_t * task)
                 lv_draw_fill_dsc_t * dsc = task->draw_dsc;
                 if(!(dsc->radius == 0
                      && dsc->grad.dir == LV_GRAD_DIR_NONE
+#if OWF_TUYA_DMA2D_BACKEND
+                     /* OPAQUE-ONLY on the Beken backend: only fully-opaque solid fills go to
+                      * DMA2D (a register-to-memory colour write, no background read). LVGL's
+                      * alpha fill uses an STM32-specific fake-A8 blend idiom that doesn't map
+                      * to Beken's blend HW (caused dropped glyphs + crashes) — let the software
+                      * draw unit handle anything with opacity < max. */
+                     && dsc->opa >= LV_OPA_MAX
+#endif
                      && (dsc->base.layer->color_format == LV_COLOR_FORMAT_ARGB8888
                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_XRGB8888
                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_RGB888
@@ -257,11 +295,21 @@ static int32_t evaluate_cb(lv_draw_unit_t * draw_unit, lv_draw_task_t * task)
                      && dsc->scale_y == 256
                      && dsc->rotation == 0
                      && lv_image_src_get_type(dsc->src) == LV_IMAGE_SRC_VARIABLE
+#if OWF_TUYA_DMA2D_BACKEND
+                     /* OPAQUE-ONLY: fully opaque, and a source with NO alpha channel (so the
+                      * copy is a straight M2M pixel-format convert, never a blend that would
+                      * read the background). Excludes ARGB8888/ARGB1555 sources. */
+                     && dsc->opa >= LV_OPA_MAX
+                     && (dsc->header.cf == LV_COLOR_FORMAT_XRGB8888
+                         || dsc->header.cf == LV_COLOR_FORMAT_RGB888
+                         || dsc->header.cf == LV_COLOR_FORMAT_RGB565)
+#else
                      && (dsc->header.cf == LV_COLOR_FORMAT_ARGB8888
                          || dsc->header.cf == LV_COLOR_FORMAT_XRGB8888
                          || dsc->header.cf == LV_COLOR_FORMAT_RGB888
                          || dsc->header.cf == LV_COLOR_FORMAT_RGB565
                          || dsc->header.cf == LV_COLOR_FORMAT_ARGB1555)
+#endif
                      && (dsc->base.layer->color_format == LV_COLOR_FORMAT_ARGB8888
                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_XRGB8888
                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_RGB888
@@ -380,7 +428,11 @@ static int32_t wait_finish_cb(lv_draw_unit_t * draw_unit)
 #if !LV_DRAW_DMA2D_ASYNC
 static bool check_transfer_completion(void)
 {
+#if OWF_TUYA_DMA2D_BACKEND
+    return !owf_dma2d_backend_busy();
+#else
     return !(DMA2D->CR & DMA2D_CR_START);
+#endif
 }
 #endif
 

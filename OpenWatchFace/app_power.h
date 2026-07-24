@@ -17,10 +17,21 @@
  * ========================================================================== */
 #pragma once
 #include <lvgl.h>
+#if BOARD_PLATFORM_TUYA
+#include "tuya/compat/owf_tuya_soc_stats.h"   // core mV from SoC regs + commanded MHz
+#include "tuya/compat/owf_tuya_cpu_measure.h"  // owf_tuya_measure_cpu_mhz() — REAL clock by cycle-count
+#include "tuya/compat/owf_tuya_voltage.h"      // owf_tuya_set_core_mv() / get — live mV core voltage
+#include "tuya/compat/owf_tuya_dpll_sweep.h"   // DPLL band force/sweep — >480 MHz bring-up probe
+#endif
 
 /* --- palette (shared with About) ---
  * The accent (headers + graph line + live values) is now the user-tunable accent
  * color: ui_accent_soft_hex() for headers, ui_accent_hex() for the brighter line. */
+/* The MaixCam-Pro has the same AXP2101 PMU, reached via MaixCDK (board_* bridge),
+ * so the PMU-only UI (battery graph/voltage/charging/gauge-avg draw) applies there
+ * too — even though BOARD_HAS_PMU_AXP2101 (the XPowersLib path) is 0. */
+#define PM_HAS_PMU  (BOARD_HAS_PMU_AXP2101 || BOARD_PLATFORM_MAIX)
+
 #define PM_CARD_BG     0x141414   // graph-card / row background
 #define PM_CARD_BORDER 0x262626   // graph-card / row border
 #define PM_DIM         0x888888   // captions / units
@@ -184,6 +195,11 @@ static void pm_make_cpu_graph(lv_obj_t *parent, pm_cpu_graph_t *out) {
 static lv_obj_t *pm_batt_lbl = nullptr;   // battery detail block
 static lv_obj_t *pm_power_lbl = nullptr;  // power/runtime detail block
 static lv_obj_t *pm_clk_lbl  = nullptr;   // core voltage + clock + OC block
+#if BOARD_PLATFORM_TUYA
+static lv_obj_t *pm_octune_vmv_lbl  = nullptr;   // OC-tuning: live core-voltage value
+static lv_obj_t *pm_octune_band_lbl = nullptr;   // OC-tuning: DPLL band -> MHz value
+static lv_obj_t *pm_oc544_lbl       = nullptr;   // OC-tuning: persist/disable button text
+#endif
 static lv_timer_t *pm_timer  = nullptr;
 static uint8_t   s_pm_graph_tick = 0;     // counts text ticks; pushes a graph point every PM_GRAPH_EVERY
 
@@ -238,7 +254,12 @@ static void pm_header(lv_obj_t *parent, const char *text) {
 static void pm_update_graphs(void) {
   // Per-core CPU usage is independent of the PMU, so always latch + plot it.
   cpu_usage_sample();
+#if BOARD_PLATFORM_MAIX
+  // The ESP idle-hook estimator doesn't work here; use the real /proc/stat delta.
+  uint8_t c0 = (uint8_t)owf_maix_cpu_usage_pct();
+#else
   uint8_t c0 = cpu_usage_pct(0);
+#endif
   if (pm_g_cpu.ser0) {
     lv_chart_set_next_value(pm_g_cpu.chart, pm_g_cpu.ser0, c0);
 #if BOARD_DUAL_CORE
@@ -278,7 +299,7 @@ static void pm_update_labels(void) {
 
   bool have_pmu = board_power_ok();
   uint16_t vbat = have_pmu ? board_batt_voltage_mv() : BATT_NOMINAL_MV;  // mV (nominal w/o gauge)
-  uint16_t ma   = power_estimate_ma();
+  uint16_t ma   = power_estimate_ma_at(vbat);   // mA at the LIVE cell voltage (model is mW)
   uint32_t mw   = power_estimate_mw(vbat);
 
   // --- BATTERY detail block (PMU only) ---
@@ -288,13 +309,20 @@ static void pm_update_labels(void) {
     }
 #if BOARD_HAS_ADC_BATTERY
     else {
-      // No PMU/charger: just the ADC-measured voltage + estimated percent.
-      int pct = board_batt_percent();
-      char bb[96];
+      // No PMU/charger IC, but we know if USB is attached (board_usb_powered). Show the
+      // ADC-measured voltage + estimated %, plus the USB/charging state — same shape as
+      // the PMU block below. While on USB the charger pulls the cell voltage up, so the
+      // % reads high; the "USB power: yes" line tells you why (and that the % isn't the
+      // true resting charge). Without USB it's the real resting %.
+      int  pct  = board_batt_percent();
+      bool usb  = board_usb_powered();
+      char bb[160];
       snprintf(bb, sizeof(bb),
                "Voltage:   %u.%02u V\n"
-               "Estimate:  %d%%  (no gauge)",
-               vbat / 1000, (vbat % 1000) / 10, pct);
+               "Estimate:  %d%%  (no gauge)\n"
+               "USB power: %s",
+               vbat / 1000, (vbat % 1000) / 10, pct,
+               usb ? "yes (charging)" : "no");
       lv_label_set_text(pm_batt_lbl, bb);
     }
 #else
@@ -353,7 +381,7 @@ static void pm_update_labels(void) {
   // counter), so they only mean anything with the AXP2101. An ADC-only battery
   // (C6) has no gauge — they'd be stuck on "measuring"/"learning" forever, so omit
   // them there and show just the model + the ADC voltage block above.
-#if BOARD_HAS_PMU_AXP2101
+#if PM_HAS_PMU
   if (have_pmu) {
   // REAL average current from the fuel gauge — the only hardware-grounded value.
   if (m > 0 && m < (int)sizeof(pb)) {
@@ -367,10 +395,12 @@ static void pm_update_labels(void) {
     int ch = (int)hlc, cm = (int)((hlc - (int)hlc) * 60.0f + 0.5f);
     m += snprintf(pb + m, sizeof(pb) - m, "\nRuntime: ~%dh %02dm", ch, cm);
   }
+#if !BOARD_PLATFORM_MAIX
   // REAL deep-sleep floor current — THE number for judging the rail-cut savings.
   // Labeled "Idle" on screen (user preference): it's the watch-at-rest draw —
   // screen dark, CPU powered down between background checks (wake bursts are
   // accounted as awake time and excluded from this number).
+  // (No MCU deep sleep on the Linux/Maix port, so this line is omitted there.)
   if (m > 0 && m < (int)sizeof(pb)) {
     if (calib_is_learned())
       snprintf(pb + m, sizeof(pb) - m, "\nIdle:    %d.%02d mA  (REAL floor, %us)",
@@ -380,8 +410,9 @@ static void pm_update_labels(void) {
     else
       snprintf(pb + m, sizeof(pb) - m, "\nIdle:    learning floor...");
   }
+#endif
   }   // close: if (have_pmu)
-#endif  /* BOARD_HAS_PMU_AXP2101 — gauge-derived lines */
+#endif  /* PM_HAS_PMU — gauge-derived lines */
   lv_label_set_text(pm_power_lbl, pb);
 
   // --- CORE & CLOCK detail block ---
@@ -389,6 +420,39 @@ static void pm_update_labels(void) {
   // on-die LDO is told to output, NOT a measurement (the S3 can't sense its own
   // core rail). Reflects the real programmed value incl. a boot-time auto-revert.
   char cb[200];
+#if BOARD_PLATFORM_TUYA
+  // T5: read the LIVE core clock + digital-core LDO voltage straight from the SoC
+  // clock/analog registers (the SDK's PM getters are stubs). Both are real values.
+  // Core voltage here IS the active CPU rail select (vcorehsel) — the knob a future
+  // undervolt would move — not a guess. SoC die-temp has no safe public API on this
+  // chip (only the WiFi-PHY internal sensor), so it's shown as n/a rather than faked.
+  {
+    // Clock = the REAL running frequency, MEASURED by timing a fixed-cycle assembly
+    // busy-loop against the AON-RTC us counter (driven by the 32768 Hz crystal, an
+    // absolute reference independent of the CPU PLL). This is an actual measurement
+    // anchored to wall-clock time, NOT the value we set into the clock-div register
+    // and NOT a gated cycle counter — so it reports what the PLL actually produced.
+    // Blocks ~40-150 ms (keeps the fastest of a few runs); fine on this 5 s-refresh
+    // settings panel. Core voltage IS live from the reg (vcorehsel). SoC die-temp:
+    // no safe public API on this chip -> n/a.
+    uint32_t mhz = owf_tuya_measure_cpu_mhz();
+    uint16_t cmv = owf_tuya_core_mv();
+    int k = snprintf(cb, sizeof(cb), "Clock:   %lu MHz", (unsigned long)mhz);
+    if (k > 0 && k < (int)sizeof(cb))
+      k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %u mV  (vsel %u)",
+                    cmv, owf_tuya_core_vsel());
+    if (k > 0 && k < (int)sizeof(cb))
+      snprintf(cb + k, sizeof(cb) - k, "\nTemp:    n/a  (no public sensor)");
+  }
+#elif BOARD_PLATFORM_MAIX
+  // No MCU core-voltage/clock-tree/die-sensor here — show the real CPU temp + load.
+  {
+    // CPU load is shown by the graph above; here just the real die temperature.
+    int tc = owf_maix_cpu_temp_c();
+    if (tc > -273) snprintf(cb, sizeof(cb), "Temp:    %d\xC2\xB0""C", tc);
+    else           snprintf(cb, sizeof(cb), "Temp:    n/a");
+  }
+#else
   uint16_t cmv = core_dbias_to_mv(core_get_dig_dbias());
   int k = snprintf(cb, sizeof(cb), "Core:    ~%u mV  (%s)",
                    cmv, s_core_unstable ? "reverted" : "set");
@@ -427,6 +491,7 @@ static void pm_update_labels(void) {
       k += snprintf(cb + k, sizeof(cb) - k, "\nTemp:    SoC %d.%uC",
                     (int)soc_c, (unsigned)((soc_c - (int)soc_c) * 10) % 10);
   }
+#endif  /* BOARD_PLATFORM_MAIX */
   lv_label_set_text(pm_clk_lbl, cb);
 }
 
@@ -450,6 +515,11 @@ static void pm_cleanup_cb(lv_event_t *e) {
   pm_batt_lbl = nullptr;
   pm_power_lbl = nullptr;
   pm_clk_lbl  = nullptr;
+#if BOARD_PLATFORM_TUYA
+  pm_octune_vmv_lbl  = nullptr;
+  pm_octune_band_lbl = nullptr;
+  pm_oc544_lbl       = nullptr;
+#endif
   pm_g_batt = pm_graph_t{};
   pm_g_draw = pm_graph_t{};
   pm_g_cpu  = pm_cpu_graph_t{};
@@ -473,7 +543,22 @@ static void pm_refresh_freq_highlight(void) {
 
 static void pm_freq_btn_cb(lv_event_t *e) {
   uint16_t mhz = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
+#if BOARD_PLATFORM_TUYA
+  extern HWCDC USBSerial;
+  uint32_t r9_before  = OWF_T5_REG_ANA9;
+  uint32_t clk_before = OWF_T5_REG_CPU_CLKDIV;
+  settings_set_cpu_mhz(mhz);
+  uint32_t r9_after   = OWF_T5_REG_ANA9;
+  uint32_t clk_after  = OWF_T5_REG_CPU_CLKDIV;
+  USBSerial.printf("[dvfs] req=%uMHz  reg9 %08lx->%08lx (vsel %u->%u = %u->%u mV)  clk %08lx->%08lx\n",
+                   mhz, (unsigned long)r9_before, (unsigned long)r9_after,
+                   (unsigned)((r9_before >> 16) & 0xF), (unsigned)((r9_after >> 16) & 0xF),
+                   600u + ((unsigned)((r9_before >> 16) & 0xF)) * 25u,
+                   600u + ((unsigned)((r9_after >> 16) & 0xF)) * 25u,
+                   (unsigned long)clk_before, (unsigned long)clk_after);
+#else
   settings_set_cpu_mhz(mhz);          // apply + persist
+#endif
   pm_refresh_freq_highlight();
   pm_update_labels();                 // clock line reflects the new speed at once
 }
@@ -506,7 +591,6 @@ static void pm_refresh_deepsleep(void) {
 static void pm_checks_toggle_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   settings_set_checks_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
-  haptics_pulse(12);
   pm_refresh_deepsleep();
 }
 
@@ -516,7 +600,6 @@ static void pm_interval_step_cb(lv_event_t *e) {
   if (!settings_get_checks_enabled()) return;
   int d = (int)(intptr_t)lv_event_get_user_data(e);
   settings_set_check_interval((uint16_t)((int)settings_get_check_interval() + d));
-  haptics_pulse(10);
   pm_refresh_deepsleep();
 }
 
@@ -549,7 +632,6 @@ static void pm_refresh_display(void) {
 static void pm_autodim_toggle_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   settings_set_autodim(lv_obj_has_state(sw, LV_STATE_CHECKED));
-  haptics_pulse(12);
   pm_refresh_display();
 }
 
@@ -559,7 +641,6 @@ static void pm_dimusb_toggle_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   if (!settings_get_autodim()) return;
   settings_set_dim_on_usb(lv_obj_has_state(sw, LV_STATE_CHECKED));
-  haptics_pulse(12);
   pm_refresh_display();
 }
 
@@ -569,7 +650,6 @@ static void pm_dim_step_cb(lv_event_t *e) {
   if (!settings_get_autodim()) return;
   int d = (int)(intptr_t)lv_event_get_user_data(e);
   settings_set_autodim_pct((uint8_t)((int)settings_get_autodim_pct() + d));
-  haptics_pulse(10);
   pm_refresh_display();
 }
 
@@ -578,12 +658,17 @@ static void pm_dim_step_cb(lv_event_t *e) {
 static void pm_rail_toggle_cb(lv_event_t *e) {
   uint8_t i = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
   rail_cut_set(i, !rail_cut_get(i));
-  haptics_pulse(12);
   lv_obj_t *b = (lv_obj_t *)lv_event_get_target(e);
   bool on = rail_cut_get(i);
   lv_obj_set_style_bg_color(b, lv_color_hex(on ? ui_accent_hex() : 0x1F1F1F), 0);
   lv_obj_t *l = lv_obj_get_child(b, 0);
-  if (l) lv_label_set_text_fmt(l, "%-6s  %s", rail_name(i), on ? "CUT in sleep" : "tap to cut");
+  char nm[12];
+#ifdef RAIL_AUX_MASK
+  snprintf(nm, sizeof nm, "%s%s", rail_name(i), (RAIL_AUX_MASK & (1u << i)) ? "*" : "");
+#else
+  snprintf(nm, sizeof nm, "%s", rail_name(i));
+#endif
+  if (l) lv_label_set_text_fmt(l, "%-6s  %s", nm, on ? "CUT in sleep" : "tap to cut");
 }
 
 #if OVERCLOCK_ENABLE
@@ -595,6 +680,155 @@ static void pm_oc_btn_cb(lv_event_t *e) {
   pm_update_labels();     // refresh the Clk / OC readout immediately
 }
 #endif
+
+#if BOARD_PLATFORM_TUYA
+/* Build a "[-]  <value>  [+]" stepper row under `parent`. The minus/plus buttons get
+ * `cb` with user_data `-step` / `+step`. Returns the centered value label so the caller
+ * can stash it for live updates. Mirrors the dim/interval stepper styling. */
+static lv_obj_t *pm_octune_stepper(lv_obj_t *parent, lv_event_cb_t cb,
+                                   int step, const char *init) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, UI_PX(60));
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_pad_all(row, 0, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *dn = lv_btn_create(row);
+  lv_obj_set_size(dn, UI_PX(64), UI_PX(52));
+  lv_obj_set_style_radius(dn, UI_PX(12), 0);
+  lv_obj_set_style_bg_color(dn, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_add_event_cb(dn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(-step));
+  lv_obj_t *dnl = lv_label_create(dn);
+  lv_obj_set_style_text_font(dnl, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(dnl, lv_color_white(), 0);
+  lv_label_set_text(dnl, LV_SYMBOL_MINUS);
+  lv_obj_center(dnl);
+
+  lv_obj_t *val = lv_label_create(row);
+  lv_obj_set_style_text_font(val, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(val, lv_color_hex(ui_accent_hex()), 0);
+  lv_label_set_text(val, init);
+
+  lv_obj_t *up = lv_btn_create(row);
+  lv_obj_set_size(up, UI_PX(64), UI_PX(52));
+  lv_obj_set_style_radius(up, UI_PX(12), 0);
+  lv_obj_set_style_bg_color(up, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_add_event_cb(up, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(step));
+  lv_obj_t *upl = lv_label_create(up);
+  lv_obj_set_style_text_font(upl, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(upl, lv_color_white(), 0);
+  lv_label_set_text(upl, LV_SYMBOL_PLUS);
+  lv_obj_center(upl);
+  return val;
+}
+
+/* ============================================================================
+ *  T5 OC TUNING — live voltage + DPLL-band steppers (bring-up / probing).
+ *  Voltage: owf_tuya_set_core_mv() in 25 mV steps. Band: force the DPLL VCO band
+ *  (>480 MHz discovery) with the XTAL-park sequence, then measure the real MHz.
+ *  These directly poke the silicon; intended for bench probing over USB serial.
+ * ========================================================================== */
+/* pm_octune_vmv_lbl / pm_octune_band_lbl are declared up top (cleanup references them). */
+static uint16_t  s_octune_mv   = 950;            // runtime core-voltage target (mV)
+static uint8_t   s_octune_band = 0xFF;           // forced DPLL band; 0xFF = stock/auto
+
+/* Repaint the two OC-tuning value labels from live state. */
+static void pm_octune_refresh(void) {
+  if (pm_octune_vmv_lbl)
+    lv_label_set_text_fmt(pm_octune_vmv_lbl, "core %u / dig %u mV",
+                          (unsigned)owf_tuya_get_core_ldo_mv(),
+                          (unsigned)owf_tuya_get_dig_ldo_mv());
+  if (pm_octune_band_lbl) {
+    if (s_octune_band == 0xFF)
+      lv_label_set_text(pm_octune_band_lbl, "stock 480");
+    else
+      lv_label_set_text_fmt(pm_octune_band_lbl, "band %u = %lu MHz",
+                            (unsigned)s_octune_band,
+                            (unsigned long)owf_tuya_measure_cpu_mhz());
+  }
+  if (pm_oc544_lbl) {
+    if (settings_get_oc_enabled())
+      lv_label_set_text_fmt(pm_oc544_lbl, "OC SAVED (band %u, %u mV) - tap to disable",
+                            (unsigned)settings_get_oc_band(), (unsigned)settings_get_oc_mv());
+    else
+      lv_label_set_text(pm_oc544_lbl, "Save overclock (band 0 = 544 MHz)");
+  }
+}
+
+/* Voltage +/- (user_data = signed mV delta). Clamps to a sane 600..1300 mV window. */
+static void pm_octune_v_step_cb(lv_event_t *e) {
+  int d = (int)(intptr_t)lv_event_get_user_data(e);
+  int mv = (int)s_octune_mv + d;
+  if (mv < 600)  mv = 600;
+  if (mv > 1300) mv = 1300;            // soft UI ceiling; rail's true limit is yours to find
+  s_octune_mv = (uint16_t)mv;
+  owf_tuya_set_core_mv(s_octune_mv);   // apply immediately
+  pm_octune_refresh();
+}
+
+/* DPLL band +/- (user_data = signed delta). Forces the band via the XTAL-park path,
+ * then measures. delta that takes band below 0 returns to stock auto-480. */
+static void pm_octune_band_step_cb(lv_event_t *e) {
+  int d = (int)(intptr_t)lv_event_get_user_data(e);
+  int b = (s_octune_band == 0xFF ? -1 : (int)s_octune_band) + d;
+  if (b < 0) {
+    s_octune_band = 0xFF;
+    owf_tuya_park_xtal();
+    owf_tuya_dpll_restore_auto();      // back to stock 480
+    owf_tuya_restore_clkdiv((OWF_T5_REG_CPU_CLKDIV & ~0x3Fu) | (OWF_T5_CKSEL_480 << 4));
+  } else {
+    if (b > 7) b = 7;
+    s_octune_band = (uint8_t)b;
+    uint32_t saved = owf_tuya_park_xtal();
+    owf_tuya_dpll_force_band(s_octune_band);
+    OWF_T5_REG_CPU_CLKDIV = (saved & ~0x3Fu) | (OWF_T5_CKSEL_480 << 4);  // ride the new PLL
+  }
+  pm_octune_refresh();
+  pm_update_labels();                  // top Clock: line reflects the measured rate
+}
+
+/* Run the full band sweep and print band->MHz over USB serial (bench discovery). */
+static void pm_octune_sweep_cb(lv_event_t *e) {
+  (void)e;
+  extern HWCDC USBSerial;
+  owf_t5_dpll_state_t st = owf_tuya_dpll_read();
+  USBSerial.printf("[dpll] baseline: band=%u band0=%u band1=%u cksel=%u  (cpu cksel=%u div=%u)\n",
+                   st.band, st.band0, st.band1, st.cksel, st.cksel_core, st.clkdiv_core);
+  uint16_t res[8] = {0};
+  int n = owf_tuya_dpll_sweep(0, 7, res);
+  for (int i = 0; i < n; i++)
+    USBSerial.printf("[dpll] band %d -> %u MHz\n", i, (unsigned)res[i]);
+  pm_octune_refresh();
+  pm_update_labels();
+}
+
+/* Known-good overclock: DPLL band 0 (~544 MHz) at 975 mV. This PERSISTS it to NVS and
+ * applies it now, guarded by the survived-boot gate so a hang on the next cold boot
+ * auto-disables it. Tapping again while already OC'd toggles it back OFF (stock 480).
+ * The band/voltage come from the live OC-tuning steppers if the user changed them, else
+ * the defaults below — so you can dial in a value with the steppers, then make it stick. */
+#define OWF_T5_OC_BAND_DEF  0      /* band 0 = ~544 MHz (user-confirmed) */
+#define OWF_T5_OC_MV_DEF    975    /* stable at the core-LDO ceiling */
+static void pm_oc544_btn_cb(lv_event_t *e) {
+  (void)e;
+  if (settings_get_oc_enabled()) {
+    settings_clear_oc();                 // toggle OFF -> back to stock 480
+  } else {
+    // Use the current stepper band if the user forced one, else the default.
+    uint8_t  band = (s_octune_band == 0xFF) ? OWF_T5_OC_BAND_DEF : s_octune_band;
+    uint16_t mv   = (s_octune_mv  < 600)    ? OWF_T5_OC_MV_DEF   : s_octune_mv;
+    settings_set_oc(band, mv);           // persist + apply (survived-boot gated at boot)
+    s_octune_band = band; s_octune_mv = mv;
+  }
+  pm_octune_refresh();
+  pm_update_labels();
+}
+#endif  /* BOARD_PLATFORM_TUYA */
 
 /* ----- Power-off button + its confirm dialog ----- */
 static lv_obj_t *pm_off_box = nullptr;   // confirm overlay (one at a time)
@@ -692,9 +926,15 @@ static void app_open_power(void) {
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(124));
   lv_obj_set_style_pad_all(col, UI_PX(6), 0);
 #else
-  // S3-2.06: ORIGINAL fixed geometry (toggle rows inside use fixed pixel offsets
-  // tuned to this width; rescaling clipped their names into the switch).
-  lv_obj_set_size(col, 374, 408);
+  // S3-2.06: ORIGINAL fixed WIDTH (toggle rows inside use fixed pixel offsets tuned
+  // to this width; rescaling clipped their names into the switch). The HEIGHT must
+  // NOT stay fixed though: 408 px starting at y=84 needs 492 px of screen, which
+  // the 502-px 2.06 has but the 448-px S3-1.8 does not — the container ran off the
+  // bottom, so the last item stayed clipped no matter how it scrolled.
+  // Derive the height from the real screen instead (same 84 px top offset, same
+  // 10 px bottom margin the 2.06 effectively had: 502-84-408 = 10).
+  lv_obj_set_width(col, 374);
+  lv_obj_set_height(col, (int)screenHeight - 84 - 10);
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 84);
   lv_obj_set_style_pad_all(col, 6, 0);
 #endif
@@ -711,16 +951,20 @@ static void app_open_power(void) {
   // scrolls smoothly); this is the same trick applied to the dense Power list.
   lv_obj_set_style_pad_row(col, UI_PX(20), 0);
   // Extra breathing room at the very bottom so the LAST item (CPU picker / overclock
-  // button) doesn't clip against the screen edge when scrolled fully down. Applies
-  // to both boards (S3 fixed px, C6 scaled).
+  // button, and the "Power off" button below it) fully clears the screen edge when
+  // scrolled all the way down. This is EMPTY SCROLL RUNWAY, not layout padding —
+  // without enough of it the final row sits flush against the bottom bezel and
+  // reads as cut off even though it technically fits.
+  // Scaled (UI_PX), not a flat constant: the old fixed 28 px was a 2.06 value, and
+  // on the shorter S3-1.8 it left the last item clipping the bottom edge.
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_pad_bottom(col, UI_PX(78), 0);
 #else
-  lv_obj_set_style_pad_bottom(col, 28, 0);
+  lv_obj_set_style_pad_bottom(col, UI_PX(56), 0);
 #endif
 
   // ---- BATTERY (needs the PMU gauge; omitted on the PMU-less C6) ----
-#if BOARD_HAS_PMU_AXP2101
+#if PM_HAS_PMU
   pm_header(col, "BATTERY");
   pm_make_graph(col, "Level", 0, 100, &pm_g_batt);
   pm_batt_lbl = pm_line(col, &FONT_SMALL, PM_VAL, "");
@@ -738,11 +982,22 @@ static void app_open_power(void) {
   pm_power_lbl = pm_line(col, &FONT_SMALL, PM_VAL, "");
 
   // ---- CPU (per-core usage) ----
+#if BOARD_PLATFORM_TUYA
+  // T5: the app FreeRTOS domain is 2 cores; the 3rd BK7258 core is the separate
+  // coprocessor domain (vendor media/DSP) with no schedulable idle task, so it can't
+  // be sampled here. Name the 2 cores we actually measure so the count isn't a mystery.
+  pm_header(col, "CPU  (app cores 0-1 %)");
+#else
   pm_header(col, "CPU  (per-core %)");
+#endif
   pm_make_cpu_graph(col, &pm_g_cpu);
 
-  // ---- CORE & CLOCK ----
+  // ---- CORE & CLOCK (Maix: CPU temp + load) ----
+#if BOARD_PLATFORM_MAIX
+  pm_header(col, "CPU");
+#else
   pm_header(col, "CORE & CLOCK");
+#endif
   pm_clk_lbl = pm_line(col, &FONT_SMALL, PM_VAL, "");
 
   s_pm_graph_tick = 0;
@@ -876,12 +1131,23 @@ static void app_open_power(void) {
     char sum[64];
     snprintf(sum, sizeof sum, "Cutting %u of %u.", rails_cut_count(), cuttable);
     pm_line(col, &FONT_SMALL, 0xAAAAAA, sum);
+#ifdef RAIL_AUX_MASK
+    pm_line(col, &FONT_SMALL, 0x888888, "* = aux: no load on schematic (experimental)");
+#endif
   }
   for (uint8_t i = 0; i < rail_state_count(); i++) {
 #ifdef RAIL_NEVER_CUT_MASK
     // Never-cut rails (ALDO1 = RTC/I2C supply) can't be cut at all, so don't list
     // them here — showing a toggle that does nothing looks broken.
     if (RAIL_NEVER_CUT_MASK & (1u << i)) continue;
+#endif
+    // Aux rails (no load on the schematic — see RAIL_AUX_MASK) get a '*' so the
+    // experimental candidates stand out from the proven peripheral LDOs.
+    char nm[12];
+#ifdef RAIL_AUX_MASK
+    snprintf(nm, sizeof nm, "%s%s", rail_name(i), (RAIL_AUX_MASK & (1u << i)) ? "*" : "");
+#else
+    snprintf(nm, sizeof nm, "%s", rail_name(i));
 #endif
     if (rail_state_raw(i) == 1) {                     // SAFE -> a tappable cut toggle
       lv_obj_t *b = lv_btn_create(col);
@@ -894,35 +1160,59 @@ static void app_open_power(void) {
       lv_obj_t *l = lv_label_create(b);
       lv_obj_set_style_text_font(l, &FONT_SMALL, 0);
       lv_obj_set_style_text_color(l, lv_color_white(), 0);
-      lv_label_set_text_fmt(l, "%-6s  %s", rail_name(i), on ? "CUT in sleep" : "tap to cut");
+      lv_label_set_text_fmt(l, "%-6s  %s", nm, on ? "CUT in sleep" : "tap to cut");
       lv_obj_align(l, LV_ALIGN_LEFT_MID, UI_PX(12), 0);
     } else {                                          // unsafe/untested -> info only
       char rl[48];
-      snprintf(rl, sizeof rl, "%-6s  %s", rail_name(i), rail_verdict_str(i));
+      snprintf(rl, sizeof rl, "%-6s  %s", nm, rail_verdict_str(i));
       pm_line(col, &FONT_SMALL, rail_state_raw(i) == 2 ? 0x888888 : 0xC9A227, rl);
     }
   }
 #endif  /* BOARD_HAS_PMU_AXP2101 — power-rails section */
 
   // ---- CPU SPEED ----
+  // The SG2002 doesn't expose CPU frequency scaling (no cpufreq governor), so the
+  // speed buttons have nothing to drive — hidden on the Maix port.
+#if !BOARD_PLATFORM_MAIX
   pm_header(col, "CPU SPEED  (MHz)");
 
   lv_obj_t *rowc = lv_obj_create(col);
-  lv_obj_set_width(rowc, LV_PCT(100));
-  lv_obj_set_height(rowc, UI_PX(64));
   lv_obj_set_style_bg_opa(rowc, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(rowc, 0, 0);
   lv_obj_set_style_pad_all(rowc, 0, 0);
   lv_obj_clear_flag(rowc, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(rowc, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(rowc, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(rowc, UI_PX(8), 0);
+  lv_obj_set_style_pad_row(rowc, UI_PX(8), 0);
+  // The T5 has 7 freq steps (vs 2-3 on the ESP boards) — too many for one row. WRAP.
+  // The earlier attempts failed because rowc had a percent width on a flex child whose
+  // height was LV_SIZE_CONTENT — LVGL then sized rowc's WIDTH from its (wide) children
+  // too, so it never hit a wrap boundary. FIX: give rowc an EXPLICIT pixel width (the
+  // column's content width) so the wrap boundary is real, and content-height so it grows
+  // down as rows are added.
+#if BOARD_PLATFORM_TUYA
+  // col is 374 wide with pad_all 6 -> ~362 content. Hard-set rowc to 360 and use 80px
+  // buttons: 4*80 + 3*8 gaps = 344 < 360 fit a row; any extra wrap to the next line. The
+  // EXPLICIT pixel width (not LV_PCT on a content-height flex child) is what makes the
+  // wrap boundary real — that was the bug. Works for any button count without clipping.
+  lv_obj_set_width(rowc, 360);
+  lv_obj_set_height(rowc, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(rowc, LV_FLEX_FLOW_ROW_WRAP);
+  const int pm_freq_btn_w = 80;
+#else
+  lv_obj_set_width(rowc, LV_PCT(100));
+  lv_obj_set_height(rowc, UI_PX(64));
+  lv_obj_set_flex_flow(rowc, LV_FLEX_FLOW_ROW);
+  const int pm_freq_btn_w = UI_PX(78);
+#endif
 
   for (uint8_t i = 0; i < CPU_FREQ_COUNT; i++) {
     lv_obj_t *b = lv_btn_create(rowc);
-    lv_obj_set_size(b, UI_PX(78), UI_PX(56));
+    lv_obj_set_size(b, pm_freq_btn_w, UI_PX(56));
     lv_obj_set_style_radius(b, UI_PX(12), 0);
+    lv_obj_set_style_pad_all(b, 0, 0);     // keep the fixed width; no inner pad widening it
+    lv_obj_set_flex_grow(b, 0);            // never stretch (would defeat wrapping)
     lv_obj_add_event_cb(b, pm_freq_btn_cb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)CPU_FREQS[i]);
     lv_obj_t *t = lv_label_create(b);
@@ -933,6 +1223,68 @@ static void app_open_power(void) {
     pm_freq_btns[i] = b;
   }
   pm_refresh_freq_highlight();
+#endif  /* !BOARD_PLATFORM_MAIX (CPU SPEED buttons) */
+
+#if BOARD_PLATFORM_TUYA
+  // ---- OC TUNING (bench/probing): live core-voltage + DPLL-band steppers ----
+  // Directly pokes the silicon. Voltage in 25 mV steps; band forces the DPLL VCO
+  // (>480 MHz discovery) via the XTAL-park sequence and measures the real rate.
+  // The SWEEP button prints band->MHz over USB serial. A bad band may need a reboot.
+  pm_header(col, "OC TUNING (bench)");
+
+  lv_obj_t *vlbl = pm_line(col, &FONT_SMALL, PM_DIM, "Core voltage");
+  (void)vlbl;
+  pm_octune_vmv_lbl = pm_octune_stepper(col, pm_octune_v_step_cb, 25, "-- mV");
+
+  lv_obj_t *blbl = pm_line(col, &FONT_SMALL, PM_DIM, "DPLL band (clock)");
+  (void)blbl;
+  pm_octune_band_lbl = pm_octune_stepper(col, pm_octune_band_step_cb, 1, "stock 480");
+
+  // One-tap known-good overclock: DPLL band 0 (~544 MHz) at 975 mV. Runtime only.
+  lv_obj_t *ocrow = lv_obj_create(col);
+  lv_obj_set_width(ocrow, LV_PCT(100));
+  lv_obj_set_height(ocrow, UI_PX(56));
+  lv_obj_set_style_bg_opa(ocrow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(ocrow, 0, 0);
+  lv_obj_set_style_pad_all(ocrow, 0, 0);
+  lv_obj_clear_flag(ocrow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(ocrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(ocrow, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *ocb544 = lv_btn_create(ocrow);
+  lv_obj_set_size(ocb544, UI_PX(220), UI_PX(46));
+  lv_obj_set_style_bg_color(ocb544, lv_color_hex(0x0A3A1A), 0);
+  lv_obj_set_style_radius(ocb544, UI_PX(12), 0);
+  lv_obj_add_event_cb(ocb544, pm_oc544_btn_cb, LV_EVENT_CLICKED, nullptr);
+  pm_oc544_lbl = lv_label_create(ocb544);
+  lv_obj_set_style_text_font(pm_oc544_lbl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(pm_oc544_lbl, lv_color_hex(0x66FF99), 0);
+  lv_label_set_text(pm_oc544_lbl, "Save overclock (band 0 = 544 MHz)");
+  lv_obj_center(pm_oc544_lbl);
+
+  lv_obj_t *swrow = lv_obj_create(col);
+  lv_obj_set_width(swrow, LV_PCT(100));
+  lv_obj_set_height(swrow, UI_PX(56));
+  lv_obj_set_style_bg_opa(swrow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(swrow, 0, 0);
+  lv_obj_set_style_pad_all(swrow, 0, 0);
+  lv_obj_clear_flag(swrow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(swrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(swrow, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *swb = lv_btn_create(swrow);
+  lv_obj_set_size(swb, UI_PX(220), UI_PX(46));
+  lv_obj_set_style_bg_color(swb, lv_color_hex(0x0A2A3A), 0);
+  lv_obj_set_style_radius(swb, UI_PX(12), 0);
+  lv_obj_add_event_cb(swb, pm_octune_sweep_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *swl = lv_label_create(swb);
+  lv_obj_set_style_text_font(swl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(swl, lv_color_hex(0x66CCFF), 0);
+  lv_label_set_text(swl, "Sweep DPLL bands -> serial");
+  lv_obj_center(swl);
+
+  pm_octune_refresh();
+#endif  /* BOARD_PLATFORM_TUYA (OC TUNING) */
 
 #if OVERCLOCK_ENABLE
   // Runtime overclock trigger. Never auto-applies at boot, so USB/flashing always
