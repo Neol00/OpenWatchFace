@@ -1,0 +1,36 @@
+# partitions_s3_4mb.csv — custom 4 MB layout for the ESP32-S3 Super Mini (BOARD_ID_CUSTOM).
+#
+# Total flash = 4 MB (0x400000). The Super Mini variant has only 4 MB internal flash
+# (and 2 MB PSRAM), so the 8/16/32 MB tables overrun it. This is a SINGLE-APP, NO-OTA
+# layout: the user doesn't use OTA (flashes over USB), so we drop the second app slot
+# (app1) AND otadata, reclaiming ~2 MB that becomes the FFat data volume.
+#
+# WHY NO app1 / otadata:
+#   - app0 + app1 are an OTA ping-pong PAIR — two full app copies so an update can be
+#     written to the idle slot, verified, then booted (with rollback). That costs 2x
+#     the app size. With no OTA we keep ONE app slot only.
+#   - otadata tracks which OTA slot is active. With a single 'factory'-class app there
+#     is nothing to track, so it's omitted too.
+#
+# CRITICAL — fixed offsets (or BLACK SCREEN): partition table @ 0x8000, and the
+# Arduino ESP32 build flashes the app .bin at 0x10000, so the app partition MUST start
+# at exactly 0x10000. NVS sits in 0x9000..0xe000 (20 KB); 0xe000..0x10000 is left as a
+# small reserved gap (where otadata would have been) so the app still lands on 0x10000.
+# NVS stays 20 KB (enlarging it would push the app off 0x10000 and brick the boot).
+#
+# SIZING — 2.5 MB app + ~1.375 MB FFat.
+#   app0   0x10000 .. 0x290000  = 0x280000 (2.5 MB = 2,621,440 B)
+#   ffat   0x290000.. 0x3F0000  = 0x160000 (~1.375 MB = 1,441,792 B)
+#   coredump 0x3F0000.. 0x400000 = 0x10000 (64 KB), at the very top.
+#
+# HISTORY: 2 MB (0x200000 = 2,097,152 B) was JUST too small — the S3 build measured
+# 2,115,440 B, over by ~18 KB. (The C6's ~2.15 MB doesn't transfer: different arch/
+# -O2/XIP, so the S3 binary had to be measured, not assumed.) 2.5 MB clears it with
+# ~506 KB headroom for growth while keeping FFat usable. If the app ever outgrows
+# 2.5 MB, bump app0 to 0x300000 (3 MB) and shrink ffat to 0xE0000 (~896 KB).
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+app0,       app,  factory,  0x10000,   0x280000,
+ffat,       data, fat,      0x290000,  0x160000,
+coredump,   data, coredump, 0x3F0000,  0x10000,
