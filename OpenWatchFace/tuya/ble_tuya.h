@@ -192,7 +192,14 @@ static uint8_t  s_ble_batt_val = 0;
 /* Result toast + overlay bookkeeping - same enum/values as ble_provision.h so
  * app_wifi_ble.h works unchanged. */
 enum BleToast { BLE_TOAST_NONE = 0, BLE_TOAST_PAIRED, BLE_TOAST_SAVED, BLE_TOAST_DUP, BLE_TOAST_FULL,
-                BLE_TOAST_FORGETFAIL };
+                BLE_TOAST_FORGETFAIL,
+                // Low-internal-SRAM radio-bring-up refusals — MUST stay in sync with the copy
+                // in ble_provision.h (notif_net.h sets these unconditionally, so both BLE
+                // backends' enums need them). See the *_MIN_FREE_INTERNAL guards.
+                BLE_TOAST_WIFI_OOM_BLE,    // WiFi refused, BLE up   -> "turn off BLE first"
+                BLE_TOAST_WIFI_OOM_BOOT,   // WiFi refused, BLE off  -> "try a reboot"
+                BLE_TOAST_BLE_OOM_WIFI,    // BLE refused,  WiFi on  -> "turn off WiFi first"
+                BLE_TOAST_BLE_OOM_BOOT };  // BLE refused,  WiFi off -> "try a reboot"
 static volatile BleToast s_ble_toast      = BLE_TOAST_NONE;
 static char              s_ble_toast_ssid[WIFI_SSID_MAX] = "";
 static lv_obj_t         *s_ble_key_box    = nullptr;   // loop thread only
@@ -829,6 +836,10 @@ static void ble_ui_tick(void) {
     else if (r == BLE_TOAST_SAVED)  { col = 0x32D74B; snprintf(msg, sizeof(msg), LV_SYMBOL_OK "  WiFi saved\n%s", s_ble_toast_ssid); }
     else if (r == BLE_TOAST_DUP)    { col = 0xFF9F0A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Already saved\n%s", s_ble_toast_ssid); }
     else if (r == BLE_TOAST_FORGETFAIL) { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Couldn't forget phone\nTry again"); }
+    else if (r == BLE_TOAST_WIFI_OOM_BLE)  { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start WiFi - low RAM\nTurn off BLE first"); }
+    else if (r == BLE_TOAST_WIFI_OOM_BOOT) { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start WiFi - low RAM\nTry a reboot"); }
+    else if (r == BLE_TOAST_BLE_OOM_WIFI)  { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start BLE - low RAM\nTurn off WiFi first"); }
+    else if (r == BLE_TOAST_BLE_OOM_BOOT)  { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Couldn't start BLE - low RAM\nTry a reboot"); }
     else                            { col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Network list full"); }
     lv_obj_t *l = lv_label_create(s_ble_toast_box);
     lv_obj_set_style_text_font(l, &FONT_SMALL, 0);

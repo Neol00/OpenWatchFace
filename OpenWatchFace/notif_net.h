@@ -117,6 +117,12 @@ static bool wifi_connect(void) {
   // — it only blocks a NEW init while BLE holds the memory. Turning BLE off (or the
   // next reboot) frees the SRAM and WiFi comes back on its own. Rate-limit the log so
   // the ~scheduled retries don't spam the console.
+  // The coexistence guard + refusal toast only exist on the real-BLE backends
+  // (BOARD_HAS_BLE -> ble_provision.h, or the Tuya T5 -> tuya/ble_tuya.h). Both define
+  // ble_is_up() and the BleToast enum/s_ble_toast we use here. The Maix build stubs
+  // WiFi/BLE out entirely (no ble_is_up, no toast system), so this whole block would
+  // fail to compile there — gate it out. On Maix there is nothing to guard anyway.
+#if BOARD_HAS_BLE || BOARD_PLATFORM_TUYA
   {
     size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (free_int < WIFI_MIN_FREE_INTERNAL) {
@@ -143,6 +149,7 @@ static bool wifi_connect(void) {
       return false;
     }
   }
+#endif
 
   // Snapshot the saved-network list under the store mutex, then connect from the
   // copy. This runs on core 0 and each attempt can block for seconds, so we must

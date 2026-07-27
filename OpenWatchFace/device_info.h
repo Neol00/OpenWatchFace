@@ -17,7 +17,7 @@
 
 #define DEVICE_NAME    "OpenWatchFace"        // full product name
 #define DEVICE_SHORT   "WatchFace"            // short form
-#define DEVICE_VERSION "1.3.1"                // firmware version
+#define DEVICE_VERSION "1.3.2"                // firmware version
 #define DEVICE_AUTHOR  "Noel Ejemyr"          // project author
 #define DEVICE_VENDOR  "Waveshare"            // hardware vendor
 #define DEVICE_BOARD   BOARD_NAME             // board model — follows the selected board (board.h)

@@ -64,7 +64,7 @@ void bk_delay_us(uint32_t us);
 /* PSRAM LDO voltage. 2.0V is the verified-stable rail for 160M. (Boot is 1.95V; 2.0V is one
  * fine step up. The next rung above 2.0V jumps to 3.0V — only needed for the unstable 240M.) */
 #ifndef OWF_PSRAM_VOLT
-#define OWF_PSRAM_VOLT PSRAM_OUT_2_0V
+#define OWF_PSRAM_VOLT PSRAM_OUT_1_95V
 #endif
 
 /* ============================================================================================

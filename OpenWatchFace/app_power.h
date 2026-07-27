@@ -18,10 +18,11 @@
 #pragma once
 #include <lvgl.h>
 #if BOARD_PLATFORM_TUYA
-#include "tuya/compat/owf_tuya_soc_stats.h"   // core mV from SoC regs + commanded MHz
+#include "tuya/compat/owf_tuya_soc_stats.h"   // core mV from SoC regs + commanded MHz (readout)
 #include "tuya/compat/owf_tuya_cpu_measure.h"  // owf_tuya_measure_cpu_mhz() — REAL clock by cycle-count
-#include "tuya/compat/owf_tuya_voltage.h"      // owf_tuya_set_core_mv() / get — live mV core voltage
-#include "tuya/compat/owf_tuya_dpll_sweep.h"   // DPLL band force/sweep — >480 MHz bring-up probe
+// owf_tuya_voltage.h + owf_tuya_dpll_sweep.h were only used by the removed OC-tuning UI
+// (voltage/DPLL steppers); the CORE & CLOCK section only READS the clock/voltage via the
+// two headers above, so those two includes are no longer needed here.
 #endif
 
 /* --- palette (shared with About) ---
@@ -194,12 +195,7 @@ static void pm_make_cpu_graph(lv_obj_t *parent, pm_cpu_graph_t *out) {
 /* ---- text widgets (live, refreshed by the timer) ---- */
 static lv_obj_t *pm_batt_lbl = nullptr;   // battery detail block
 static lv_obj_t *pm_power_lbl = nullptr;  // power/runtime detail block
-static lv_obj_t *pm_clk_lbl  = nullptr;   // core voltage + clock + OC block
-#if BOARD_PLATFORM_TUYA
-static lv_obj_t *pm_octune_vmv_lbl  = nullptr;   // OC-tuning: live core-voltage value
-static lv_obj_t *pm_octune_band_lbl = nullptr;   // OC-tuning: DPLL band -> MHz value
-static lv_obj_t *pm_oc544_lbl       = nullptr;   // OC-tuning: persist/disable button text
-#endif
+static lv_obj_t *pm_clk_lbl  = nullptr;   // core voltage + clock block
 static lv_timer_t *pm_timer  = nullptr;
 static uint8_t   s_pm_graph_tick = 0;     // counts text ticks; pushes a graph point every PM_GRAPH_EVERY
 
@@ -515,11 +511,6 @@ static void pm_cleanup_cb(lv_event_t *e) {
   pm_batt_lbl = nullptr;
   pm_power_lbl = nullptr;
   pm_clk_lbl  = nullptr;
-#if BOARD_PLATFORM_TUYA
-  pm_octune_vmv_lbl  = nullptr;
-  pm_octune_band_lbl = nullptr;
-  pm_oc544_lbl       = nullptr;
-#endif
   pm_g_batt = pm_graph_t{};
   pm_g_draw = pm_graph_t{};
   pm_g_cpu  = pm_cpu_graph_t{};
@@ -680,155 +671,6 @@ static void pm_oc_btn_cb(lv_event_t *e) {
   pm_update_labels();     // refresh the Clk / OC readout immediately
 }
 #endif
-
-#if BOARD_PLATFORM_TUYA
-/* Build a "[-]  <value>  [+]" stepper row under `parent`. The minus/plus buttons get
- * `cb` with user_data `-step` / `+step`. Returns the centered value label so the caller
- * can stash it for live updates. Mirrors the dim/interval stepper styling. */
-static lv_obj_t *pm_octune_stepper(lv_obj_t *parent, lv_event_cb_t cb,
-                                   int step, const char *init) {
-  lv_obj_t *row = lv_obj_create(parent);
-  lv_obj_set_width(row, LV_PCT(100));
-  lv_obj_set_height(row, UI_PX(60));
-  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(row, 0, 0);
-  lv_obj_set_style_pad_all(row, 0, 0);
-  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  lv_obj_t *dn = lv_btn_create(row);
-  lv_obj_set_size(dn, UI_PX(64), UI_PX(52));
-  lv_obj_set_style_radius(dn, UI_PX(12), 0);
-  lv_obj_set_style_bg_color(dn, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_add_event_cb(dn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(-step));
-  lv_obj_t *dnl = lv_label_create(dn);
-  lv_obj_set_style_text_font(dnl, &FONT_LABEL, 0);
-  lv_obj_set_style_text_color(dnl, lv_color_white(), 0);
-  lv_label_set_text(dnl, LV_SYMBOL_MINUS);
-  lv_obj_center(dnl);
-
-  lv_obj_t *val = lv_label_create(row);
-  lv_obj_set_style_text_font(val, &FONT_LABEL, 0);
-  lv_obj_set_style_text_color(val, lv_color_hex(ui_accent_hex()), 0);
-  lv_label_set_text(val, init);
-
-  lv_obj_t *up = lv_btn_create(row);
-  lv_obj_set_size(up, UI_PX(64), UI_PX(52));
-  lv_obj_set_style_radius(up, UI_PX(12), 0);
-  lv_obj_set_style_bg_color(up, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_add_event_cb(up, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(step));
-  lv_obj_t *upl = lv_label_create(up);
-  lv_obj_set_style_text_font(upl, &FONT_LABEL, 0);
-  lv_obj_set_style_text_color(upl, lv_color_white(), 0);
-  lv_label_set_text(upl, LV_SYMBOL_PLUS);
-  lv_obj_center(upl);
-  return val;
-}
-
-/* ============================================================================
- *  T5 OC TUNING — live voltage + DPLL-band steppers (bring-up / probing).
- *  Voltage: owf_tuya_set_core_mv() in 25 mV steps. Band: force the DPLL VCO band
- *  (>480 MHz discovery) with the XTAL-park sequence, then measure the real MHz.
- *  These directly poke the silicon; intended for bench probing over USB serial.
- * ========================================================================== */
-/* pm_octune_vmv_lbl / pm_octune_band_lbl are declared up top (cleanup references them). */
-static uint16_t  s_octune_mv   = 950;            // runtime core-voltage target (mV)
-static uint8_t   s_octune_band = 0xFF;           // forced DPLL band; 0xFF = stock/auto
-
-/* Repaint the two OC-tuning value labels from live state. */
-static void pm_octune_refresh(void) {
-  if (pm_octune_vmv_lbl)
-    lv_label_set_text_fmt(pm_octune_vmv_lbl, "core %u / dig %u mV",
-                          (unsigned)owf_tuya_get_core_ldo_mv(),
-                          (unsigned)owf_tuya_get_dig_ldo_mv());
-  if (pm_octune_band_lbl) {
-    if (s_octune_band == 0xFF)
-      lv_label_set_text(pm_octune_band_lbl, "stock 480");
-    else
-      lv_label_set_text_fmt(pm_octune_band_lbl, "band %u = %lu MHz",
-                            (unsigned)s_octune_band,
-                            (unsigned long)owf_tuya_measure_cpu_mhz());
-  }
-  if (pm_oc544_lbl) {
-    if (settings_get_oc_enabled())
-      lv_label_set_text_fmt(pm_oc544_lbl, "OC SAVED (band %u, %u mV) - tap to disable",
-                            (unsigned)settings_get_oc_band(), (unsigned)settings_get_oc_mv());
-    else
-      lv_label_set_text(pm_oc544_lbl, "Save overclock (band 0 = 544 MHz)");
-  }
-}
-
-/* Voltage +/- (user_data = signed mV delta). Clamps to a sane 600..1300 mV window. */
-static void pm_octune_v_step_cb(lv_event_t *e) {
-  int d = (int)(intptr_t)lv_event_get_user_data(e);
-  int mv = (int)s_octune_mv + d;
-  if (mv < 600)  mv = 600;
-  if (mv > 1300) mv = 1300;            // soft UI ceiling; rail's true limit is yours to find
-  s_octune_mv = (uint16_t)mv;
-  owf_tuya_set_core_mv(s_octune_mv);   // apply immediately
-  pm_octune_refresh();
-}
-
-/* DPLL band +/- (user_data = signed delta). Forces the band via the XTAL-park path,
- * then measures. delta that takes band below 0 returns to stock auto-480. */
-static void pm_octune_band_step_cb(lv_event_t *e) {
-  int d = (int)(intptr_t)lv_event_get_user_data(e);
-  int b = (s_octune_band == 0xFF ? -1 : (int)s_octune_band) + d;
-  if (b < 0) {
-    s_octune_band = 0xFF;
-    owf_tuya_park_xtal();
-    owf_tuya_dpll_restore_auto();      // back to stock 480
-    owf_tuya_restore_clkdiv((OWF_T5_REG_CPU_CLKDIV & ~0x3Fu) | (OWF_T5_CKSEL_480 << 4));
-  } else {
-    if (b > 7) b = 7;
-    s_octune_band = (uint8_t)b;
-    uint32_t saved = owf_tuya_park_xtal();
-    owf_tuya_dpll_force_band(s_octune_band);
-    OWF_T5_REG_CPU_CLKDIV = (saved & ~0x3Fu) | (OWF_T5_CKSEL_480 << 4);  // ride the new PLL
-  }
-  pm_octune_refresh();
-  pm_update_labels();                  // top Clock: line reflects the measured rate
-}
-
-/* Run the full band sweep and print band->MHz over USB serial (bench discovery). */
-static void pm_octune_sweep_cb(lv_event_t *e) {
-  (void)e;
-  extern HWCDC USBSerial;
-  owf_t5_dpll_state_t st = owf_tuya_dpll_read();
-  USBSerial.printf("[dpll] baseline: band=%u band0=%u band1=%u cksel=%u  (cpu cksel=%u div=%u)\n",
-                   st.band, st.band0, st.band1, st.cksel, st.cksel_core, st.clkdiv_core);
-  uint16_t res[8] = {0};
-  int n = owf_tuya_dpll_sweep(0, 7, res);
-  for (int i = 0; i < n; i++)
-    USBSerial.printf("[dpll] band %d -> %u MHz\n", i, (unsigned)res[i]);
-  pm_octune_refresh();
-  pm_update_labels();
-}
-
-/* Known-good overclock: DPLL band 0 (~544 MHz) at 975 mV. This PERSISTS it to NVS and
- * applies it now, guarded by the survived-boot gate so a hang on the next cold boot
- * auto-disables it. Tapping again while already OC'd toggles it back OFF (stock 480).
- * The band/voltage come from the live OC-tuning steppers if the user changed them, else
- * the defaults below — so you can dial in a value with the steppers, then make it stick. */
-#define OWF_T5_OC_BAND_DEF  0      /* band 0 = ~544 MHz (user-confirmed) */
-#define OWF_T5_OC_MV_DEF    975    /* stable at the core-LDO ceiling */
-static void pm_oc544_btn_cb(lv_event_t *e) {
-  (void)e;
-  if (settings_get_oc_enabled()) {
-    settings_clear_oc();                 // toggle OFF -> back to stock 480
-  } else {
-    // Use the current stepper band if the user forced one, else the default.
-    uint8_t  band = (s_octune_band == 0xFF) ? OWF_T5_OC_BAND_DEF : s_octune_band;
-    uint16_t mv   = (s_octune_mv  < 600)    ? OWF_T5_OC_MV_DEF   : s_octune_mv;
-    settings_set_oc(band, mv);           // persist + apply (survived-boot gated at boot)
-    s_octune_band = band; s_octune_mv = mv;
-  }
-  pm_octune_refresh();
-  pm_update_labels();
-}
-#endif  /* BOARD_PLATFORM_TUYA */
 
 /* ----- Power-off button + its confirm dialog ----- */
 static lv_obj_t *pm_off_box = nullptr;   // confirm overlay (one at a time)
@@ -1225,68 +1067,13 @@ static void app_open_power(void) {
   pm_refresh_freq_highlight();
 #endif  /* !BOARD_PLATFORM_MAIX (CPU SPEED buttons) */
 
-#if BOARD_PLATFORM_TUYA
-  // ---- OC TUNING (bench/probing): live core-voltage + DPLL-band steppers ----
-  // Directly pokes the silicon. Voltage in 25 mV steps; band forces the DPLL VCO
-  // (>480 MHz discovery) via the XTAL-park sequence and measures the real rate.
-  // The SWEEP button prints band->MHz over USB serial. A bad band may need a reboot.
-  pm_header(col, "OC TUNING (bench)");
+  // NOTE: the T5 "OC TUNING (bench)" section (live core-voltage + DPLL-band steppers,
+  // the one-tap 544 MHz save, and the DPLL sweep-to-serial button) was REMOVED from the
+  // Power app on the user's request — OC tuning is not exposed in the UI on this device.
+  // The underlying knobs still exist for bench work (owf_tuya_cpu_freq.h /
+  // owf_tuya_psram_freq.h and owf_tuya_dpll_sweep.h); they just aren't surfaced here.
 
-  lv_obj_t *vlbl = pm_line(col, &FONT_SMALL, PM_DIM, "Core voltage");
-  (void)vlbl;
-  pm_octune_vmv_lbl = pm_octune_stepper(col, pm_octune_v_step_cb, 25, "-- mV");
-
-  lv_obj_t *blbl = pm_line(col, &FONT_SMALL, PM_DIM, "DPLL band (clock)");
-  (void)blbl;
-  pm_octune_band_lbl = pm_octune_stepper(col, pm_octune_band_step_cb, 1, "stock 480");
-
-  // One-tap known-good overclock: DPLL band 0 (~544 MHz) at 975 mV. Runtime only.
-  lv_obj_t *ocrow = lv_obj_create(col);
-  lv_obj_set_width(ocrow, LV_PCT(100));
-  lv_obj_set_height(ocrow, UI_PX(56));
-  lv_obj_set_style_bg_opa(ocrow, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(ocrow, 0, 0);
-  lv_obj_set_style_pad_all(ocrow, 0, 0);
-  lv_obj_clear_flag(ocrow, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(ocrow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(ocrow, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_t *ocb544 = lv_btn_create(ocrow);
-  lv_obj_set_size(ocb544, UI_PX(220), UI_PX(46));
-  lv_obj_set_style_bg_color(ocb544, lv_color_hex(0x0A3A1A), 0);
-  lv_obj_set_style_radius(ocb544, UI_PX(12), 0);
-  lv_obj_add_event_cb(ocb544, pm_oc544_btn_cb, LV_EVENT_CLICKED, nullptr);
-  pm_oc544_lbl = lv_label_create(ocb544);
-  lv_obj_set_style_text_font(pm_oc544_lbl, &FONT_SMALL, 0);
-  lv_obj_set_style_text_color(pm_oc544_lbl, lv_color_hex(0x66FF99), 0);
-  lv_label_set_text(pm_oc544_lbl, "Save overclock (band 0 = 544 MHz)");
-  lv_obj_center(pm_oc544_lbl);
-
-  lv_obj_t *swrow = lv_obj_create(col);
-  lv_obj_set_width(swrow, LV_PCT(100));
-  lv_obj_set_height(swrow, UI_PX(56));
-  lv_obj_set_style_bg_opa(swrow, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(swrow, 0, 0);
-  lv_obj_set_style_pad_all(swrow, 0, 0);
-  lv_obj_clear_flag(swrow, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(swrow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(swrow, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_t *swb = lv_btn_create(swrow);
-  lv_obj_set_size(swb, UI_PX(220), UI_PX(46));
-  lv_obj_set_style_bg_color(swb, lv_color_hex(0x0A2A3A), 0);
-  lv_obj_set_style_radius(swb, UI_PX(12), 0);
-  lv_obj_add_event_cb(swb, pm_octune_sweep_cb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t *swl = lv_label_create(swb);
-  lv_obj_set_style_text_font(swl, &FONT_SMALL, 0);
-  lv_obj_set_style_text_color(swl, lv_color_hex(0x66CCFF), 0);
-  lv_label_set_text(swl, "Sweep DPLL bands -> serial");
-  lv_obj_center(swl);
-
-  pm_octune_refresh();
-#endif  /* BOARD_PLATFORM_TUYA (OC TUNING) */
-
-#if OVERCLOCK_ENABLE
+#if OVERCLOCK_ENABLE && !BOARD_PLATFORM_TUYA
   // Runtime overclock trigger. Never auto-applies at boot, so USB/flashing always
   // work; reboot undoes a bad bump.
   lv_obj_t *ocb = lv_btn_create(col);

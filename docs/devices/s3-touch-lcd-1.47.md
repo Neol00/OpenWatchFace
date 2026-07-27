@@ -177,13 +177,14 @@ All of these are compile-time and live in the sketch folder.
 | `BOARD_HAS_HAPTICS` | `1` | Haptic feedback. Enabled, but there is no motor fitted by default — see the note below to add one. |
 | `HAPTICS_CLICK_MS` | `28` | Button-tick length (strength is length-only). Lower if too hard, raise if too faint; floor ~20 ms or a coin ERM never spins up. |
 
-### Experimental — off by default
+### Extra
 
 | Setting | File | Notes |
 |---|---|---|
 | `OVERCLOCK_ENABLE` | `overclock.h` | Past 240 MHz on the S3. **Can hang or scramble flash/NVS** — read the header's recovery notes first. |
 | `UNDERVOLT_ENABLE` | `settings_store.h` | Core-rail undervolt. **Disabled by default** — the shipped table is all-stock, so it is a no-op until you opt in and edit it. Validate each step against a meter before trusting it; see the [overclocking & undervolting](../../README.md#experimental-overclocking--undervolting) section. |
 | `CORE_UV_MV[]` | `core_voltage.h` | Real core (dig_dbias) undervolt, separate from the rail one above. Default 1150 mV = stock. Also off unless you edit it. |
+| `BATT_DESIGN_MAH` | `power_model.h` | 400 is the default battery design capacity set in for the device (mAh). Change this to fit your battery size and get better battery health data. |
 
 > The AXP2101 rail undervolt does **not** apply here — there is no PMU rail to trim, so
 > that path is a no-op on the C6.

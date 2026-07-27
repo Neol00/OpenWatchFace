@@ -178,13 +178,14 @@ All of these are compile-time and live in the sketch folder.
 | `HAPTICS_CLICK_MS` | `40` | Button-tick length (strength is length-only). Raise if too faint, lower if too strong; below ~25 it stops registering. |
 | `BOARD_HAS_ULP_STEPS` | `1` | Deep-sleep step counting on the RISC-V ULP. Needs the custom libs from step 4. |
 
-### Experimental — off by default
+### Extra
 
 | Setting | File | Notes |
 |---|---|---|
 | `OVERCLOCK_ENABLE` | `overclock.h` | Past 240 MHz on the S3. **Can hang or scramble flash/NVS** — read the header's recovery notes first. |
 | `UNDERVOLT_ENABLE` | `settings_store.h` | AXP2101 rail undervolt (DCDC1). **Disabled by default** — the shipped table is all-stock 3300 mV, so it is a no-op until you opt in and edit it. Validate each step against a meter; see the [overclocking & undervolting](../../README.md#experimental-overclocking--undervolting) section. |
 | `CORE_UV_MV[]` | `core_voltage.h` | Real core (dig_dbias) undervolt, separate from the rail one above. Default 1150 mV = stock. Also off unless you edit it. |
+| `BATT_DESIGN_MAH` | `power_model.h` | 400 is the default battery design capacity set in for the device (mAh). Change this to fit your battery size and get better battery health data. |
 
 > Both undervolt paths have a self-test safety net. This board has the AXP2101 PMU, so
 > unlike the C6 it *can* use the rail undervolt — but leave it stock unless you are

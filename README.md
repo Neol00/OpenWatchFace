@@ -37,6 +37,8 @@ media — all in a single Arduino translation unit on top of LVGL.
 ## Table of contents
 - [Screenshots](#screenshots)
 - [Installation](#installation) — **per-device guides** in [`docs/devices/`](docs/devices/README.md)
+- [Apps](#apps)
+  - [Controls — the BOOT button](#controls--the-boot-button)
 - [Architecture overview](#architecture-overview)
 - [Deep sleep & the timed wake](#deep-sleep--the-timed-wake)
 - [The notification pipeline](#the-notification-pipeline)
@@ -46,8 +48,6 @@ media — all in a single Arduino translation unit on top of LVGL.
   - [Media control over BLE (AMS)](#media-control-over-ble-ams)
 - [Storage (SD card vs flash)](#storage-sd-card-vs-flash)
 - [Experimental: overclocking & undervolting](#experimental-overclocking--undervolting)
-- [Apps](#apps)
-  - [Controls — the BOOT button](#controls--the-boot-button)
 - [Credits & licensing](#credits--licensing)
 
 ---
@@ -79,6 +79,44 @@ from the Boards Manager. The MaixCam and Fossil ports use their own toolchains.
 
 ---
 
+## Apps
+
+The launcher (`app_menu.h`) is a scrollable grid on the top LVGL layer; the
+watch face keeps running underneath. The hardware **BOOT** button is the universal
+back/menu key (clock → menu → app → back out). Current apps:
+
+| App | Icon | What it does |
+|-----|------|--------------|
+| **Notifications** | 🔔 | Unified list/reader for HTTPS, ANCS (iPhone) and Gadgetbridge (Android) notifications; dismiss (clears on an iPhone too via ANCS) |
+| **Timer** | 🔁 | Countdown timer + stopwatch + alarm; a running countdown arms a precise deep-sleep timer wake so the alarm fires on time |
+| **Appearance** | 🎨 | Accent color / theme (mono-accent mode); restyles the live UI immediately |
+| **Power** | 🔋 | Battery %, charge state, power estimates, the duty-cycle/floor-current learner, CPU usage, voltages, per-rail sleep-cut toggles, background-check toggle, battery-health proxy, change CPU clock speed |
+| **WiFi & BLE** | 📶 | Toggle radios, saved WiFi networks, BLE pairing (shows the pair code), bonded phones |
+| **Player** | 🎵 | Now-playing (iPhone via AMS, Android via Gadgetbridge): track/artist + transport controls |
+| **Find Phone** | 📞 | Ring the phone (Gadgetbridge on Android, or a companion app) |
+| **Files** | 💾 | Browse the SD card / flash FAT storage; view, move and delete files |
+| **About** | 📋 | Live spec sheet: chip/flash/PSRAM, per-pool SRAM & PSRAM free, SD usage, and reported library versions |
+
+A pull-down **quick shade** (`quick_shade.h`) over the watch face gives one-drag access
+to brightness and mute for sudden lighting changes (e.g. stepping into sunlight),
+also including a caffeine button to keep the watch awake.
+
+### Controls — the BOOT button
+
+The watch has one physical control, the **BOOT** button. Everything else is touch.
+
+| Action | What it does |
+|---|---|
+| **Single tap** | Open the app menu / go **back** one level (app → menu → watch face). Also closes the pull-down shade, or silences a ringing alarm, if one is up. |
+| **Double tap** (two taps within ~½ second) | Put the watch into **deep sleep**. A single tap of BOOT wakes it again. |
+| **Hold** | Nothing — holding BOOT has no special function. |
+
+> The watch also deep-sleeps on its own after ~2 minutes idle on the watch face (unless
+> on USB power or kept awake by Caffeine); a **single BOOT tap wakes it**. See
+> [Deep sleep & the timed wake](#deep-sleep--the-timed-wake).
+
+---
+
 ## Architecture overview
 
 Everything is **header-only**, `#include`-d in dependency order into one `.ino`
@@ -98,11 +136,13 @@ flags; the loop reads those flags and does all the actual UI (popups, bell refre
 
 ## Deep sleep & the timed wake
 
-The single most important thing to understand about this watch's power model:
+This varies across different devices, this is primarily explaining the ESP32 devices and the ideal hardware conditions.
+Deep sleep represents the OpenWatchFace goal of lowest possible power consumption. The single most important thing to
+understand about this watch's power model:
 
 > **You cannot truly "turn the watch off" and still have it wake itself up.**
 > A device that is fully powered down has nothing running to decide *when* to come
-> back. ESP32 **deep sleep** is the next best thing: it powers down the CPU, radios,
+> back. **deep sleep** is the next best thing: it powers down the CPU, radios,
 > RAM and most peripherals, leaving only the ultra-low-power RTC + wake logic alive —
 > just enough to be re-woken by a **timer** or a **button**. So the watch spends
 > almost all of its life in deep sleep and briefly resurrects on a schedule.
@@ -138,7 +178,7 @@ When the watch decides to sleep (idle timeout, or user action), `enter_deep_slee
 > is the periodic reset that keeps long-term memory monotonicity from mattering.
 
 ### The timed wake does NOT light up the screen
-A naïve design would do a full boot every interval just to check for messages, lighting
+A naive design would do a full boot every interval just to check for messages, lighting
 the display each time and draining the battery. Instead, a timer wake runs a **light
 background check** first (`background_check_has_new()`), and the display is only
 initialized if there is actually something new:
@@ -424,64 +464,6 @@ How it stays safe:
   targets live only in the source table, so changing or backing out a value is just a
   reflash — never a brick. Tune one step at a time and validate it under load
   (max brightness + WiFi fetch + busy CPU) for a long while; expect silicon lottery.
-
----
-
-## Apps
-
-The launcher (`app_menu.h`) is a scrollable 3-column grid on the top LVGL layer; the
-watch face keeps running underneath. The hardware **BOOT** button is the universal
-back/menu key (clock → menu → app → back out). Current apps:
-
-| App | Icon | What it does |
-|-----|------|--------------|
-| **Notifications** | 🔔 | Unified list/reader for HTTPS, ANCS (iPhone) and Gadgetbridge (Android) notifications; dismiss (clears on an iPhone too via ANCS) |
-| **Timer** | 🔁 | Countdown timer + stopwatch; a running countdown arms a precise deep-sleep timer wake so the alarm fires on time |
-| **Appearance** | 🎨 | Accent color / theme (mono-accent mode); restyles the live UI immediately |
-| **Power** | 🔋 | Battery %, charge state, power estimates, the duty-cycle/floor-current learner, CPU usage, voltages, per-rail sleep-cut toggles, background-check toggle, battery-health proxy, change CPU clock speed |
-| **WiFi & BLE** | 📶 | Toggle radios, saved WiFi networks, BLE pairing (shows the pair code), bonded phones |
-| **Player** | 🎵 | Now-playing (iPhone via AMS, Android via Gadgetbridge): track/artist + transport controls |
-| **Find Phone** | 📞 | Ring the phone (Gadgetbridge on Android, or a companion app) |
-| **Files** | 💾 | Browse the SD card / flash FAT storage; view, move and delete files |
-| **About** | 📋 | Live spec sheet: chip/flash/PSRAM, per-pool SRAM & PSRAM free, SD usage, battery health, and auto-reported library versions |
-
-A pull-down **quick shade** (`quick_shade.h`) over the watch face gives one-drag access
-to brightness and mute for sudden lighting changes (e.g. stepping into sunlight),
-also including a caffeine button to keep the watch awake.
-
-### Controls — the BOOT button
-
-The watch has one physical control, the **BOOT** button. Everything else is touch.
-
-| Action | What it does |
-|---|---|
-| **Single tap** | Open the app menu / go **back** one level (app → menu → watch face). Also closes the pull-down shade, or silences a ringing alarm, if one is up. |
-| **Double tap** (two taps within ~½ second) | Put the watch into **deep sleep**. A single tap of BOOT wakes it again. |
-| **Hold** | Nothing — holding BOOT has no special function. |
-
-> The watch also deep-sleeps on its own after ~2 minutes idle on the watch face (unless
-> on USB power or kept awake by Caffeine); a **single BOOT tap wakes it**. See
-> [Deep sleep & the timed wake](#deep-sleep--the-timed-wake).
-
----
-
-### Out-of-tree library patches
-A fresh library install will **not** have the modifications this firmware relies on, so
-without them the build fails or the watch misbehaves (crash on BLE toggle, single-core
-rendering, no PSRAM screen cache). They are shipped as ready-to-apply unified diffs in
-[`patches/`](patches/) with an apply script for Windows and Linux — see the
-"Apply the library patches" step in your [device guide](docs/devices/README.md) and
-[`patches/README.md`](patches/README.md). All are GPL-compatible:
-
-| Patch | File | Library / license | Effect |
-|-------|------|-------------------|--------|
-| Pin LVGL render thread to core 0 | `lvgl/src/osal/lv_freertos.c` | LVGL (MIT) | 2nd SW draw unit uses the idle core (dual-core rendering) |
-| Enable `LV_USE_SNAPSHOT` | `lv_conf.h` | LVGL (MIT) | lets the PSRAM screen cache pre-render screens |
-| Async-DMA QSPI flush | `GFX…/Arduino_ESP32QSPI.cpp` | Arduino_GFX (MIT) | overlaps pixel conversion with transmission (higher FPS) |
-| Second SPI transaction struct | `GFX…/Arduino_ESP32QSPI.h` | Arduino_GFX (MIT) | supports the pipelined flush above |
-| Unregister GAP event listener in `deinit()` | `BLE/src/BLEDevice.cpp` | ESP32 core (Apache-2.0) | fixes a crash when BLE is toggled off then on again |
-| `getPsramSize()` reports the physical chip | `cores/esp32/Esp.cpp` | ESP32 core (LGPL-2.1) | shows 8 MB instead of "6 MB" once XIP-from-PSRAM reserves heap |
-| I2S channel-leak fix in `begin()`/`end()` | `ESP_I2S/src/ESP_I2S.cpp` | ESP32 core (LGPL-2.1) | keeps the speaker alive: a failed teardown no longer leaks I2S channels until "no available channel found" |
 
 ---
 

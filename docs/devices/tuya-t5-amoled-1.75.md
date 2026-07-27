@@ -168,6 +168,13 @@ All of these are compile-time and live in the sketch folder.
 | `HAPTICS_CLICK_MS` | `28` | Button-tick length — the **real** strength knob (buzz is length-only). Lower if too hard, raise if too faint; floor ~20 ms or a coin ERM never spins up. Only matters if you fit a motor (see below). |
 | `HAPTICS_INTENSITY_PCT` | `40` | **Reserved / not wired up.** IO14 has no hardware PWM on the T5 and the software-PWM attempt was reverted, so the motor runs at full strength regardless. Left in place for when amplitude control is redone; tune `HAPTICS_CLICK_MS` instead. |
 
+### Battery capacity
+
+| Setting | File | Notes |
+|---|---|---|
+| `BATT_DESIGN_MAH` | `power_model.h` | 400 is the default battery design capacity set in for the device (mAh). Change this to fit your battery size and get better battery health data. |
+
+
 ### CPU & PSRAM clock / voltage (T5-specific)
 
 The ESP32 experimental knobs (`overclock.h`, `settings_store.h` rail undervolt,

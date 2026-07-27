@@ -2109,7 +2109,7 @@ static void haptics_attach_click_feedback(void) {}   // no motor -> nothing to a
 
 /* ================================ loop =================================== */
 static int lastMinuteShown = -1;  // -1 = nothing drawn yet
-static uint32_t lastBattMs = 0;   // battery poll timer
+static uint32_t lastBattMs = 0;   // battery + voltage + bell poll timer (10s, partial redraw)
 static uint32_t lastNotifMs = 0;  // notification fetch timer
 
 void loop() {
@@ -2387,14 +2387,28 @@ void loop() {
     if (!g_alarm_active) almclk_fire();
   }
 
-  // --- Battery + bell: poll every 20s. (WiFi indicator is refreshed on the 15s
-  //     notification cadence below, in phase with the fetch that actually drives
-  //     the radio's connect/disconnect — see there.) ---
-  if (ms - lastBattMs > 20000) {
+  // --- Battery + voltage + bell: poll every 10s, PARTIAL-REDRAW only ---
+  //
+  // Both updaters touch only their OWN LVGL objects — watchface_set_battery() rewrites
+  // the middle battery widget + the corner voltage label; watchface_set_bell() rewrites
+  // the bell badge. LVGL's own per-object dirty tracking then repaints just those
+  // regions on the next lv_timer_handler(); the whole face is NOT redrawn. So we do
+  // NOT set the loop's `dirty` flag here — that flag only holds the fast animation
+  // pacing (see fast_pace below), which a routine battery/bell poll doesn't need.
+  //
+  // refresh_battery() already change-detects: it repaints the battery+voltage objects
+  // ONLY when pct, the CHARGING/USB state, or the voltage actually moved (see its tail
+  // return). That folds in the "update when USB charging status changes" requirement —
+  // a plug/unplug flips `chg`, so the icon (purple + "USB") and the voltage readout
+  // refresh on the next 10s poll with no full-face redraw. watchface_refresh_bell()
+  // is likewise a no-op paint unless the unread count changed.
+  //
+  // (WiFi indicator rides the 15s notification cadence below, in phase with the fetch
+  // that drives the radio's connect/disconnect — see there.)
+  if (ms - lastBattMs > 10000) {
     lastBattMs = ms;
-    if (refresh_battery()) dirty = true;
+    refresh_battery();          // battery icon + corner voltage; in-place, USB-edge aware
     watchface_refresh_bell();   // unread count from the active store (SD/FAT or flash)
-    dirty = true;
   }
 
   // --- Notifications: ask the CORE-0 network task to poll the server every 15s
