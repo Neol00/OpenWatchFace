@@ -1,0 +1,72 @@
+/* AUO 416x416 AMOLED command-mode panel node - extracted VERBATIM from the
+ * REAL device tree dumped from the user's DW13F1 hoki (merged base+dtbo),
+ * 2026-08-03. Ground truth for the MDP5/DSI display bring-up: init command
+ * sequence, timings, lane config, reset sequence.
+ */
+
+			qcom,mdss_dsi_auo_416p_amoled_cmd {
+				qcom,esd-check-enabled;
+				qcom,mdss-dsi-bllp-power-mode;
+				qcom,mdss-dsi-on-command = <0x5010000 0x1000200 0x150100 0x02 0xfe011501 0x00 0x20af015 0x1000000 0x2fe00 0x29010000 0x52a 0x1e01bd 0x29010000 0x52b 0x19f 0x29010000 0x530 0x19f 0x29010000 0x531 0x1e01bd 0x5010000 0x212 0x150100 0x02 0x35021501 0x00 0x2532015 0x1000000 0x25100 0x15010000 0x28000266 0x150100 0x02 0x63ff0501 0x3200 0x2110005 0x100001e 0x22900>;
+				qcom,mdss-dsi-off-command = [05 01 00 00 00 00 02 28 00 05 01 00 00 78 00 02 10 00];
+				qcom,mdss-dsi-v-bottom-border = <0x00>;
+				qcom,mdss-dsi-color-order = "rgb_swap_rgb";
+				qcom,mdss-dsi-t-clk-pre = <0x12>;
+				qcom,mdss-dsi-bl-min-level = <0x01>;
+				qcom,mdss-dsi-on-command-state = "dsi_lp_mode";
+				qcom,mdss-dsi-pixel-alignment = <0x00>;
+				qcom,mdss-dsi-h-back-porch = <0x06>;
+				qcom,mdss-dsi-v-back-porch = <0x01>;
+				qcom,mdss-dsi-panel-name = "AUO 416p AMOLED command mode dsi panel";
+				qcom,mdss-dsi-panel-clockrate = <0x1265b500>;
+				qcom,mdss-dsi-bllp-eof-power-mode;
+				qcom,mdss-dsi-panel-status-check-mode = "te_signal_check";
+				qcom,mdss-dsi-panel-width = <0x1a0>;
+				qcom,mdss-dsi-h-sync-skew = <0x00>;
+				qcom,mdss-dsi-reset-sequence = <0x01 0x0a>;
+				qcom,mdss-dsi-te-check-enable;
+				qcom,mdss-dsi-te-pin-select = <0x01>;
+				qcom,mdss-dsi-te-using-te-pin;
+				qcom,mdss-dsi-h-front-porch = <0x04>;
+				qcom,mdss-dsi-v-front-porch = <0x01>;
+				qcom,mdss-dsi-dma-trigger = "trigger_sw";
+				qcom,mdss-dsi-pixel-packing = "tight";
+				qcom,mdss-dsi-panel-destination = "display_1";
+				qcom,mdss-dsi-v-top-border = <0x00>;
+				qcom,mdss-dsi-idle-on-command-state = "dsi_hs_mode";
+				qcom,mdss-dsi-panel-height = <0x1a0>;
+				qcom,mdss-dsi-te-dcs-command = <0x01>;
+				qcom,mdss-dsi-h-sync-pulse = <0x01>;
+				qcom,mdss-dsi-virtual-channel-id = <0x00>;
+				qcom,mdss-dsi-lane-0-state;
+				qcom,mdss-dsi-underflow-color = <0xff>;
+				qcom,mdss-dsi-hbm-off-command = [15 01 00 00 00 00 02 fe 00 15 01 00 00 28 00 02 66 00 15 01 00 00 00 00 02 fe 01 15 01 00 00 00 00 02 11 80 15 01 00 00 00 00 02 fe 00];
+				qcom,mdss-dsi-h-left-border = <0x00>;
+				qcom,mdss-dsi-border-color = <0x00>;
+				qcom,mdss-dsi-mdp-trigger = "none";
+				qcom,mdss-dsi-idle-on-command = [05 01 00 00 00 00 02 fe 00 05 01 00 00 1e 00 01 39];
+				phandle = <0x296>;
+				qcom,mdss-dsi-bpp = <0x18>;
+				qcom,mdss-dsi-panel-timings-phy-12nm = <0x605010a 0x3010f>;
+				qcom,mdss-dsi-panel-type = "dsi_cmd_mode";
+				qcom,mdss-dsi-lane-map = "lane_map_0123";
+				qcom,mdss-dsi-off-command-state = "dsi_hs_mode";
+				qcom,mdss-dsi-panel-framerate = <0x2d>;
+				qcom,mdss-dsi-tear-disable;
+				qcom,mdss-dsi-bl-max-level = <0xff>;
+				qcom,mdss-dsi-h-pulse-width = <0x04>;
+				qcom,mdss-dsi-v-pulse-width = <0x02>;
+				qcom,panel-supply-entries = <0x28e>;
+				qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_dcs";
+				qcom,mdss-dsi-power-off-disable;
+				qcom,mdss-dsi-idle-off-command = [05 01 00 00 00 00 02 fe 00 05 01 00 00 1e 00 01 38];
+				qcom,mdss-dsi-stream = <0x00>;
+				qcom,mdss-dsi-traffic-mode = "burst_mode";
+				linux,phandle = <0x296>;
+				qcom,mdss-tear-check-frame-rate = <0x1194>;
+				qcom,mdss-dsi-hbm0-on-command = <0x15010000 0x2fe 0x1150100 0x02 0x11931501 0x00 0x2fe0015 0x1000000 0x26602>;
+				qcom,mdss-dsi-h-right-border = <0x00>;
+				qcom,mdss-dsi-t-clk-post = <0x05>;
+				qcom,mdss-dsi-panel-controller = <0x1fa>;
+				qcom,mdss-dsi-idle-fps = <0x0f>;
+			}

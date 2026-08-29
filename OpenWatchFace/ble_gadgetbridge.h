@@ -219,6 +219,27 @@ static void gb_handle_settime(const char *line) {
                    tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (double)tzh);
 }
 
+/* {"t":"weather","temp":293,"hum":50,"code":802,"txt":"..","wind":..,"loc":"Berlin"}
+ * Gadgetbridge's Bangle.js weather push. Per the design, BLE only sets the LOCATION:
+ * it carries a place NAME ("loc") but NO coordinates, so we store the name, mark it
+ * as needing geocoding, persist it, and kick a WiFi fetch — the actual weather for
+ * that place comes from open-meteo (geocode the name -> lat/lon -> forecast), not
+ * from these fields. (We deliberately ignore temp/code here: they're OpenWeatherMap
+ * codes in Kelvin, a different scheme from the WMO codes our icons map, and the WiFi
+ * fetch gives a full multi-day forecast the push can't.) */
+static void gb_handle_weather(const String &js) {
+  String loc;
+  if (!json_find_string(js, 0, "loc", loc) || loc.isEmpty()) return;
+  // Only act on a genuinely new place name (avoids re-geocoding on every push —
+  // Gadgetbridge re-sends weather periodically). weather_set_name_for_geocode()
+  // stores the name + arms the geocode-on-next-fetch flag and returns true if the
+  // name actually changed.
+  if (weather_set_name_for_geocode(loc.c_str())) {
+    USBSerial.printf("[gb] weather location -> \"%s\" (will geocode+fetch)\n", loc.c_str());
+    weather_request_fetch();
+  }
+}
+
 /* One complete '\n'-terminated line from the phone. */
 static void gb_handle_line(char *line) {
   // Strip leading control bytes (Gadgetbridge prefixes \x10) and whitespace.
@@ -242,8 +263,8 @@ static void gb_handle_line(char *line) {
     // {"t":"find","n":true} rings the watch — same path as the find-watch write.
     if (js.indexOf("\"n\":true") >= 0) s_ble_findwatch_req = true;
   }
-  // TODO: "call" (live incoming-call screen, like the ANCS s_incoming_* seam),
-  //       "weather".
+  else if (t == "weather") gb_handle_weather(js);
+  // TODO: "call" (live incoming-call screen, like the ANCS s_incoming_* seam).
   else USBSerial.printf("[gb] ignored t=\"%s\"\n", t.c_str());
 }
 

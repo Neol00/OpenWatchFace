@@ -74,6 +74,7 @@ struct __attribute__((packed)) ramfb_cfg {
 #define FB_MAX_W 480
 #define FB_MAX_H 480
 static uint32_t s_fb[FB_MAX_W * FB_MAX_H] __attribute__((aligned(4096)));
+static uint32_t s_w_ramfb, s_h_ramfb;
 
 void *fb_init(uint32_t w, uint32_t h)
 {
@@ -107,9 +108,17 @@ void *fb_init(uint32_t w, uint32_t h)
     cfg.stride_be = __builtin_bswap32(w * 4);
     fwcfg_dma_write(key, &cfg, sizeof cfg);
 
-    con_puts("ramfb: "); con_putdec(w); con_puts("x"); con_putdec(h);
-    con_puts(" @ "); con_puthex((uint32_t)(uintptr_t)s_fb); con_puts("\n");
+    s_w_ramfb = w; s_h_ramfb = h;
+    bdiag_puts("ramfb: "); bdiag_putdec(w); bdiag_puts("x"); bdiag_putdec(h);
+    bdiag_puts(" @ "); bdiag_puthex((uint32_t)(uintptr_t)s_fb); bdiag_puts("\n");
     return s_fb;
 }
+
+/* Accessors so board-neutral code (gfx_text.c) can render here too. */
+uint32_t fb_width(void)  { return s_w_ramfb; }
+uint32_t fb_height(void) { return s_h_ramfb; }
+uint32_t fb_bpp(void)    { return 4; }
+void    *fb_ptr(void)    { return s_fb; }
+void     fb_flush_all(void) { }          /* ramfb scans DDR continuously */
 
 #endif /* PLAT_BOARD_QEMU_VIRT */

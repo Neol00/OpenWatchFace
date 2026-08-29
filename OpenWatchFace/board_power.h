@@ -18,6 +18,13 @@
  * ========================================================================== */
 #pragma once
 
+#if BOARD_HAS_GAUGE_BQ27220
+#include "gauge_bq27220.h"
+#endif
+#if BOARD_HAS_CHARGER_BQ25896
+#include "charger_bq25896.h"
+#endif
+
 #if BOARD_HAS_PMU_AXP2101
 #include "XPowersLib.h"
 
@@ -531,6 +538,128 @@ static bool     board_is_charging(void)          { return owf_maix_is_charging()
 static bool     board_vbus_in(void)              { return owf_maix_vbus_in() != 0; }
 static bool     board_usb_powered(void)          { return board_vbus_in(); }
 static float    board_pmu_temp_c(void)           { return -273.0f; }
+#elif BOARD_PLATFORM_FOSSIL
+/* Fossil: the PMIC fuel gauge / charger, read over SPMI by the bare-metal
+ * runtime (fossil-port pmic_fg.c — real on the Gen 6's PM660 FG-GEN3, honest
+ * -1 stubs on the Gen 4). The gauge runs autonomously with the profile the
+ * stock OS programmed, so there is no begin()/config step: power_ok is simply
+ * "does a SoC read answer sanely". No I2C involved — no bus lock needed. */
+extern "C" int fg_batt_percent(void);
+extern "C" int fg_batt_mv(void);
+extern "C" int fg_batt_ma(void);      /* + = discharging; -32768 on error */
+extern "C" int fg_batt_temp_dc(void);
+extern "C" int chg_usb_present(void);
+extern "C" int chg_charging(void);
+/* FG/CHARGER RE-ENABLED (2026-08-07) — VALIDATED ON HARDWARE. The 2026-08-03
+ * disable ("plausible junk" + suspected TZ/XPU reset) predated the SPMI
+ * arbiter v2 APID-table fix (fossil-port spmi_arb.c): reads through channel 0
+ * hit whatever peripheral was first in the arb table, which is exactly where
+ * the junk came from. The pwr1 census re-test through the fixed arbiter read
+ * soc=87 vb=4190 ib=-3 chg=0x45 usb=0x10 tbat=433 — every value plausible and
+ * mutually consistent (near-full cell trickling on USB, charger in terminate)
+ * — and the deferred-first-read canary proved no XPU reset. Gen 6 only; the
+ * Gen 4's PM8916 VM-BMS still returns the honest -1 stubs.
+ *
+ * FAIL-SAFES KEPT (learned 2026-08-03, they stay forever): the low-battery
+ * cutoff protects a KNOWN-dying, UNPLUGGED cell, so implausible readings must
+ * never power the watch off:
+ *   - a voltage below any boot-capable level (< 2500 mV) reports 0 (INVALID),
+ *     which the cutoff logic already ignores;
+ *   - an ERRORED usb-present read (-1) counts as PRESENT, never absent. */
+static int      board_batt_percent(void)
+{
+    /* Full-clamp: this cell sits at/above 4.15 V only when charge-terminated,
+     * but the FG's learned capacity can lag and report 9x% there. Anything
+     * >= 4150 mV is a full battery — report 100. */
+    int pct = fg_batt_percent();
+    if (pct >= 0 && fg_batt_mv() >= 4150) return 100;
+    return pct;
+}
+static bool     board_power_ok(void)             { return fg_batt_percent() >= 0; }
+static bool     board_power_begin(void)          { return board_power_ok(); }
+static void     board_power_full_init(void)      {}   /* gauge runs autonomously */
+static void     board_power_sleep_charge_cfg(void) {}
+static uint16_t board_batt_voltage_mv(void)
+{
+    int mv = fg_batt_mv();
+    return (mv < 2500) ? 0 : (uint16_t)mv;           /* fail-safe: junk = 0 */
+}
+static bool     board_vbus_in(void)
+{
+    return chg_usb_present() != 0;                   /* fail-safe: err = present */
+}
+static bool     board_usb_powered(void)          { return board_vbus_in(); }
+static uint16_t board_vbus_voltage_mv(void)
+{
+    /* No validated VBUS ADC channel yet — report nominal USB when present. */
+    return board_vbus_in() ? 5000 : 0;
+}
+static bool     board_is_charging(void)          { return chg_charging() == 1; }
+static float    board_pmu_temp_c(void)
+{
+    /* Closest analog to the AXP2101 "PMU die" reading: the FG's battery
+     * thermistor (charge-path heat shows up here the same way). */
+    int dc = fg_batt_temp_dc();
+    return (dc == -9999) ? -273.0f : (float)dc / 10.0f;
+}
+#elif BOARD_HAS_GAUGE_BQ27220 || BOARD_HAS_CHARGER_BQ25896
+/* ===== BQ27220 fuel gauge + BQ25896 charger (T-Deck Pro) ====================
+ * Two chips, two jobs, both on the shared I2C bus:
+ *   - the GAUGE answers questions about the CELL (percent, mV, temp, health).
+ *     It coulomb-counts autonomously, including through deep sleep, so there is
+ *     nothing to initialise and nothing to service — reads are always current.
+ *   - the CHARGER answers questions about the INPUT (VBUS present, charge state).
+ *
+ * Presence is probed ONCE at boot and cached: these helpers are called from the
+ * loop (the VBUS poll runs twice a second) and re-probing a missing chip on
+ * every call would put a doomed I2C transaction on the shared bus each time.
+ * A chip that fails its probe reports the standard "no data" sentinels, so the
+ * UI degrades exactly as it does on a board with no battery hardware at all. */
+static bool s_bq_gauge_ok = false;
+static bool s_bq_chg_ok   = false;
+
+static bool     board_power_begin(void)
+{
+#if BOARD_HAS_GAUGE_BQ27220
+  s_bq_gauge_ok = bq27220_begin();
+#endif
+#if BOARD_HAS_CHARGER_BQ25896
+  s_bq_chg_ok   = bq25896_begin();
+#endif
+  return s_bq_gauge_ok || s_bq_chg_ok;
+}
+/* "Power subsystem usable" gates the Power app's graphs and the battery UI. The
+ * GAUGE is what those need; a charger alone gives no percentage to plot. */
+static bool     board_power_ok(void)             { return s_bq_gauge_ok; }
+static void     board_power_full_init(void)      {}   /* both run autonomously */
+static void     board_power_sleep_charge_cfg(void) {}
+
+#if BOARD_HAS_GAUGE_BQ27220
+static int      board_batt_percent(void)         { return s_bq_gauge_ok ? bq27220_soc() : -1; }
+static uint16_t board_batt_voltage_mv(void)      { return s_bq_gauge_ok ? bq27220_voltage_mv() : 0; }
+static float    board_pmu_temp_c(void)           { return s_bq_gauge_ok ? bq27220_temp_c() : -273.0f; }
+#else
+static int      board_batt_percent(void)         { return -1; }
+static uint16_t board_batt_voltage_mv(void)      { return 0; }
+static float    board_pmu_temp_c(void)           { return -273.0f; }
+#endif
+
+#if BOARD_HAS_CHARGER_BQ25896
+/* VBUS presence comes from the CHARGER's power-good bit, not from the gauge's
+ * current sign: "is the watch plugged in" must stay true when the battery is
+ * full and current has fallen to zero. */
+static bool     board_vbus_in(void)              { return s_bq_chg_ok && bq25896_vbus_present(); }
+static bool     board_is_charging(void)          { return s_bq_chg_ok && bq25896_is_charging(); }
+static uint16_t board_vbus_voltage_mv(void)      { return s_bq_chg_ok ? bq25896_vbus_mv() : 0; }
+#elif BOARD_HAS_GAUGE_BQ27220
+/* Gauge only: fall back to its charging flag as a proxy for "on power". Weaker —
+ * it goes false once charge terminates even though USB is still attached. */
+static bool     board_vbus_in(void)              { return s_bq_gauge_ok && bq27220_is_charging(); }
+static bool     board_is_charging(void)          { return board_vbus_in(); }
+static uint16_t board_vbus_voltage_mv(void)      { return board_vbus_in() ? 5000 : 0; }
+#endif
+static bool     board_usb_powered(void)          { return board_vbus_in(); }
+
 #else
 static bool     board_power_ok(void)             { return false; }
 static bool     board_power_begin(void)          { return false; }
@@ -546,7 +675,20 @@ static float    board_pmu_temp_c(void)           { return -273.0f; }
 #endif
 static void     board_set_core_rail_mv(uint16_t) {}
 static bool     board_power_acks(void)           { return false; }
+#if BOARD_PLATFORM_FOSSIL
+/* Fossil Gen 4 has no accessible PMU power-off path yet (PM8916 over SPMI is a
+ * later driver) AND no button force-reset, so the useful "power off" action on
+ * this watch is a warm reboot back to the stock boot chain: the screen goes
+ * dark, the user is out of our firmware, and the watch comes back to Wear OS
+ * (from which it can be re-launched or re-flashed). reboot_now() is the
+ * bare-metal msm8909 reset (platform/reboot_msm.c); it does not return.
+ * Returns true because it DID issue the shutdown — the caller must NOT then
+ * fall through to a deep-sleep path. */
+extern "C" void reboot_now(void);
+static bool     board_power_off(void)            { reboot_now(); return true; }
+#else
 static bool     board_power_off(void)            { return false; }
+#endif
 
 /* Placeholder rail surface so sleep_power.h compiles until its rail machinery
  * is gated for PMU-less boards (next extraction step). RAIL_COUNT stays >=1

@@ -5,6 +5,13 @@
 # layout: the user doesn't use OTA (flashes over USB), so we drop the second app slot
 # (app1) AND otadata, reclaiming ~2 MB that becomes the FFat data volume.
 #
+# NO OTA -- AND IT CANNOT HAVE IT. This was re-checked when OTA was added to the
+# other tables (2026-08-28): the S3 build measures 2,115,440 B, so two app slots
+# need 2 x 2.5 MB = 5 MB before nvs, otadata, FFat or coredump are counted. Total
+# flash is 4 MB. It is over by ~2.1 MB, and no amount of shrinking FFat helps --
+# the app slots alone exceed the part. This board stays cable-flashed; the update
+# check still runs and will simply report that no installer is available here.
+#
 # WHY NO app1 / otadata:
 #   - app0 + app1 are an OTA ping-pong PAIR — two full app copies so an update can be
 #     written to the idle slot, verified, then booted (with rollback). That costs 2x

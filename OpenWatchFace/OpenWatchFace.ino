@@ -5,6 +5,8 @@
  *  Waveshare ESP32-C6-Touch-LCD-1.47
  *  Waveshare Tuya T5-E1-Touch-AMOLED-1.75
  *  Waveshare ESP32-S3-Touch-AMOLED-1.8
+ *  Waveshare ESP32-S3-Touch-AMOLED-1.64
+ *  Waveshare ESP32-S3-Touch-LCD-2
  *
  *  REQUIREMENTS:
  *    - esp32 (Espressif Systems) = v3.3.11
@@ -33,7 +35,10 @@
 #include "tuya/owf_tuya_port.h"      // panel/touch registration, power latch, sleep, backlight (tkl shims)
 #include "tuya/owf_tuya_lvgl_own.h"  // OUR OWN LVGL v9.5 (replaces the SDK vendor v8) - display+indev+flush
 #endif
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_FOSSIL
+#include "owf_fossil_lvgl.h"         // fossil-port LVGL v9.5 on the continuous-splash framebuffer
+#endif
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
 #include "Arduino_GFX_Library.h"   // Arduino_GFX panel driver — not used when an external framework owns the display
 #endif
 #if BOARD_TOUCH_FT3168
@@ -133,6 +138,19 @@
 
 HWCDC USBSerial;
 
+/* Reset pin, shared by EVERY firmware-owned panel path below: boards that break one
+ * out define LCD_RESET; some do not (the S3-1.8 and the S3-Touch-LCD-2 — deliberately,
+ * see the note in their board headers: a defined-but-negative pin macro would satisfy
+ * every "#ifdef LCD_RESET" guard and then feed -1 to a GPIO API). Arduino_TFT wants
+ * GFX_NOT_DEFINED in that case, and that constant is an Arduino_GFX one, so it is
+ * spelled HERE where the library is in scope — and OUTSIDE the per-panel branches so
+ * the SPI panels can use it too, not just the QSPI AMOLEDs. */
+#if BOARD_LCD_HAS_RESET
+#define OWF_LCD_RST LCD_RESET
+#else
+#define OWF_LCD_RST GFX_NOT_DEFINED
+#endif
+
 #if BOARD_DISPLAY_AMOLED_QSPI
 /* ---- Display: QSPI AMOLED (Waveshare's exact construction) -----------------
  * Two panels share this path — CO5300 (S3-2.06) and SH8601 (S3-1.8 HW V1). The
@@ -151,16 +169,7 @@ typedef Arduino_CO5300 OwfAmoled;
 #else
 typedef Arduino_SH8601 OwfAmoled;
 #endif
-/* Reset pin: boards that break one out define LCD_RESET; the S3-1.8 does not
- * (deliberately — see the note in its board header: a defined-but-negative pin
- * macro would satisfy every "#ifdef LCD_RESET" guard and then feed -1 to a GPIO
- * API). Arduino_TFT wants GFX_NOT_DEFINED in that case, and that constant is an
- * Arduino_GFX one, so it is spelled HERE where the library is in scope. */
-#if BOARD_LCD_HAS_RESET
-#define OWF_LCD_RST LCD_RESET
-#else
-#define OWF_LCD_RST GFX_NOT_DEFINED
-#endif
+/* (OWF_LCD_RST is defined once above, ahead of all the panel branches.) */
 OwfAmoled *amoled = new OwfAmoled(
   bus, OWF_LCD_RST, 0 /* rotation */, LCD_WIDTH, LCD_HEIGHT,
   LCD_COL_OFFSET1, LCD_ROW_OFFSET1, LCD_COL_OFFSET2, LCD_ROW_OFFSET2);
@@ -169,6 +178,12 @@ Arduino_GFX *gfx = amoled;
 /* Bus-typed pointer for the async flush: writePixelsBeAsync()/waitAsync() are
  * LOCAL PATCH additions on Arduino_ESP32QSPI, not the Arduino_DataBus base. */
 Arduino_ESP32QSPI *qspi_bus = static_cast<Arduino_ESP32QSPI *>(bus);
+
+/* Per-panel vendor register table applied after gfx->begin(). Only the 1.64
+ * needs one so far (the library's generic SH8601 init omits the 0xC4 SPI-mode
+ * command that module requires, leaving the panel black). Compiles to nothing on
+ * every other board — same arrangement as display_jd9853.h below. */
+#include "display_sh8601_164.h"
 
 #elif BOARD_DISPLAY_JD9853_SPI
 /* ---- Display: JD9853 LCD over classic SPI (ST7789-class controller). The
@@ -201,6 +216,29 @@ Arduino_ESP32SPIDMA *spidma_bus = static_cast<Arduino_ESP32SPIDMA *>(bus);
 Arduino_TFT *spidma_tft = static_cast<Arduino_TFT *>(gfx);
 #include "display_jd9853.h"
 
+#elif BOARD_DISPLAY_ST7789_SPI
+/* ---- Display: genuine ST7789T3 240x320 LCD over classic SPI (S3-Touch-LCD-2).
+ * Same SPI-DMA bus + async-flush plumbing as the JD9853 path above (spidma_bus /
+ * spidma_tft), and literally the same Arduino_ST7789 panel class — but where the
+ * JD9853 is an ST7789-*class* controller needing a vendor register table after
+ * begin(), this is a REAL ST7789 whose init the library performs completely. So
+ * there is deliberately NO display_*.h include here.
+ *
+ * MISO is passed because the microSD SHARES this SPI host (BOARD_SD_SHARES_LCD_BUS)
+ * and does read data back; the panel itself is write-only. IPS = true: this is an
+ * IPS panel, so the library applies the inversion this module needs (the JD9853
+ * boards pass false and get their inversion from the vendor table's 0x21).
+ * LCD_RESET does not exist on this board -> OWF_LCD_RST resolves to GFX_NOT_DEFINED
+ * via BOARD_LCD_HAS_RESET=0. */
+Arduino_DataBus *bus = new Arduino_ESP32SPIDMA(
+  LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, LCD_MISO, FSPI, false /* don't hold the bus */);
+Arduino_GFX *gfx = new Arduino_ST7789(
+  bus, OWF_LCD_RST, 0 /* rotation */, true /* IPS */, LCD_WIDTH, LCD_HEIGHT,
+  LCD_COL_OFFSET1, LCD_ROW_OFFSET1, LCD_COL_OFFSET2, LCD_ROW_OFFSET2);
+
+Arduino_ESP32SPIDMA *spidma_bus = static_cast<Arduino_ESP32SPIDMA *>(bus);
+Arduino_TFT *spidma_tft = static_cast<Arduino_TFT *>(gfx);
+
 #elif BOARD_DISPLAY_GC9A01_SPI
 /* ---- Display: GC9A01 240x240 ROUND LCD over classic SPI (custom Super Mini build).
  * Same SPI-DMA bus + async-flush plumbing as the JD9853 path above (Arduino_TFT /
@@ -215,6 +253,19 @@ Arduino_GFX *gfx = new Arduino_GC9A01(
 
 Arduino_ESP32SPIDMA *spidma_bus = static_cast<Arduino_ESP32SPIDMA *>(bus);
 Arduino_TFT *spidma_tft = static_cast<Arduino_TFT *>(gfx);
+
+#elif BOARD_DISPLAY_EPD_GDEQ031T10
+/* ---- Display: GDEQ031T10 320x240 E-PAPER over SPI (T-Deck Pro) -------------
+ * NO Arduino_GFX object on this board. GxEPD2 owns the panel and its SPI host
+ * outright, so the `gfx` / `bus` pointers the other branches construct do not
+ * exist here — every use of them is already gated by a display flag, and the
+ * remaining raw-panel helper (low_batt_splash) is compiled out for this board.
+ *
+ * The panel is not emissive and cannot be repainted per dirty tile, so the whole
+ * integration is inverted relative to every other board: my_disp_flush() writes
+ * into a 1bpp shadow buffer and returns, and epd_service() in loop() drives the
+ * actual refresh. display_epd_gdeq031t10.h holds the full explanation. */
+#include "display_epd_gdeq031t10.h"
 #endif
 
 /* Board-neutral brightness (0-255). CO5300: panel command. JD9853: PWM backlight
@@ -229,6 +280,15 @@ static inline void board_display_set_brightness(uint8_t b) {
   owf_maix_set_backlight((int)b * 100 / 255);   // firmware uses 0..255; MaixCDK wants 0..100
 #elif BOARD_PLATFORM_TUYA
   owf_tuya_set_backlight((int)b * 100 / 255);   // firmware uses 0..255; TuyaOpen display wants 0..100
+#elif BOARD_DISPLAY_EPD_GDEQ031T10
+  // Reflective e-paper: no panel brightness exists. The one lamp on the board
+  // is the KEYBOARD backlight, so the brightness control drives that instead
+  // (and 0 really means off — the shade's floor is 0% on this board).
+  board_tdeck_kbd_backlight(b);
+#elif BOARD_PLATFORM_FOSSIL
+  // AUO AMOLED is bl_ctrl_dcs: brightness IS panel command 0x51, sent over
+  // our own DSI host (fossil-port dsi_dcs.c). Same command family as CO5300.
+  dsi_dcs_set_brightness(b);
 #endif
 }
 
@@ -239,10 +299,16 @@ static inline void board_display_set_brightness(uint8_t b) {
  * is built). gfx->begin() must have run (it has, at this point in setup).
  * Board-neutral: shown on both the S3 (AXP2101 gauge) and C6 (ADC). */
 static void low_batt_splash(uint16_t hold_ms) {
-#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL || BOARD_DISPLAY_DEFERRED_REFRESH
   /* Raw Arduino_GFX panel draw — no gfx object when an external framework owns the
-   * panel (Maix/Tuya). A LVGL low-battery splash can replace this later; for now it's
-   * a no-op (the low-batt path still proceeds). */
+   * panel (Maix/Tuya), nor on an e-paper board (GxEPD2 owns it and there is no
+   * `gfx` at all). A LVGL low-battery splash can replace this later; for now it's
+   * a no-op (the low-batt path still proceeds).
+   *
+   * On e-paper the omission costs little: this splash exists so an empty cell
+   * doesn't just go dark with no explanation, but the panel RETAINS whatever was
+   * last shown after power is cut, so the screen never goes blank-and-unexplained
+   * the way an emissive one does. */
   (void)hold_ms;
 #else
   const int W = gfx->width(), H = gfx->height();
@@ -294,8 +360,31 @@ void Arduino_IIC_Touch_Interrupt(void) {
 /* ---- Touch: AXS5106L over I2C (Waveshare bsp_touch helper library) -------- */
 #include "esp_lcd_touch_axs5106l.h"
 static volatile bool s_touch_activity = false;   // set whenever a finger is seen
+
+#elif BOARD_TOUCH_CST816
+/* ---- Touch: CST816D over I2C (in-tree driver; polled, no INT line) -------- */
+#include "touch_cst816.h"
+static volatile bool s_touch_activity = false;   // set whenever a finger is seen
+
+#elif BOARD_TOUCH_CST328
+/* ---- Touch: CST328 over I2C (in-tree driver; T-Deck Pro) ------------------
+ * A DIFFERENT chip from the CST816 above despite the name — 0x1A vs 0x15 and a
+ * 28-byte validated status block instead of single-byte registers. Polled from
+ * my_touchpad_read() like the CST816; this board DOES break out an INT line
+ * (TP_INT 12) but nothing attaches an ISR to it yet, so the poll is the only
+ * source of touch activity. */
+#include "touch_cst328.h"
+static volatile bool s_touch_activity = false;   // set whenever a finger is seen
 #else  /* BOARD_TOUCH_MAIX — MaixCDK owns the touch indev; keep the loop's idle-refresh flag */
 static volatile bool s_touch_activity = false;
+#endif
+
+#if BOARD_HAS_KEYBOARD_TCA8418
+/* ---- Physical QWERTY keyboard (TCA8418 matrix scanner) --------------------
+ * Registers an ADDITIONAL keypad indev in setup(); it does NOT replace touch.
+ * Outside the touch #if/#elif chain above because it is orthogonal to which
+ * pointer device the board has. */
+#include "keyboard_tca8418.h"
 #endif
 
 /* Set on a BOOT-button press edge; consumed in loop() to force-undim the panel (self-heals a
@@ -376,6 +465,15 @@ static void haptics_attach_click_feedback(void);
  * Reading is the real cell voltage, not VBUS. The strike counter is a shared
  * function-local static. `need` lets the boot/wake one-shots require fewer polls. */
 static bool board_low_batt_cutoff_check(uint8_t need) {
+#if BOARD_PLATFORM_FOSSIL
+  /* NO CUTOFF ON FOSSIL until the PM660 SMB/FG registers are validated on
+   * hardware. The reads are environment-dependent junk: booted from the
+   * recovery partition they returned "unplugged + low cell" on a 100%
+   * charged, USB-connected watch, and this check power-cycled every boot at
+   * ~3 s (2026-08-03). A protection that fires on garbage protects nothing. */
+  (void)need;
+  return false;
+#else
   static uint8_t strikes = 0;
   // T5 note: the divider ratio is now calibrated against a multimeter (4.20 V real), and
   // board_usb_powered() reads the real BAT_CHG pin (GPIO30) - so the cutoff is trustworthy
@@ -390,6 +488,7 @@ static bool board_low_batt_cutoff_check(uint8_t need) {
     strikes = 0;
   }
   return false;
+#endif /* BOARD_PLATFORM_FOSSIL */
 }
 /* Runtime poll (full strike count). */
 static inline bool board_low_batt_should_cutoff(void) {
@@ -470,6 +569,34 @@ RTC_DATA_ATTR static uint32_t rtc_last_ntp_epoch = 0;
  * so net headroom is still ~20KB ABOVE . */
 // #define DIRECT_RENDER_MODE
 #define PARTIAL_BUF_LINES BOARD_PARTIAL_BUF_LINES  // lines per partial buffer (x2) — per-board, see board_*.h
+
+/* ---- Full-screen single framebuffer, board-scoped -------------------------
+ * BOARD_LVGL_FULL_PSRAM_FB: allocate ONE full-screen LVGL buffer in PSRAM
+ * instead of the two partial line-buffers in SRAM.
+ *
+ * This is NOT a performance change and is not expected to be one. On an e-paper
+ * board the panel waveform dominates by an order of magnitude (write=20ms vs
+ * wait=700ms), and PSRAM is slower for the CPU than SRAM.
+ *
+ * It is a CORRECTNESS/DEBUGGING change, and specific to the T-Deck Pro's EPD:
+ * with one full-screen buffer LVGL always hands the flush a single whole-panel
+ * area, so the shadow buffer is always fed a complete frame and the dirty box
+ * is always the full panel. That removes partial-window addressing entirely as
+ * a variable, which is what the custom register-LUT waveform needs in order to
+ * be tuned in isolation — the fast LUT was observed to render only when the
+ * redraw area was large, so small windows must be ruled out before the LUT
+ * itself can be judged.
+ *
+ * Costs ~150 KB of PSRAM (240*320*2) and frees the ~84 KB the two SRAM line
+ * buffers were using. */
+#ifndef BOARD_LVGL_FULL_PSRAM_FB
+#define BOARD_LVGL_FULL_PSRAM_FB 0
+#endif
+#if BOARD_LVGL_FULL_PSRAM_FB
+#define OWF_FULL_FB_MODE 1
+#else
+#define OWF_FULL_FB_MODE 0
+#endif
 static uint32_t screenWidth, screenHeight, bufSize;
 static lv_display_t *disp;
 static lv_color_t *disp_draw_buf;
@@ -497,7 +624,7 @@ static uint32_t lastMillis = 0;
 #include "watch_base.h"
 #include "player_state.h"      // source-agnostic Now Playing state (fed by AMS/HTTP/Android)
 #include "cpu_usage.h"         // power-safe per-core CPU usage estimate (idle-hook based; for the Power app)
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
 #include "core_voltage.h"      // EXPERIMENTAL core (dig_dbias) undervolt — default OFF, see it's header
 #include "clocks.h"            // read-only clock-tree dump (observability for the overclock work)
 #include "overclock.h"         // EXPERIMENTAL CPU overclock (>240 MHz) — default OFF, see it's header
@@ -507,6 +634,8 @@ static uint32_t lastMillis = 0;
 #include "tuya/compat/esp_clk_stubs.h"  // Tuya: same SoC-register modules stubbed (no MCU clock tuning)
 #endif
 #include "settings_store.h"
+#include "weather_store.h"    // weather model + NVS location/snapshot + WMO->icon map
+                              // (after settings_store.h: uses `prefs`; after watch_base.h: store_lock)
 #include "power_model.h"
 #include "haptics.h"          // vibration motor (GPIO18) — non-blocking pattern player
 #define AUDIO_SMALL_SPEAKER 0 // 1 = THIS if watch has the tiny in-ear speaker mod (full drive).
@@ -560,6 +689,9 @@ static uint8_t      rails_cut_count(void);
  *     they use the shell and define their own app_open_*.
  *   - app_settings.h LAST of the settings group: it dispatches to
  *     app_open_power / _wifi_ble, so those must be defined first. */
+/* Software-update CHECK (no installer yet). Before the app screens because
+ * app_wifi_ble.h hosts its button; self-contained, so order is free. */
+#include "ota_check.h"
 #include "screen_cache.h"       // PSRAM pre-render cache: blit a static screen instantly on open, then render live over it
 #include "app_menu.h"
 #include "app_power.h"
@@ -572,10 +704,21 @@ static uint8_t      rails_cut_count(void);
                                 // whole file preprocesses away on touch boards)
 #include "app_appearance.h"     // accent-color picker (uses quick_shade_restyle + ui_accent_*)
 #include "app_timer.h"          // Timer + Stopwatch + alarm overlay (uses timer_store + haptics)
+#include "crown_nav.h"          // rotating crown -> scroll / quick-shade (BOARD_HAS_CROWN only;
+                                // whole file preprocesses away without a crown). AFTER app_timer.h:
+                                // it reads g_alarm_active, and after quick_shade.h/app_menu.h.
 #include "app_find_phone.h"     // Find My Phone: ring the paired phone (uses ble_ping_phone)
 #include "app_files.h"          // Files: on-device browser for FFat + SD (view/delete/space)
+#include "app_gallery.h"        // Gallery: browse photos/videos on SD + FFat (any PSRAM board
+                                // with esp_jpeg — no camera needed; tile gated on OWF_HAS_GALLERY).
+                                // Pulls in media_codecs.h (JPEG/PNG/BMP/GIF stills) and
+                                // media_video.h (AVI/MJPEG/animated-GIF playback)
+#include "app_camera.h"         // Camera: viewfinder + recorder (BOARD_HAS_CAMERA boards only;
+                                // compiles to nothing elsewhere, and its tile is gated too)
 #include "app_fitness.h"        // Fitness: step counter (uses imu_steps + i2c_lock)
 #include "app_sleep.h"          // Sleep: sleep-quality tracking + DND (uses sleep_track)
+#include "app_weather.h"        // Weather: current + forecast + graph (reads weather_store;
+                                // weather_request_fetch forward-declared in watch_base.h)
 
 /* BOOT button: BOOT_BTN_GPIO comes from the board header. While the watch is
  * running we can read it as a normal input (LOW = pressed, it has a pull-up).
@@ -621,7 +764,7 @@ static void notif_card_create(void) {
   lv_obj_set_style_text_font(notif_title, &FONT_LABEL, 0);
   lv_obj_set_style_text_color(notif_title, lv_color_white(), 0);
   lv_obj_align(notif_title, LV_ALIGN_TOP_LEFT, 0, 0);
-  lv_label_set_long_mode(notif_title, LV_LABEL_LONG_DOT);
+  ui_label_single_line(notif_title);
   lv_obj_set_width(notif_title, 300);
 
   notif_body = lv_label_create(notif_card);
@@ -831,7 +974,7 @@ static bool s_flush_async = false;
 /* Glyph-buffer allocator for LVGL's FONT draw-buf handlers (hooked in setup —
  * see the comment there). lv_draw_buf_handlers_t's fields live in a private
  * header; including it is fine, the lib is vendored in this repo. */
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA   /* glyph font-handler tuning: LVGL-internal + ESP-patch APIs; unused when an external framework (Maix/Tuya) owns LVGL */
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL   /* glyph font-handler tuning: LVGL-internal + ESP-patch APIs; unused when an external framework (Maix/Tuya) owns LVGL */
 #include <draw/lv_draw_buf_private.h>
 static void *glyph_buf_malloc(size_t size, lv_color_format_t cf) {
   (void)cf;
@@ -850,7 +993,7 @@ static void glyph_buf_free(void *p) {
 extern "C" void lv_font_fmt_txt_glyph_cache_init(void);
 #endif  /* glyph font-handler tuning - excluded when Maix/Tuya owns LVGL */
 
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
 /* The firmware's own panel flush + touch read. When an external framework owns LVGL
  * (Maix: MaixCDK lvgl_init; Tuya: the SDK lv_vendor task - both create the LVGL
  * display/indev), and the Arduino_GFX `gfx`/SPI-bus objects don't exist, so this whole
@@ -1053,7 +1196,15 @@ static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_ma
     gfx->endWrite();
   }
 #endif  /* BOARD_DISPLAY_SPIDMA */
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  // E-PAPER: the flush does NOT reach the glass. Threshold this RGB565 tile into
+  // the 1bpp shadow buffer and return immediately; epd_service() in loop() pushes
+  // the panel at most every EPD_MIN_REFRESH_MS. Pushing here instead would cost
+  // 0.5-3 s of flashing PER DIRTY TILE. See display_epd_gdeq031t10.h.
+  epd_blit_tile(area, px_map);
+#else
   gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+#endif
 #if CPU_PROFILE_SERIAL
   s_flush_us += (uint32_t)(micros() - f0);
   s_flush_calls++;
@@ -1063,6 +1214,58 @@ static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_ma
   s_lvgl_drew = true;        // LVGL re-rendered -> the loop will push the panel once
   lv_disp_flush_ready(d);
 }
+
+#if BOARD_TOUCH_CST328
+/* ---- CST328 sampling, decoupled from the LVGL indev poll ------------------
+ * Called from TWO places, deliberately:
+ *   - loop(), every iteration (the normal case), and
+ *   - the e-paper's busy callback, DURING a panel refresh.
+ *
+ * The second one is the point. A refresh blocks for 0.7-1.1 s; without sampling
+ * inside it, a tap that starts or ends mid-refresh is not observed until the
+ * refresh finishes. Presses then look stretched by up to a full refresh — the
+ * "+10s button stays held for two seconds" symptom.
+ *
+ * The debounce here is TIME-based (millis), not poll-count based. That matters
+ * precisely because the poll rate is now wildly irregular: fast in the loop,
+ * slower inside a busy wait. A count-based debounce would mean different real
+ * durations depending on what the panel happened to be doing.
+ *
+ * SAFE FROM THE BUSY CALLBACK: touches only I2C and plain variables — no panel,
+ * no SPI, no LVGL calls, no blocking. See the rules in display_epd_gdeq031t10.h.
+ *
+ * State is file-scope (not function-static) so my_touchpad_read() can report it. */
+static bool     s_c328_pressed  = false;   /* debounced state handed to LVGL */
+static int32_t  s_c328_x = 0, s_c328_y = 0;/* last live coordinates */
+static uint32_t s_c328_up_since = 0;       /* millis() when the driver first said "up" */
+
+/* Hold a press this long after the driver reports "no finger", to bridge the
+ * single-poll dropouts this controller family produces mid-touch. Kept SHORT:
+ * every extra ms here is felt directly as a button that stays lit after release,
+ * and with mid-refresh sampling the dropouts are now caught quickly anyway. */
+#define CST328_REL_DEBOUNCE_MS 25
+
+static void cst328_poll(void) {
+  int32_t tx = 0, ty = 0;
+  i2c_lock();                     /* keyboard, charger, gauge share this bus */
+  bool finger_down = cst328_read(&tx, &ty);
+  i2c_unlock();
+
+  uint32_t now = millis();
+  if (finger_down) {
+    s_c328_x = tx;
+    s_c328_y = ty;
+    s_c328_pressed  = true;
+    s_c328_up_since = 0;          /* cancel any pending release */
+    lastActivityMs  = now;
+    s_touch_activity = true;      /* no touch ISR attached — the poll is the only source */
+    notif_dismiss();              /* a tap clears any notification card */
+  } else if (s_c328_pressed) {
+    if (s_c328_up_since == 0) s_c328_up_since = now;
+    if (now - s_c328_up_since >= CST328_REL_DEBOUNCE_MS) s_c328_pressed = false;
+  }
+}
+#endif  /* BOARD_TOUCH_CST328 */
 
 static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   // While BOOT is held, report "released" and ignore touch entirely so a stray
@@ -1082,11 +1285,21 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   // "released" with ZERO I2C. While a finger IS down we keep polling at the full
   // rate (monitor mode keeps the flag false during a hold — the s_tp_was_down
   // latch covers that), so drag/scroll tracking is completely unaffected.
+  //
+  // BOARD_HAS_TOUCH_INT: this fast path REQUIRES a real interrupt line, because
+  // IIC_Interrupt_Flag is only ever set by the touch ISR. On a board whose INT is
+  // not broken out (TP_INT -1, e.g. the S3-1.64) the flag would be permanently
+  // false and this early-out would report "released" forever — touch completely
+  // dead, with the I2C read below never reached. Such boards skip the early-out
+  // and poll the controller every LVGL tick, which is what their vendor demo does
+  // too; the cost is the ~0.5 ms triple-read that the interrupt would have saved.
   static bool s_tp_was_down = false;
+#if BOARD_HAS_TOUCH_INT
   if (!FT3168->IIC_Interrupt_Flag && !s_tp_was_down) {
     data->state = LV_INDEV_STATE_REL;
     return;
   }
+#endif
 
   i2c_lock();   // shared bus: don't interleave with the net task's RTC ops (core 0)
   int32_t fingers = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
@@ -1172,6 +1385,71 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   } else {
     data->state = LV_INDEV_STATE_REL;
   }
+#elif BOARD_TOUCH_CST816
+  // CST816D via the in-tree driver (touch_cst816.h) — POLLED: this board breaks out
+  // no INT line, so every LVGL indev poll does the I2C read. cst816_read() returns
+  // true only while a finger is genuinely down, so the stale-coordinate trap (the
+  // chip never clears X/Y on release) can't reach LVGL.
+  int32_t tx = 0, ty = 0;
+  i2c_lock();                       // the QMI8658 IMU shares this bus
+  bool finger_down = cst816_read(&tx, &ty);
+  i2c_unlock();
+
+  // RELEASE DEBOUNCE — same treatment as the AXS5106L above and for the same
+  // reason: a polled single-point controller intermittently reports "no finger"
+  // for one poll in the middle of ONE continuous touch. Handed straight to LVGL,
+  // each dropout ends the press and starts a new one, so a single tap fires
+  // CLICKED repeatedly. Hold the press (at the last live coordinates) until the
+  // driver has said "up" continuously for CST816_REL_DEBOUNCE_MS; a real lift
+  // still releases promptly and drags track normally.
+  #define CST816_REL_DEBOUNCE_MS  60   // > a single dropped poll, < a real tap-release feel
+  static bool     s_cst_pressed  = false;  // debounced state reported to LVGL
+  static int32_t  s_cst_x = 0, s_cst_y = 0;// last live coordinates (held across dropouts)
+  static uint32_t s_cst_up_since = 0;      // millis() when the driver first said "up"
+  uint32_t cst_now = millis();
+
+  if (finger_down) {
+    s_cst_x = tx;
+    s_cst_y = ty;
+    s_cst_pressed  = true;
+    s_cst_up_since = 0;             // cancel any pending release
+    lastActivityMs = cst_now;
+    s_touch_activity = true;        // no touch ISR on this board — the poll is the only source
+    notif_dismiss();                // a tap clears any notification card
+  } else if (s_cst_pressed) {
+    if (s_cst_up_since == 0) s_cst_up_since = cst_now;
+    if (cst_now - s_cst_up_since >= CST816_REL_DEBOUNCE_MS) s_cst_pressed = false;  // real lift
+  }
+
+  if (s_cst_pressed) {
+    data->state   = LV_INDEV_STATE_PR;
+    data->point.x = s_cst_x;
+    data->point.y = s_cst_y;
+  } else {
+    data->state = LV_INDEV_STATE_REL;
+  }
+
+#elif BOARD_TOUCH_CST328
+  // CST328: the state is maintained by cst328_poll() (above), NOT read here.
+  //
+  // WHY THE POLL IS SEPARATE ON THIS BOARD. Every other board polls the
+  // controller right here, once per LVGL indev period. That works because their
+  // flush returns in milliseconds. This panel's refresh BLOCKS for 0.7-1.1 s, so
+  // an indev-only poll cannot see anything that happens during a refresh — and a
+  // quick tap can begin AND end inside one. The result is a press registered late
+  // and released even later: the "button held for two seconds" symptom.
+  //
+  // Instead cst328_poll() runs from BOTH the loop and the panel's busy callback
+  // (see epd_set_busy_callback in setup), so touch keeps being sampled at full
+  // rate even mid-refresh. This callback just reports the latest debounced state.
+  if (s_c328_pressed) {
+    data->state   = LV_INDEV_STATE_PR;
+    data->point.x = s_c328_x;
+    data->point.y = s_c328_y;
+  } else {
+    data->state = LV_INDEV_STATE_REL;
+  }
+
 #else
   // No capacitive touch panel (BOARD_TOUCH_BUTTONS, e.g. the Super Mini). This POINTER
   // indev always reports "released" — navigation comes from the physical UP/DOWN/SELECT
@@ -1180,9 +1458,89 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   data->state = LV_INDEV_STATE_REL;
 #endif
 }
+#if BOARD_HAS_KEYBOARD_TCA8418
+/* ---- Keypad indev: the physical QWERTY (T-Deck Pro) ------------------------
+ * A SECOND LVGL indev alongside the touch pointer. LVGL's keypad indev model is
+ * one key per read call, so this drains ONE FIFO event per poll and holds it as
+ * pressed/released — draining the whole FIFO here would discard every key but
+ * the last.
+ *
+ * This is a TEXT keyboard with no arrow keys, so it does not drive UI navigation
+ * (touch does). The reachable LVGL key codes are LV_KEY_ENTER and
+ * LV_KEY_BACKSPACE; everything else is a literal character.
+ *
+ * SHIFT and SYM are handled here as modifier STATE (the keymap gives them the
+ * KB_KEY_SHIFT / KB_KEY_SYM sentinels, which never reach LVGL). Both apply
+ * ONLY WHILE PHYSICALLY HELD — hold shift + letter for a capital, hold sym +
+ * key for its secondary legend (BOARD_KB_ALTMAP) — exactly like a desktop
+ * keyboard. Deliberately NO sticky/one-shot latch: a latch means a stray tap
+ * silently remaps the next key, which reads as "the keyboard types the wrong
+ * characters". */
+static void my_keypad_read(lv_indev_t *indev, lv_indev_data_t *data) {
+  static uint32_t s_kb_key   = 0;      // last key reported (held across the release)
+  static uint8_t  s_kb_code  = 0xFF;   // raw matrix code of that key (release matching:
+                                       //   the decoded key changes when a modifier is
+                                       //   dropped mid-hold, the matrix position doesn't)
+  static bool     s_kb_held  = false;
+  static bool     s_shift_held = false;
+  static bool     s_sym_held   = false;
+
+  uint8_t code = 0;
+  bool pressed = false;
+
+  i2c_lock();                          // touch, PMU, gauge and IMU share this bus
+  bool got = tca8418_pop(&code, &pressed);
+  i2c_unlock();
+
+  if (got) {
+    uint32_t base = tca8418_to_lvgl(code, false, false);
+    // Matrix-position breadcrumb (RAW position only — never the decoded char, so
+    // typed passwords don't echo to serial). This is how an unmapped key gets
+    // located: press it, read row/col here, add it to BOARD_KB_KEYMAP. The
+    // mic/second-shift columns were placed with exactly this.
+    if (pressed)
+      USBSerial.printf("[kb] raw=%u row=%u col=%u%s\n",
+                       code, (unsigned)(code / BOARD_KB_COLS),
+                       (unsigned)((BOARD_KB_COLS - 1) - (code % BOARD_KB_COLS)),
+                       base ? "" : " (unmapped)");
+    if (base == KB_KEY_SHIFT || base == KB_KEY_SYM) {
+      bool *held = (base == KB_KEY_SHIFT) ? &s_shift_held : &s_sym_held;
+      *held = pressed;                 // active exactly while the key is down
+      if (pressed) {
+        lastActivityMs   = millis();
+        s_touch_activity = true;
+      }
+    } else {
+      if (pressed) {
+        // Look up with the ACTIVE layers, not the base map: some keys exist ONLY
+        // in the sym layer (the mic key's secondary legend is the digit 0 — its
+        // base entry is 0/unmapped, so a base-map gate would swallow sym+mic).
+        uint32_t k = tca8418_to_lvgl(code, s_sym_held, s_shift_held);
+        if (k != 0) {                  // 0 = nothing on this position in the active layer
+          s_kb_key  = k;
+          s_kb_code = code;
+          s_kb_held = true;
+          lastActivityMs   = millis();
+          s_touch_activity = true;     // a keypress is user activity: hold off idle sleep
+          notif_dismiss();             // ...and clears a notification card, like a tap
+        }
+      } else if (code == s_kb_code) {
+        s_kb_held = false;             // release of the key we are currently reporting
+      }
+    }
+  }
+
+  data->key   = s_kb_key;
+  data->state = s_kb_held ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+  /* Tell LVGL more events are queued so it polls again promptly rather than
+   * waiting a full indev period per key — otherwise fast typing lags badly. */
+  data->continue_reading = got;
+}
+#endif  /* BOARD_HAS_KEYBOARD_TCA8418 */
+
 #endif  /* firmware-owned panel flush + touch read - excluded when Maix/Tuya owns LVGL */
 
-#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_MAIX || BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
 /* No firmware-owned async LCD DMA when an external framework owns the panel (Maix:
  * MaixCDK; Tuya: the SDK lv_vendor task), so there's nothing to fence. Provided here
  * because the gated block above (which holds the real one) is compiled out, yet
@@ -1229,16 +1587,30 @@ void setup() {
   // hides the issue). Must precede everything else so battery power holds immediately.
   owf_tuya_power_latch_on();
 #endif
+#ifdef BOARD_PWR_LATCH_GPIO
+  // FIRST: same soft-latch situation on ESP boards with a SYS_EN keep-alive (the
+  // S3-1.69) — assert it before anything else so battery power holds the moment
+  // the PWR key is released. Also releases the hold a deep-sleep wake carried over.
+  board_power_latch_on();
+#endif
   USBSerial.begin(115200);
+  OWF_STAGE(15);   /* fossil bring-up marker */
   USBSerial.println(DEVICE_NAME " v" DEVICE_VERSION " boot");
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+  /* T-Deck Pro: ground every unused peripheral enable IMMEDIATELY. Floating,
+   * the modem's boost EN drifts high, the A7682E boots (red STATUS LED lit,
+   * battery drain). Must run before the slow parts of setup() so the modem
+   * never gets a window to start; also releases the deep-sleep holds. */
+  board_tdeck_rails_off();
+#endif
 #if BOARD_PLATFORM_TUYA && OWF_T5_DEEP_SLEEP
-  // Deep-sleep PHASE 2: if the previous session requested deep sleep (double-press ->
-  // owf_tuya_deep_sleep_try -> controlled reboot), THIS is the quiet sleep-boot. Arms the
-  // wake buttons/timer AND the GPIO19 power-latch keep-status (so battery power survives the
-  // sleep), then enters deep sleep right here — never returns; the eventual button wake
-  // reboots into a normal setup(). No-op on a normal boot. Must run before any hardware
-  // init so the sleep-boot stays dark and fast.
+  // Deep-sleep wake detection: the PWR-quick-press entry (owf_tuya_deep_sleep_quick) leaves
+  // a kv marker; finding it means THIS boot is the wake. Sets the flag behind
+  // board_woke_from_button() (so the still-held PWR press is swallowed below) and clears
+  // any legacy reboot-design flags. No-op on a normal boot.
   owf_tuya_deep_sleep_boot_check();
+  if (owf_tuya_woke_from_deep_sleep())
+    rtc_last_notif_id = owf_tuya_ds_saved_notif_id();   // dedup id rode the kv marker (RAM lost)
 #endif
 
   // Release the wake-time pull hold on the BOOT pin so it works as a normal
@@ -1252,10 +1624,31 @@ void setup() {
   board_release_sleep_isolation();
 
 
+#if defined(STOP_SETUP2A)
+  /* Recovery 3 s bisect, point 4a: USBSerial + wake-release stubs done,
+   * settings_load NOT called. ~31 s = those are innocent. */
+  OWF_STAGE(1);
+  for (;;) { }
+#endif
   // Settings (interval, checks-enabled) are needed even on the light path.
   settings_load();
+#if defined(STOP_SETUP2B)
+  /* Recovery 3 s bisect, point 4b: settings_load survived. ~31 s = killer is
+   * in weather/timer/haptics/audio below; 3 s = settings_load is the killer. */
+  OWF_STAGE(1);
+  for (;;) { }
+#endif
+  OWF_STAGE(16);   /* fossil bring-up marker */
+  weather_load();          // weather location + last snapshot from NVS (falls back to preset)
   timer_load();            // countdown state (so a TIMER wake can ring it)
-  haptics_init();          // vibration motor pin (cheap; ready on every path)
+  haptics_init();
+#if BOARD_HAS_CROWN
+  /* Probe the crown's optical sensor. Fail-soft and latched: an absent or
+   * unpowered PAT9126 logs once and the crown stays dead for the boot, rather
+   * than retrying onto a bus the touchscreen is using every frame. */
+  crown_init();
+#endif
+  OWF_STAGE(17);   /* fossil bring-up marker */          // vibration motor pin (cheap; ready on every path)
   audio_alarm_init();      // park the codec/amp rail OFF (ready if a TIMER wake rings)
   // Saved WiFi networks come from a CSV on SD/FFat — a SLOW filesystem read that
   // delays the watch face appearing. The light background-check path (timer wake)
@@ -1274,6 +1667,13 @@ void setup() {
   // paths so the background wake's drain_update() can keep learning across reboots.
   health_load();
   calib_load();
+  OWF_STAGE(18);   /* fossil bring-up marker */
+#if defined(STOP_SETUP2)
+  /* Recovery 3 s bisect, point 4: settings/weather/timer/haptics/audio init
+   * done. Stage 1 arms ~31 s: that reading = alive here; 3 s = killer above. */
+  OWF_STAGE(1);
+  for (;;) { }
+#endif
 
   // Core-undervolt safety net: capture a "golden" compute/RAM self-test result
   // NOW, while the core is still at the trusted IDF-stock voltage. Then apply the
@@ -1315,6 +1715,7 @@ void setup() {
   // boot — so the watch always boots stock with working USB and stays flashable
   // (no ROM download mode). This only checks/reports a prior hung attempt.
   overclock_check_recovery();
+  OWF_STAGE(19);   /* fossil bring-up marker */
 
   // Load the stored notification list (needed on the light path too, so the
   // background check appends to the existing history rather than starting fresh).
@@ -1346,7 +1747,9 @@ void setup() {
 #if BOARD_PLATFORM_TUYA
   USBSerial.println("[ckpt] pre-Wire"); USBSerial.flush();
 #endif
+  OWF_STAGE(20);   /* fossil: about to touch the I2C controller */
   OWF_WIRE_BEGIN(IIC_SDA, IIC_SCL);
+  OWF_STAGE(21);   /* fossil: I2C bring-up survived */
 #if BOARD_PLATFORM_TUYA
   USBSerial.println("[ckpt] post-Wire / pre-power"); USBSerial.flush();
 #endif
@@ -1359,6 +1762,7 @@ void setup() {
   // screen/touch are powered on this wake. (SAFE rails always keep I2C alive, so
   // this gets through.) The full PMU config still runs later as usual.
   rails_load_state();
+  OWF_STAGE(23);   /* fossil bring-up marker */
   // Resilient PMU bring-up. On a DEEP-SLEEP wake where peripheral rails were cut,
   // the AXP2101 does NOT answer power.begin() on the first try (observed: a
   // POWERON boot reads begin()=1, but a deep-sleep wake reads begin()=0) — the SoC
@@ -1367,6 +1771,7 @@ void setup() {
   // re-powered rails) stayed dead. A cold power-on works only because the PMU
   // powers up fresh with full settle. MIMIC that: retry begin() until it answers.
   bool pmu_up = board_power_begin();
+  OWF_STAGE(22);   /* fossil bring-up marker */
 #if BOARD_PLATFORM_TUYA
   USBSerial.println("[ckpt] post-power"); USBSerial.flush();
 #endif
@@ -1518,28 +1923,43 @@ void setup() {
   // earliest target from timer_load(); a light wake that sleeps never needs the list
   // at all.) Loaded via s_defer_fs_loads after the screen paints.
 
-#if BOARD_DISPLAY_AMOLED_QSPI && BOARD_HAS_PMU_AXP2101
-  // S3 cold-panel bring-up. When the display rails (ALDO1/2/4) are CUT in deep
-  // sleep, this wake re-powers them in rails_restore() above. An AMOLED panel must
-  // see its reset asserted across the supply ramp, or it powers up into a bad state
-  // and stays black even though gfx->begin() later releases reset (the observed
-  // "black screen, watch otherwise alive" after cutting the rails). So: hold
-  // LCD_RESET LOW now, give the freshly-powered rails a proper settle, THEN let
-  // gfx->begin() release reset and run the full init sequence against stable power.
-  // Harmless on a warm boot where the rails were never cut (just an extra reset
-  // pulse + delay before the same begin()). S3-only; the C6 path is unchanged.
+#if BOARD_DISPLAY_AMOLED_QSPI
+  // S3 cold-panel bring-up. An AMOLED panel must see its reset asserted across the
+  // supply ramp, or it powers up into a bad state and stays black even though
+  // gfx->begin() later releases reset (the observed "black screen, watch otherwise
+  // alive"). So: hold LCD_RESET LOW now, let the rails settle, THEN let gfx->begin()
+  // release reset and run the full init sequence against stable power.
   //
-  // BOARD_LCD_HAS_RESET: the S3-1.8 breaks out NO panel reset (LCD_RESET is
-  // GFX_NOT_DEFINED = -1 there), so the pin half must be compiled out — a
-  // pinMode(-1) would be a silent no-op at best. The RAIL SETTLE still applies
-  // on such a board, so keep the delay; that panel relies on its software-reset
-  // /sleep-out init sequence instead of a reset line.
+  // GATING — two INDEPENDENT conditions, which is why this is not one #if:
+  //
+  //   1) THE RESET PULSE (BOARD_LCD_HAS_RESET). Needed by any AMOLED that breaks
+  //      out a reset line, PMU or not. This used to be nested inside a
+  //      "&& BOARD_HAS_PMU_AXP2101" outer gate, which was wrong: it silently
+  //      compiled the reset OUT on an AMOLED board with a reset line but no PMU
+  //      (the S3-1.64), and that board booted fine but stayed BLACK — exactly the
+  //      failure this block exists to prevent. The pin half must NOT depend on the
+  //      PMU. (The S3-1.8 is the opposite case: PMU, but LCD_RESET is
+  //      GFX_NOT_DEFINED = -1, so the pin half compiles out there and that panel
+  //      relies on its software-reset/sleep-out init instead. pinMode(-1) would be
+  //      a silent no-op at best, hence the guard.)
+  //
+  //   2) THE RAIL SETTLE (BOARD_HAS_PMU_AXP2101). Only meaningful where the display
+  //      rails (ALDO1/2/4) were CUT in deep sleep and re-powered by rails_restore()
+  //      above — i.e. a PMU board. On a no-PMU board the panel supply is always on,
+  //      so there is no ramp to wait out and the 60 ms is dead time on every boot.
 #if BOARD_LCD_HAS_RESET
   pinMode(LCD_RESET, OUTPUT);
   digitalWrite(LCD_RESET, LOW);   // assert panel reset while VCI/VDD/VEE stabilize
 #endif
+#if BOARD_HAS_PMU_AXP2101
   delay(60);                      // AMOLED supply settle (the display rail already got
                                   // its per-rail + final settle in rails_restore above)
+#elif BOARD_LCD_HAS_RESET
+  // No PMU: rails were never cut, so no supply-ramp wait is needed — but the panel
+  // still needs a minimum RESET LOW width before begin() releases it. 10 ms is far
+  // above the SH8601/CO5300 requirement (tens of microseconds) and costs nothing.
+  delay(10);
+#endif
 #endif
 
   // Drive the display bus at BOARD_LCD_BUS_HZ (80 MHz on both current boards)
@@ -1563,23 +1983,48 @@ void setup() {
   s_display_ready = true;
 #elif BOARD_PLATFORM_MAIX
   s_display_ready = true;     // MaixCDK lvgl_init already brought up the panel
+#elif BOARD_PLATFORM_FOSSIL
+  /* fossil-port owns LVGL on the continuous-splash framebuffer (owf_fossil_lvgl.h),
+   * the same "bring up here, adopt as default below" flow as the Tuya path. */
+#if defined(STOP_SETUP3)
+  /* Recovery 3 s bisect, point 5: ALL of setup() before display init done.
+   * ~31 s = alive here (killer is display init or later); 3 s = killer is in
+   * the setup body between stage 18 and here. */
+  OWF_STAGE(1);
+  for (;;) { }
+#endif
+  s_display_ready = owf_fossil_lvgl_begin();
+#elif BOARD_DISPLAY_EPD_GDEQ031T10
+  /* E-PAPER: no Arduino_GFX object at all. GxEPD2 owns the panel, so bring-up is
+   * "deselect every device on the shared SPI host, then init the panel". The CS
+   * predeselect MUST come first — see epd_predeselect_bus(). */
+  epd_predeselect_bus();
+  if (!epd_begin()) USBSerial.println("epd_begin() failed!");
+  s_display_ready = true;
 #else
   if (!gfx->begin(BOARD_LCD_BUS_HZ)) USBSerial.println("gfx->begin() failed!");
   s_display_ready = true;     // gfx is now safe to draw to / displayOff()
 #if BOARD_DISPLAY_JD9853_SPI
   jd9853_reg_init();          // vendor register table — required after begin()
 #endif
+#if BOARD_DISPLAY_SH8601_QSPI && defined(BOARD_WS_S3_TOUCH_AMOLED_164)
+  sh8601_164_reg_init();      // vendor register table — required after begin();
+                              // sends 0xC4 (SPI mode) which the library omits and
+                              // without which this panel stays BLACK. See the header.
+#endif
   gfx->fillScreen(RGB565_BLACK);
 #endif
   // The display has now set up the (shared) SPI bus with MISO — SD-over-SPI may
   // mount from here on (it waits on this; SDMMC boards ignore it).
   sd_set_bus_ready();
+  OWF_STAGE(30);   /* fossil: post-display marker */
 
   // Apply saved brightness before anything is shown.
 #if BOARD_PLATFORM_TUYA
   USBSerial.println("[ckpt] pre-brightness"); USBSerial.flush();
 #endif
   settings_apply_brightness(s_brightness);
+  OWF_STAGE(31);   /* fossil: post-display marker */
 #if BOARD_PLATFORM_TUYA
   USBSerial.println("[ckpt] post-brightness"); USBSerial.flush();
 #endif
@@ -1628,7 +2073,10 @@ void setup() {
     USBSerial.printf("[reset] reason=%d (%s) clean_sleep=%d\n",
                      (int)rr, txt, (int)clean_sleep, (int)unexpected);
     // Only paint for an unexpected reset (a crash) — every normal boot is silent.
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+    // Skipped on a DEFERRED-REFRESH panel: there is no `gfx` to draw through, and
+    // this banner is meant to be seen DURING boot, which a 3 s e-paper refresh
+    // cannot deliver — the reason still goes to USBSerial above either way.
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL && !BOARD_DISPLAY_DEFERRED_REFRESH
     if (unexpected) {
       gfx->setTextColor(RGB565(255, 60, 60));
       gfx->setTextSize(3);
@@ -1684,6 +2132,50 @@ void setup() {
 #elif BOARD_TOUCH_AXS5106L
   // AXS5106L via Waveshare's bsp helpers (Wire is already begun above).
   bsp_touch_init(&Wire, TP_RESET, TP_INT, gfx->getRotation(), gfx->width(), gfx->height());
+#elif BOARD_TOUCH_CST816
+  // CST816D/T (Wire is already begun above). Where a touch reset line exists
+  // (S3-1.69: TP_RESET 13) give the controller a real reset pulse before the
+  // probe — it also releases the hold-in-reset that board_sleep latched through
+  // deep sleep. The LCD-2 breaks out no reset line, so its probe stays I2C-only.
+  // Non-fatal either way: if the chip doesn't answer, cst816_read() just keeps
+  // reporting "released" and the rest of the UI (buttons/BLE) still works, so
+  // log it rather than blocking boot.
+  {
+#ifdef TP_RESET
+    gpio_hold_dis((gpio_num_t)TP_RESET);          // sleep hold may still pin it LOW
+    pinMode(TP_RESET, OUTPUT);
+    digitalWrite(TP_RESET, LOW);  delay(10);      // assert reset
+    digitalWrite(TP_RESET, HIGH); delay(100);     // release + let the controller boot
+#endif
+    uint8_t cst_id = 0;
+    if (cst816_begin(&cst_id)) USBSerial.printf("[touch] CST816 ready (id 0x%02X)\n", cst_id);
+    else                       USBSerial.println("[touch] CST816 not responding - touch disabled");
+  }
+#elif BOARD_TOUCH_CST328
+  // CST328 (Wire is already begun above). This board DOES break out a touch reset
+  // (TP_RESET 45), so give the controller a real reset pulse before probing — it
+  // also releases any hold-in-reset latched through deep sleep. Non-fatal: if the
+  // chip doesn't answer, cst328_read() keeps reporting "released" and the rest of
+  // the UI (keyboard/BLE) still works, so log it rather than blocking boot.
+  {
+#ifdef TP_RESET
+    gpio_hold_dis((gpio_num_t)TP_RESET);          // sleep hold may still pin it LOW
+    pinMode(TP_RESET, OUTPUT);
+    digitalWrite(TP_RESET, LOW);  delay(10);      // assert reset
+    digitalWrite(TP_RESET, HIGH); delay(100);     // release + let the controller boot
+#endif
+    if (cst328_begin()) USBSerial.println("[touch] CST328 ready");
+    else                USBSerial.println("[touch] CST328 not responding - touch disabled");
+  }
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  // Sample touch DURING panel refreshes too. A refresh blocks for ~0.7-1.1 s, and
+  // without this a tap starting or ending inside one is only noticed afterwards —
+  // which reads as the press being held for the length of the refresh.
+  epd_set_busy_callback(cst328_poll);
+  // Tell the EPD settle pass when the user is mid-interaction: while a finger
+  // is down more frames are coming, and the deep-clean refresh must wait.
+  epd_set_interact_probe([]() -> bool { return s_c328_pressed; });
+#endif
 #elif BOARD_TOUCH_BUTTONS
   // No touch panel — bring up the physical navigation buttons as active-LOW inputs
   // with internal pull-ups (idle HIGH, LOW when pressed; no external resistors). The
@@ -1694,6 +2186,19 @@ void setup() {
   pinMode(BTN_DOWN_GPIO,   INPUT_PULLUP);
   pinMode(BTN_SELECT_GPIO, INPUT_PULLUP);
 #endif
+#endif
+
+#if BOARD_HAS_KEYBOARD_TCA8418
+  // Physical QWERTY behind the TCA8418 matrix scanner (shares the touch I2C bus,
+  // already begun above). Non-fatal if absent: tca8418_pop() then reports no
+  // events and the UI stays fully touch-drivable.
+  {
+    i2c_lock();
+    bool kb_ok = tca8418_begin();
+    i2c_unlock();
+    if (kb_ok) USBSerial.println("[keys] TCA8418 ready (4x10)");
+    else       USBSerial.println("[keys] TCA8418 not responding - keyboard disabled");
+  }
 #endif
 
   // QMI8658 step counter (hardware pedometer). MUST come AFTER the touch controller's
@@ -1779,7 +2284,25 @@ void setup() {
     // NTP / the phone corrects it shortly after). No-op on the S3 (real RTC chip).
     board_clock_persist_restore();
     RTC_DateTime cur = board_clock_now();
+#if BOARD_PLATFORM_TUYA
+    // A failed I2C read comes back as the same 1970 sentinel as "chip unset" — and stamping
+    // the compile-time default on a mere read failure DESTROYS the good time the PCF85063
+    // kept (its rail never drops through a deep sleep or a held PWR wake). The deep-sleep
+    // entry's PM pad shutdown can also wedge the shared bus mid-transaction. So: recover the
+    // bus and retry before believing a bad read, and NEVER default-stamp while reads fail —
+    // better a wrong-looking clock that BLE/NTP corrects than a destroyed RTC.
+    for (int t = 0; board_clock_read_failed() && t < 3; t++) {
+      USBSerial.println("[rtc] clock read failed - I2C bus recover + retry");
+      owf_t5_i2c_bus_recover();
+      delay(20);
+      cur = board_clock_now();
+    }
+    bool rtc_unset = (cur.getYear() < 2024) && !board_clock_read_failed();
+    if (board_clock_read_failed())
+      USBSerial.println("[rtc] reads still failing - leaving chip time untouched");
+#else
     bool rtc_unset = (cur.getYear() < 2024);  // never set / lost backup
+#endif
     if (FORCE_TIME_SET || rtc_unset) {
       board_clock_set(TIME_SET_Y, TIME_SET_MO, TIME_SET_D,
                       TIME_SET_H, TIME_SET_MI, TIME_SET_S);
@@ -1788,12 +2311,16 @@ void setup() {
       USBSerial.println("[time] kept from battery-backed RTC");
     }
   }
+  OWF_VTRACE(0xFFFF00);  /* M4 YELLOW(/cyan): clock block done — first PM660
+                          * RTC read over SPMI (sid 0) survived */
 
   // Sleep-drain forensics: wake counter + VBAT-delta line (printed AND persisted to
   // NVS, so it's readable over USB on a later reset). Runs AFTER the clock restore
   // above so the slept-span math uses a valid clock; marks the mV delta INVALID if
   // USB/charger was present at either sample. See sleep_power.h.
+  OWF_STAGE(32);   /* fossil: pre-diag-report */
   drain_diag_boot_report(wake_timer, s_woke_from_boot);
+  OWF_STAGE(33);   /* fossil: post-diag-report */
 
 #if BOARD_PLATFORM_MAIX
   /* MaixCDK's maix::lvgl_init() (called from main.cpp before setup()) already did
@@ -1813,6 +2340,12 @@ void setup() {
   screenWidth  = lv_display_get_horizontal_resolution(disp);
   screenHeight = lv_display_get_vertical_resolution(disp);
   USBSerial.printf("[ckpt] display adopted: disp=%p %ux%u\n", (void*)disp, (unsigned)screenWidth, (unsigned)screenHeight); USBSerial.flush();
+#elif BOARD_PLATFORM_FOSSIL
+  /* fossil owns LVGL (owf_fossil_lvgl_begin ran in the display-init block above);
+   * adopt the display we created as the default, mirroring the Tuya path. */
+  disp = lv_display_get_default();
+  screenWidth  = lv_display_get_horizontal_resolution(disp);
+  screenHeight = lv_display_get_vertical_resolution(disp);
 #else
   lv_init();
   lv_tick_set_cb(millis_cb);
@@ -1836,10 +2369,20 @@ void setup() {
   lv_log_register_print_cb(my_print);
 #endif
 
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  /* No `gfx` object on an e-paper board — GxEPD2 owns the panel. The geometry is
+   * fixed and already declared by the board header, so take it straight from
+   * there rather than querying a panel object that does not exist. */
+  screenWidth  = LCD_WIDTH;
+  screenHeight = LCD_HEIGHT;
+#else
   screenWidth = gfx->width();
   screenHeight = gfx->height();
+#endif
 #ifdef DIRECT_RENDER_MODE
   bufSize = screenWidth * screenHeight;
+#elif OWF_FULL_FB_MODE
+  bufSize = screenWidth * screenHeight;        // one full-screen buffer in PSRAM
 #else
   bufSize = screenWidth * PARTIAL_BUF_LINES;   // partial: small line-bufs (x2), fit in SRAM
 #endif
@@ -1857,6 +2400,16 @@ void setup() {
   // Full-frame buffer in PSRAM (~410KB). Only used in the legacy direct path.
   disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!disp_draw_buf) disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  disp_draw_buf2 = NULL;
+#elif OWF_FULL_FB_MODE
+  /* ONE full-screen buffer in PSRAM, no second buffer. See OWF_FULL_FB_MODE.
+   * PSRAM is safe here: on the EPD board the buffer is never a DMA source —
+   * epd_blit_tile() reads it with the CPU into the 1bpp shadow buffer. */
+  disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!disp_draw_buf) {
+    USBSerial.println("[gfx] full FB didn't fit in PSRAM — falling back to internal");
+    disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
   disp_draw_buf2 = NULL;
 #else
   // PARTIAL: two line-buffers in INTERNAL SRAM. SRAM (not PSRAM) so the CPU read
@@ -1886,11 +2439,19 @@ void setup() {
   {
     bool b1_sram = esp_ptr_internal(disp_draw_buf);
     bool b2_sram = disp_draw_buf2 ? esp_ptr_internal(disp_draw_buf2) : true;
+#if OWF_FULL_FB_MODE
+    USBSerial.printf("[gfx] FULL framebuffer: %ux%u, %u KB in %s; internal SRAM now %u KB free\n",
+                     (unsigned)screenWidth, (unsigned)screenHeight,
+                     (unsigned)((bufSize * 2) / 1024),
+                     b1_sram ? "SRAM" : "PSRAM",
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+#else
     USBSerial.printf("[gfx] partial bufs: %u lines, %u KB x2 in %s; internal SRAM now %u KB free\n",
                      (unsigned)(bufSize / screenWidth),
                      (unsigned)((bufSize * 2) / 1024),
                      (b1_sram && b2_sram) ? "SRAM (fast)" : "PSRAM (SLOW fallback)",
                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+#endif
     // Async flush needs SPI-DMA-readable buffers; PSRAM fallback can't, so it
     // keeps the legacy blocking flush. (Only the QSPI bus has the async LOCAL
     // PATCH — other display buses always take the sync path.)
@@ -1909,6 +2470,12 @@ void setup() {
   lv_display_set_flush_cb(disp, my_disp_flush);
 #ifdef DIRECT_RENDER_MODE
   lv_display_set_buffers(disp, disp_draw_buf, NULL, bufSize * 2, LV_DISPLAY_RENDER_MODE_DIRECT);
+#elif OWF_FULL_FB_MODE
+  /* FULL render mode: LVGL renders the whole screen into the one buffer and
+   * calls the flush ONCE per frame with the entire panel area. That is the
+   * point of this mode — the EPD flush then always receives a complete frame
+   * and never a small window. */
+  lv_display_set_buffers(disp, disp_draw_buf, NULL, bufSize * 2, LV_DISPLAY_RENDER_MODE_FULL);
 #else
   lv_display_set_buffers(disp, disp_draw_buf, disp_draw_buf2, bufSize * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
 #if FLUSH_RENDER_SWAPPED && LV_DRAW_SW_SUPPORT_RGB565_SWAPPED
@@ -1928,6 +2495,22 @@ void setup() {
   lv_indev_t *indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, my_touchpad_read);
+
+#if BOARD_HAS_KEYBOARD_TCA8418
+  /* SECOND indev: the physical QWERTY, for TEXT ENTRY (it has no arrow keys, so
+   * it does not navigate — touch does that). A keypad indev still needs a GROUP
+   * to deliver keys to; without one LVGL drops every key silently, which is the
+   * classic "keyboard does nothing" symptom. Setting it as the default group
+   * means a text area added later receives typing once it is focused. */
+  lv_indev_t *kb_indev = lv_indev_create();
+  lv_indev_set_type(kb_indev, LV_INDEV_TYPE_KEYPAD);
+  lv_indev_set_read_cb(kb_indev, my_keypad_read);
+
+  lv_group_t *kb_group = lv_group_create();
+  lv_group_set_default(kb_group);
+  lv_indev_set_group(kb_indev, kb_group);
+#endif
+
 #if BOARD_LCD_EVEN_ALIGN
   lv_display_add_event_cb(disp, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
 #endif
@@ -1965,6 +2548,9 @@ void setup() {
     pending_notif = false;
   }
 
+  OWF_VTRACE(0xFF00FF);  /* M5 MAGENTA: whole UI built (watchface_create,
+                          * battery refresh, diag report) — about to render+
+                          * flush the FIRST REAL FRAME */
   lv_task_handler();   // partial mode: my_disp_flush pushes the dirty area(s) itself
 #ifdef DIRECT_RENDER_MODE
   gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)disp_draw_buf, screenWidth, screenHeight);
@@ -2002,7 +2588,15 @@ void setup() {
   // the net task below), and only does work while rails remain unclassified —
   // normal boots skip straight through. Interactive boots only (the background
   // path sleeps before reaching here).
+#if !BOARD_PLATFORM_FOSSIL
+  /* fossil (2026-08-03): SKIP. Rails are AXP2101-specific (PM660 rail control
+   * is not ported), and the fossil compat Preferences are still no-op — so
+   * every boot re-classified "changed" and rails_probe()'s "restarting clean"
+   * esp_restart() put the watch in a deterministic ~3 s reboot loop, right
+   * after the first-ever boot to reach this line. Re-enable once Preferences
+   * persist and PM660 rail control exists. */
   rails_probe();
+#endif
 
   // Spin up the async networking: a mutex guarding the shared notif store, and a
   // task pinned to CORE 0 so WiFi/HTTP never block the UI loop (core 1).
@@ -2038,9 +2632,40 @@ void setup() {
   lv_async_call([](void *) { lv_obj_invalidate(lv_screen_active()); }, nullptr);
 #endif
 
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  // E-PAPER NEEDS THIS TOO, AND FOR A STRICTER REASON THAN THE SPIDMA CASE ABOVE.
+  //
+  // epd_begin() runs long before LVGL exists, and it ends with epd_dirty_reset() —
+  // clearing s_epd_dirty and collapsing the dirty box — after its clear-to-white.
+  // From then on nothing marks the screen dirty: LVGL has rendered its first frame
+  // into the shadow buffer already, considers itself clean, and a static watchface
+  // gives it no reason to re-render. epd_blit_tile() is therefore never called,
+  // s_epd_dirty stays false, and epd_service() returns at its very first line on
+  // every single loop iteration.
+  //
+  // The panel then shows exactly what epd_begin() left on it — the boot clear —
+  // and STAYS THERE. Symptom is a flash to black, a flash to white, and a screen
+  // frozen white forever, with NO [epd] profile lines in the log because the
+  // printf at the end of epd_service() is never reached. That absent log line is
+  // the tell: it means no partial ever ran, so nothing about the waveform, the
+  // LUT, or EPD_FAST_LUT is implicated and changing them has no effect at all.
+  //
+  // Same two-step as the SPIDMA path: settle the layout so the invalidate records
+  // the real geometry, then re-invalidate after the first render pass via
+  // lv_async_call. Marking everything dirty (rather than pushing here) keeps this
+  // off the boot critical path — the first epd_service() in loop() does the work.
+  lv_obj_update_layout(lv_screen_active());
+  lv_obj_invalidate(lv_screen_active());
+  lv_async_call([](void *) { lv_obj_invalidate(lv_screen_active()); }, nullptr);
+  epd_invalidate_all();   // belt-and-braces: dirty the whole panel, not just LVGL's view
+#endif
+
   /* No vendor task to start: our own LVGL runs lv_timer_handler() in loop()
    * (owf_lvgl_own_handler), single-threaded, so no display lock is needed. */
 
+  OWF_STAGE(34);   /* fossil: setup() COMPLETE */
+  OWF_VTRACE(0xFF8000);  /* M6 ORANGE(/teal): setup tail survived — deferred FS
+                          * loads, net task creation, BLE, cpu_usage_init */
   USBSerial.println("Setup done");
 }
 
@@ -2115,6 +2740,32 @@ static uint32_t lastNotifMs = 0;  // notification fetch timer
 void loop() {
   uint32_t ms = millis();
   bool dirty = false;  // did anything visible change?
+
+  /* DIAGNOSTIC (temporary): trace the FIRST loop iteration, stage by stage.
+   *
+   * Symptom being chased: setup() completes ("Setup done"), the net task prints,
+   * and then the log goes permanently silent — no [epd] profile line, no anything
+   * — while the panel stays frozen on epd_begin()'s boot clear and no input does
+   * anything. That is loop() dying or blocking on its first pass, NOT a display
+   * fault, so tracing the loop is what localises it.
+   *
+   * The LAST [loop] line printed names the call that did not return. Prints only
+   * on the first iteration, so it costs nothing afterwards. Delete once found. */
+#ifndef OWF_LOOP_TRACE
+/* First-iteration boot trace. This existed to find where the very first loop()
+ * hung during bring-up; that is long settled on every board, and it prints
+ * "[loop] entered / after quick_shade_reconcile / after lv_task_handler /
+ * FIRST ITERATION COMPLETE" into the top of every log. Off by default now;
+ * set to 1 if a board ever hangs in the first iteration again. */
+#define OWF_LOOP_TRACE 0
+#endif
+#if OWF_LOOP_TRACE
+  static bool s_lt_first = true;
+  #define LOOP_TRACE(tag) do { if (s_lt_first) { USBSerial.println("[loop] " tag); USBSerial.flush(); } } while (0)
+#else
+  #define LOOP_TRACE(tag) do {} while (0)
+#endif
+  LOOP_TRACE("entered");
 #if BOARD_PLATFORM_TUYA
   // Survived-boot confirm for the persistent overclock: once we've run a few seconds in
   // the main loop, this boot is healthy -> clear the arm so the OC stays for next boot.
@@ -2214,20 +2865,41 @@ void loop() {
   }
 #endif
 
+#if BOARD_HAS_CROWN
+  // Rotating crown (crown_nav.h): watchface roll-down = quick-shade, roll-up in
+  // the shade closes it, and anywhere else it scrolls the scrollable view.
+  // Polled here with the other physical inputs so a turn is never delayed by
+  // render work. Counts as real user activity, exactly like touch/BOOT.
+  if (crown_nav_poll(ms)) {
+    lastActivityMs = ms;
+    s_boot_activity = true;
+    dirty = true;
+  }
+#endif
+
 #if BOARD_PLATFORM_TUYA
   // PWR button (IO18, active-LOW): hold ~2.5s -> hardware power-off (drop the GPIO19
   // keep-alive latch). The device fully powers down (unless USB is plugged); revived by
   // a PWR press. A short PWR tap does nothing while awake (avoid accidental shutdown).
-  // While deep-asleep, PWR is armed as a wake source (owf_tuya_deep_sleep_try) — a press
-  // reboots the chip into a fresh setup(); nothing to handle here.
+  // While deep-asleep, PWR is the ONLY wake source (owf_tuya_deep_sleep_quick) — a quick
+  // press reboots the chip into a fresh setup(); nothing to handle here.
   {
     static uint32_t s_pwr_down_ms = 0;          // when PWR was first seen held (0 = not held)
+    // WAKE-PRESS SWALLOW: on a deep-sleep-wake boot the user is STILL HOLDING the very PWR
+    // press that woke the watch — boot takes seconds with the screen dark, so they hold on
+    // waiting for feedback, and without this the hold crossed the 2.5s threshold below and
+    // POWERED THE WATCH OFF instead (off = rail drops = RTC time lost). Ignore PWR entirely
+    // until it has been seen released once; only a NEW press can arm the power-off hold.
+    static bool s_pwr_wake_swallow = owf_tuya_woke_from_deep_sleep();
     // Fresh timestamp, NOT the loop-start `ms`: on the very iteration that resumes from deep
     // sleep, `ms` predates the whole sleep. With compensated ticks the stale delta would read
     // as an instant 2.5s "long press" and power the watch off on a quick wake tap.
     uint32_t pms = millis();
     bool pwrRaw = (digitalRead(PWR_BTN_GPIO) == LOW);
-    if (pwrRaw) {
+    if (s_pwr_wake_swallow) {
+      if (!pwrRaw) s_pwr_wake_swallow = false;  // wake press released -> normal handling resumes
+      s_pwr_down_ms = 0;                        // never count the wake press toward power-off
+    } else if (pwrRaw) {
       if (s_pwr_down_ms == 0) {
         s_pwr_down_ms = pms;
       } else if (pms - s_pwr_down_ms >= 2500) {  // held long enough -> power off
@@ -2255,12 +2927,22 @@ void loop() {
   // BEFORE the handler below, so the SAME lv_timer_handler() repaints the revealed UI this frame
   // (no extra-iteration black flash). Runs on the loop thread (not mid-refresh) -> safe to
   // invalidate. Idempotent no-op unless the scrim is actually stuck.
+#if BOARD_TOUCH_CST328
+  // Sample touch on the loop thread. The panel's busy callback samples it during
+  // refreshes; between them, this is the source. Both feed the same debounced
+  // state that my_touchpad_read() reports to LVGL.
+  LOOP_TRACE("before cst328_poll");
+  cst328_poll();
+  LOOP_TRACE("after cst328_poll");
+#endif
   quick_shade_reconcile();
+  LOOP_TRACE("after quick_shade_reconcile");
 #if BOARD_PLATFORM_TUYA
   owf_lvgl_own_handler();   // our own LVGL v9.5 timer/handler (replaces the vendor task)
 #else
   lv_task_handler();
 #endif
+  LOOP_TRACE("after lv_task_handler");
 #if BOARD_SD_SHARES_LCD_BUS
   // A flush was dropped because SD held the shared bus mid-refresh: repaint the whole
   // screen now, on the loop thread OUTSIDE the refresh, where invalidating is safe.
@@ -2435,6 +3117,31 @@ void loop() {
     }
   }
 
+  // --- Weather: refresh from the internet on a SLOW cadence (weather changes
+  //     slowly, and each fetch spins the radio). Once shortly after wake, then every
+  //     WEATHER_FETCH_MS. Piggybacks the same core-0 net task + WiFi coexistence
+  //     guard as notifications; it's a no-op when WiFi is off or refused. Only armed
+  //     when there's a place to fetch for (there always is — preset or BLE-set). ---
+  static uint32_t lastWxMs = 0;
+  const uint32_t WEATHER_FETCH_MS = 30UL * 60UL * 1000UL;   // 30 min
+  if (lastWxMs == 0 || ms - lastWxMs > WEATHER_FETCH_MS) {
+    lastWxMs = ms;
+    weather_request_fetch();            // returns instantly; task fetches on core 0
+  }
+  // A finished weather fetch (or a BLE location change that triggered one) landed —
+  // repaint the on-face widget IN PLACE (no full-face redraw), and the Weather app if
+  // it's the current screen so an open app reflects the new data. watchface_refresh_weather
+  // is a no-op paint when the widget is hidden or nothing changed.
+  if (s_weather_ready) {
+    s_weather_ready = false;
+    watchface_refresh_weather();
+    if (nav_current == app_open_weather || nav_current == app_open_weather_forecast) {
+      weather_capture_scroll();         // remember where the user had scrolled to...
+      nav_current();                    // ...rebuild with fresh data...
+      // (the builder restores s_wx_scroll_y after laying out, so the view doesn't jump)
+    }
+  }
+
   // Consume a finished fetch result (set by the network task). All LVGL happens
   // HERE on the loop/core-1 side — the task never touches the UI.
   if (s_net_result_ready) {
@@ -2530,6 +3237,23 @@ void loop() {
     watchface_present();   // DIRECT only; no-op in PARTIAL (flush already pushed the areas)
   }
 
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  // E-PAPER: this is where the panel ACTUALLY updates. my_disp_flush only wrote
+  // into the shadow framebuffer, so without this call nothing ever reaches the
+  // glass. Self-rate-limiting (EPD_MIN_REFRESH_MS) and self-promoting to a full
+  // refresh every EPD_FULL_EVERY partials to clear ghosting — so it is safe and
+  // cheap to call unconditionally every loop iteration: it returns immediately
+  // when there is nothing dirty or the interval has not elapsed.
+  //
+  // Deliberately OUTSIDE the dirty-flag block above: those flags are consumed by
+  // watchface_present(), but the e-paper's own dirty state is tracked separately
+  // (a tile can land in the framebuffer on one iteration and only be eligible to
+  // push several iterations later, once the refresh interval expires).
+  LOOP_TRACE("before epd_service");
+  epd_service();
+  LOOP_TRACE("after epd_service");
+#endif
+
   // (The launcher menu is a live swipe pager now — no PSRAM snapshot. Other app
   // screens still use the screen cache via their own open paths.)
 
@@ -2555,6 +3279,14 @@ void loop() {
     lastActivityMs = ms;
     fresh_activity = true;
   }
+#if BOARD_PLATFORM_FOSSIL
+  // Fossil touch is POLLED in owf_fossil_touch_cb (no ISR sets s_touch_activity),
+  // exactly like Tuya below, so consume the runtime's own activity flag here ->
+  // any finger un-dims and resets the idle timer. Without this a tap on the
+  // WATCH FACE refreshed nothing: only opening the menu or the quick shade
+  // un-dimmed, because the loop refreshes the idle timer while either is OPEN.
+  if (owf_fossil_take_touch_activity()) { lastActivityMs = ms; fresh_activity = true; }
+#endif
 #if BOARD_PLATFORM_TUYA
   // Tuya touch is POLLED in owf_lvgl_touch_cb (no ISR sets s_touch_activity), so consume the
   // touch module's own activity flag here -> any finger un-dims and resets the idle timer.
@@ -2611,6 +3343,13 @@ void loop() {
     // the idle-sleep guard below keeps it awake while tethered to a computer (you
     // can flash it without enabling caffeine mode).
     usb_connected = board_usb_powered();
+#if BOARD_HAS_CHARGER_BQ25896
+    // Keep the red STAT LED matching "actually charging". The charger's default
+    // behaviour lights it for any input present (and keeps doing so after the
+    // firmware powers off, since the charger runs independently of the SoC), so
+    // the firmware has to drive it explicitly. Writes only on a state change.
+    bq25896_service_led();
+#endif
     i2c_unlock();
   }
   // Auto-dim on idle: after DIM_IDLE_MS with no touch/notification the panel dims
@@ -2757,5 +3496,9 @@ void loop() {
 #endif
 
   // (No Tuya display lock to release - our own LVGL is single-threaded in this loop.)
+  LOOP_TRACE("FIRST ITERATION COMPLETE");
+#if OWF_LOOP_TRACE
+  s_lt_first = false;   // trace the first pass only; silent from here on
+#endif
   delay(fast_pace ? 1 : 5);
 }

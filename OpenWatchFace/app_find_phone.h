@@ -59,10 +59,24 @@ static void app_open_find_phone(void) {
   // Cap at 180 so the S3 keeps its original look; on the C6 it shrinks to fit.
   int ring_d = (int)screenWidth - UI_PX(40);   // leave a margin both sides
   if (ring_d > 180) ring_d = 180;
+#if BOARD_SCREEN_ROUND_SMALL
+  // SMALL ROUND face: the 180 px cap is already the binding one here (360-UI_PX(40)
+  // = 325, capped to 180), so the button was never oversized for the WIDTH — it was
+  // mispositioned for the HEIGHT. Centered at UI_PX(-24) = -21 it spanned y 69..249,
+  // and the app title sits at UI_PX(40) = 35 and ends at ~69: they met exactly, which
+  // is the reported "Ring button clips with the Find Phone title".
+  // Trim to 160 and drop the center offset to UI_PX(-16) = -14 -> y 86..246, a clear
+  // 17 px below the title, with room gained back for the status line underneath.
+  if (ring_d > 160) ring_d = 160;
+#endif
   bool connected = ble_phone_connected();      // no phone -> button greyed + inert
   lv_obj_t *btn = lv_btn_create(app_scr);
   lv_obj_set_size(btn, ring_d, ring_d);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_align(btn, LV_ALIGN_CENTER, 0, UI_PX(-16));
+#else
   lv_obj_align(btn, LV_ALIGN_CENTER, 0, UI_PX(-24));
+#endif
   lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
   // Accent-filled when a phone is connected; greyed out (disabled) otherwise so it
   // visibly reads as un-pressable, matching the "No phone connected" status below.
@@ -83,7 +97,7 @@ static void app_open_find_phone(void) {
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_text_font(ic, &lv_font_montserrat_24, 0);
 #else
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_34, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(34), 0);
 #endif
   lv_obj_set_style_text_color(ic, connected ? lv_color_black() : lv_color_hex(0x777777), 0);
   lv_label_set_text(ic, LV_SYMBOL_CALL);
@@ -111,12 +125,26 @@ static void app_open_find_phone(void) {
   lv_obj_set_style_text_font(fmp_status, &FONT_SMALL, 0);
   lv_obj_set_style_text_align(fmp_status, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_long_mode(fmp_status, LV_LABEL_LONG_WRAP);
+#if BOARD_SCREEN_ROUND_SMALL
+  // The status line is the yellow text reported as clipping off both sides. LV_PCT(90)
+  // is 324 px on the C2, but this label sits LOW — around y 262..312 — and the glass
+  // there is a chord, not the full panel: at y=287 the circle is only ~289 px wide and
+  // at y=312 only ~245. A percentage of the PANEL width is the wrong measure on a round
+  // face; LV_PCT(66) = 238 px stays inside the arc even if the text wraps to a second
+  // line, and still fits "Tap to ring your phone." (~205 px at 20 px) on one line.
+  lv_obj_set_width(fmp_status, LV_PCT(66));
+#else
   lv_obj_set_width(fmp_status, LV_PCT(90));   // percent so it fits any panel width
+#endif
   // Anchor the status line a fixed gap BELOW the button's actual bottom edge,
   // not a guessed offset from screen-center: the button center is at -24 and its
   // radius shrinks on narrow panels, so a center-relative offset could land the
   // text on top of the button. ALIGN_OUT_BOTTOM_MID keeps it clear on any panel.
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_align_to(fmp_status, btn, LV_ALIGN_OUT_BOTTOM_MID, 0, UI_PX(18));
+#else
   lv_obj_align_to(fmp_status, btn, LV_ALIGN_OUT_BOTTOM_MID, 0, UI_PX(24));
+#endif
 
   if (ble_phone_connected())
     fmp_set_status("Tap to ring your phone.", 0xAAAAAA);

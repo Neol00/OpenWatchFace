@@ -164,6 +164,20 @@ static void settings_set_show_volt(bool on) {
   watchface_apply_volt_visible();         // reflect on the face immediately
 }
 
+/* Show the weather widget (icon + temperature) on the watch face, under the main
+ * dial? Default OFF. When ON, the weekday/date row shifts DOWN to make room for the
+ * widget in the middle of the face (see watchface.h). Purely a layout choice — the
+ * weather data is fetched regardless; this only controls the on-face widget.
+ * Persisted to NVS. Applied live by watchface_apply_weather_visible()
+ * (forward-declared in watch_base.h alongside the other watchface_apply_* hooks). */
+static bool s_show_weather = false;
+static bool settings_get_show_weather(void) { return s_show_weather; }
+static void settings_set_show_weather(bool on) {
+  s_show_weather = on;
+  prefs.putBool("showwx", on);
+  watchface_apply_weather_visible();      // reflect on the face immediately
+}
+
 /* Swap the WiFi and BLE indicators on the watch face? Default OFF.
  *   OFF (default): WiFi lives in the right stat column, BLE glyph in the top-right tray.
  *   ON           : WiFi glyph moves to the top-right tray, BLE takes the right column.
@@ -212,12 +226,23 @@ static inline uint32_t ui_accent_soft_hex(void) { return ui_lighten_hex(s_accent
  * unchanged. Decorative call sites pass their normal color through ui_deco_hex():
  * it returns the accent in mono mode, else the original color, so a single flag
  * recolors the whole UI without each screen knowing about the mode. Persisted. */
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+/* 1-bit e-paper: mono-accent is FORCED ON. The varied decorative tints don't
+ * survive the black/white threshold (several land on the white side and simply
+ * vanish), while the accent blue thresholds to solid black — so mono mode is
+ * the only rendering that keeps every icon visible. The setter is inert and
+ * the Appearance app hides the toggle, so nothing can turn it off. */
+static const bool s_mono_accent = true;
+static bool settings_get_mono_accent(void) { return true; }
+static void settings_set_mono_accent(bool on) { (void)on; }
+#else
 static bool s_mono_accent = false;
 static bool settings_get_mono_accent(void) { return s_mono_accent; }
 static void settings_set_mono_accent(bool on) {
   s_mono_accent = on;
   prefs.putBool("monoacc", on);
 }
+#endif
 
 /* Map a DECORATIVE color through the mono-accent mode. Pass the color a site would
  * normally use; get the accent back when mono mode is on, else the original. Use
@@ -241,7 +266,17 @@ static inline uint32_t ui_darken_hex(uint32_t c, uint8_t amt) {
  * mono mode returns a strongly-dimmed accent (so it reads as "the accent, but off");
  * otherwise the site's normal dim color. Pairs with ui_deco_hex for the bright state. */
 static inline uint32_t ui_deco_dim_hex(uint32_t normal) {
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+  /* 1-bit inverted e-paper: any darkened "dim" color falls below the luminance
+   * threshold and renders as WHITE — i.e. invisible (the missing disconnected
+   * WiFi/BLE icons). There is no "dim" on a 1-bit panel; visible beats subtle,
+   * so dim states use the full accent (which thresholds to black ink). State
+   * still reads from the adjacent ok/off text. */
+  (void)normal;
+  return s_accent;
+#else
   return s_mono_accent ? ui_darken_hex(s_accent, 200) : normal;
+#endif
 }
 
 /* ---- Mute (persisted) ----
@@ -398,7 +433,40 @@ static void settings_set_ble_txp(uint8_t idx) {
  * are valid AND WiFi-capable. setCpuFrequencyMhz() applies it.
  *   - S3-2.06 (ESP32-S3): 240 / 160 / 80.
  *   - C6-1.47 (ESP32-C6): max 160 MHz (no 240); 160 / 80. */
-#if BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_FOSSIL
+extern "C" int cpu_clk_set_mhz(int mhz);   // fossil-port pwr_diag.c (file scope: block-scope extern "C" won't compile)
+#endif
+#if BOARD_SOC_MSM8909
+/* Gen 4 (msm8909w / APQ8009W): the REAL ladder, from this watch's own DTB
+ * (qcom,cpufreq-table = 200000 400000 533330 800000 1094400 1267200 kHz).
+ * The Gen 6's 400-1306 list below is a different SoC's and must not be shown
+ * here — this part cannot reach 1306 MHz at all.
+ *
+ * NOTE: these are currently DISPLAY-ONLY and the CPU SPEED buttons are hidden
+ * on this watch (see app_power.h). On msm8909w the A7 does not own its own
+ * clocks or voltages: they belong to the RPM, a separate always-on Cortex-M3,
+ * and "setting a frequency" means sending a vote over a shared-memory mailbox.
+ * Until rpm-smd is ported, cpu_clk_set_mhz() returns -1 and a speed button
+ * would do nothing but lie. */
+/* Only the GPLL0-derived rates are offered, because only they are reachable
+ * without programming the A7 PLL and voting a higher voltage corner through
+ * the RPM (see platform/cpu_clk_a7.c). 1094.4 and 1267.2 MHz from the DTB's
+ * qcom,cpufreq-table are deliberately absent: they need corner 9, and a button
+ * that cannot do what it says is worse than no button.
+ *   800 = GPLL0/1   533 = GPLL0/1.5   400 = GPLL0/2   200 = GPLL0/4 */
+static const uint16_t CPU_FREQS[] = { 800, 533, 400, 200 };
+static uint16_t s_cpu_mhz = 800;          // the top of our ladder; the live rate
+                                          // is reported separately by pwr_cpu_mhz()
+#elif BOARD_PLATFORM_FOSSIL
+/* Gen 6 (SDM429W): the RCG mux + HF PLL ladder (fossil-port pwr_diag.c
+ * cpu_clk_set_mhz, kernel clk-cpu-sdm.c sequence). 800/400 run off GPLL0
+ * (bootloader's parking source, PLL off); 960+ reprogram the dedicated APCS
+ * HF PLL (L grid = 19.2 MHz). Everything here is DT vdd corner 1 — the SAME
+ * rail voltage the bootloader set — so no regulator writes are involved.
+ * 1305.6 MHz is the corner-1 ceiling; higher needs CPR rail control (TODO). */
+static const uint16_t CPU_FREQS[] = { 1306, 1152, 960, 800, 533, 400 };
+static uint16_t s_cpu_mhz = 800;          // bootloader default (GPLL0)
+#elif BOARD_PLATFORM_TUYA
 /* T5-E1 (BK7258): the DVFS ladder. Each speed sets the core clock + its matched
  * core voltage directly (owf_tuya_cpu_freq.h). Voltage rises with frequency. Highest-first (button row reads left=fast). */
 static const uint16_t CPU_FREQS[] = { 480, 320, 240 };
@@ -465,7 +533,16 @@ static const uint16_t CPU_FREQ_LOW = 80;
 // One entry per CPU_FREQS[] (board-specific). This is the AXP2101-RAIL undervolt,
 // so it's PMU-only — dead/no-op on the C6 (settings_apply_rail_for_mhz bails when
 // no PMU), but it must still match CPU_FREQS[] length for the static_assert.
-#if BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_FOSSIL
+// Gen 6: no AXP2101 (PM660 rails are corner-managed, untouched here). Stock
+// entries only so the static_assert holds; the fossil clock path never reads this.
+//   CPU MHz index:                      1306  1152   960   800   533   400
+#if BOARD_SOC_MSM8909
+static const uint16_t CPU_UVOLT_MV[] = { 3300, 3300, 3300, 3300 };  // 4 rates
+#else
+static const uint16_t CPU_UVOLT_MV[] = { 3300, 3300, 3300, 3300, 3300, 3300 };
+#endif
+#elif BOARD_PLATFORM_TUYA
 // T5 has no AXP2101 rail to trim (this is the PMU-rail undervolt). One STOCK entry per
 // CPU_FREQS[] so the static_assert holds; the real T5 core voltage is set per-frequency
 // via vcorehsel in owf_tuya_cpu_freq.h, not this AXP path.
@@ -515,6 +592,12 @@ static void settings_clock_hw(uint16_t mhz) {
   // keeps the 480 PLL + bus clock (QSPI/PSRAM domain) untouched and only scales the CPU,
   // with voltage-before-speedup / voltage-after-slowdown ordering. Safe to call at boot.
   owf_tuya_set_cpu_mhz(mhz);
+#elif BOARD_PLATFORM_FOSSIL
+  // Gen 6: the whole safe-switch dance (park on GPLL0 -> reprogram HF PLL ->
+  // lock-wait -> switch) lives in the port (pwr_diag.c cpu_clk_set_mhz). No
+  // voltage step: every CPU_FREQS[] entry is the same DT vdd corner. On PLL
+  // lock failure it stays parked at 800 MHz — always a working clock.
+  cpu_clk_set_mhz((int)mhz);
 #else
   // Order matters when SPEEDING UP: raise the rail before the clock so the chip
   // never runs fast on a low rail. At boot the PMU isn't up yet, so this call
@@ -617,12 +700,30 @@ static void settings_load(void) {
   prefs.begin("watch", false);            // namespace "watch", read/write
 #endif
   s_brightness        = prefs.getUChar ("bright",   s_brightness);
+  /* On the e-paper board the accent load is SKIPPED: the accent stays the
+   * default blue (the one color proven to threshold to solid black) and the
+   * picker is hidden — a stale NVS accent from an earlier build must not
+   * resurrect an invisible-icon UI. */
+#if !BOARD_DISPLAY_EPD_GDEQ031T10
   s_accent            = prefs.getUInt  ("accent",   s_accent);
+#endif
   s_mute              = prefs.getBool  ("mute",     s_mute);
   s_check_interval_min= prefs.getUShort("checkmin", s_check_interval_min);
   s_checks_enabled    = prefs.getBool  ("checks",   s_checks_enabled);
   s_sleep_mode        = prefs.getBool  ("sleepmode", s_sleep_mode);
-  s_cpu_mhz           = prefs.getUShort("cpumhz",   s_cpu_mhz);
+  /* Snap a stale persisted clock to the compile-time default: the freq table
+   * is per-board, so a value saved by an image with a DIFFERENT table (e.g.
+   * the pre-clock-control fossil builds showed the ESP 240/160/80 buttons)
+   * would otherwise select nothing and get clamped to whatever the apply
+   * path makes of it (seen on the Gen 6: stale value -> 400 MHz, no button lit). */
+  {
+    uint16_t cpu_def = s_cpu_mhz;
+    s_cpu_mhz = prefs.getUShort("cpumhz", cpu_def);
+    bool cpu_ok = false;
+    for (uint8_t i = 0; i < CPU_FREQ_COUNT; i++)
+      if (CPU_FREQS[i] == s_cpu_mhz) { cpu_ok = true; break; }
+    if (!cpu_ok) s_cpu_mhz = cpu_def;
+  }
   s_wifi_enabled      = prefs.getBool  ("wifien",   s_wifi_enabled);
   s_ble_enabled       = prefs.getBool  ("bleen",    s_ble_enabled);
   s_wifi_txp          = prefs.getUChar ("wifitxp",  s_wifi_txp) % RADIO_TXP_COUNT;
@@ -631,8 +732,11 @@ static void settings_load(void) {
   s_autodim_pct       = prefs.getUChar ("autodimp", s_autodim_pct);
   s_dim_on_usb        = prefs.getBool  ("dimusb",   s_dim_on_usb);
   s_show_volt         = prefs.getBool  ("showvolt", s_show_volt);
+  s_show_weather      = prefs.getBool  ("showwx",   s_show_weather);
   s_swap_wifi_ble     = prefs.getBool  ("swapwb",   s_swap_wifi_ble);
+#if !BOARD_DISPLAY_EPD_GDEQ031T10   /* forced-on there; s_mono_accent is const */
   s_mono_accent       = prefs.getBool  ("monoacc",  s_mono_accent);
+#endif
   s_caffeine          = prefs.getBool  ("caffeine", s_caffeine);
 #if BOARD_PLATFORM_TUYA
   s_oc_enabled        = prefs.getBool  ("ocen",     s_oc_enabled);

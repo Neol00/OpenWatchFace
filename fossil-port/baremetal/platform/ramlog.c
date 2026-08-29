@@ -44,3 +44,31 @@ void ramlog_putc(char c)
 }
 
 int ramlog_had_previous(void) { return s_had_previous; }
+
+/* Stream the ring from a cursor — the USB log console's source (usb_ci.c).
+ *
+ * The cursor is a monotonically increasing byte count, NOT a ring index, so a
+ * reader that falls behind a wrap is detected rather than silently replaying
+ * garbage: if more than a full buffer has gone by, jump to the oldest byte
+ * still present. Returns bytes copied (0 when caught up). A fresh cursor of 0
+ * therefore replays the WHOLE ring, including everything printed before the
+ * cable was plugged in, which is the entire point of the exercise.
+ */
+uint32_t ramlog_read(uint32_t *cursor, char *out, uint32_t max)
+{
+    if (RL->magic != RAMLOG_MAGIC) return 0;
+
+    uint32_t cap     = RL_CAP;
+    uint32_t written = RL->wrapped ? (cap + RL->head) : RL->head;
+    uint32_t oldest  = (written > cap) ? (written - cap) : 0u;
+
+    if (*cursor < oldest) *cursor = oldest;      /* fell behind a wrap */
+    if (*cursor >= written) return 0;            /* caught up */
+
+    uint32_t n = written - *cursor;
+    if (n > max) n = max;
+    for (uint32_t i = 0; i < n; i++)
+        out[i] = RL->buf[(*cursor + i) % cap];
+    *cursor += n;
+    return n;
+}

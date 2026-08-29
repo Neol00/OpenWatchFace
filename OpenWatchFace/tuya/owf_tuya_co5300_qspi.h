@@ -239,7 +239,21 @@ static void owf_pnl_send_frame(owf_pnl_fb_t *fb) {
    * (timeout 0 = poll) so we clear strays and then wait on THIS frame's completion alone. */
   while (tal_semaphore_wait(s_owf_pnl_tx_sem, 0) == OPRT_OK) { /* clear stray posts */ }
   tkl_qspi_send(OWF_PNL_QSPI_PORT, fb->frame, fb->len); /* DMA the pixels on 4 wires */
-  tal_semaphore_wait(s_owf_pnl_tx_sem, SEM_WAIT_FOREVER);
+  /* BOUNDED wait, not FOREVER: a full frame is ~4ms at 80MHz/4-wire, so 1s = hard failure.
+   * A lost TX-done IRQ here used to wedge this task permanently (CS stuck low, queue fills,
+   * loop thread blocks on the next post -> lit-but-frozen watch). The known cause — a direct
+   * sleep/wake register write colliding with this DMA — is fixed by parking the bus around
+   * suspend (owf_tuya_display_sleep), so this print firing means a NEW collision exists. */
+  if (tal_semaphore_wait(s_owf_pnl_tx_sem, 1000) != OPRT_OK) {
+    Serial.println("[own-pnl] TX-done IRQ LOST (1s timeout) — re-arming IRQ, frame dropped");
+    tkl_qspi_force_cs_pin(OWF_PNL_QSPI_PORT, 1);        /* release CS before touching the IRQ */
+    /* Self-heal: the wake path re-arms too (owf_t5_panel_rearm_irq in display_wake), but if a
+     * PM cycle ever kills the IRQ outside a suspend, recover here instead of dropping every
+     * subsequent frame at 1 fps. We ARE the push task, so the bus is ours — safe to re-init. */
+    tkl_qspi_irq_init(OWF_PNL_QSPI_PORT, owf_pnl_qspi_evt_cb);
+    tkl_qspi_irq_enable(OWF_PNL_QSPI_PORT);
+    return;
+  }
   tkl_qspi_force_cs_pin(OWF_PNL_QSPI_PORT, 1);          /* release CS */
 }
 
@@ -291,6 +305,45 @@ bool owf_t5_panel_park_and_wait_idle(void) {
   }
   s_owf_pnl_park_req = 0;                         /* give up cleanly -> let it run again */
   return false;
+}
+
+/* Re-arm the QSPI TX-done IRQ. The suspend path's PM cycle (mode-1 vote + the vendor WFI
+ * mask/restore in sys_hal_enter_normal_sleep) loses the QSPI interrupt enable at the ICU —
+ * even on sleeps where LV never fully engaged (proven on serial: "LV cycles: 0" wakes still
+ * came back with TX-done dead, every flush hitting the 1s timeout). Polled command writes
+ * survive, only the completion IRQ dies, so re-init + re-enable is the whole repair. MUST be
+ * called on a quiet bus (task parked, no DMA in flight) — the earlier "re-arm = crash
+ * lottery" attempts ran against the then-unserialized sleep/wake command race. */
+void owf_t5_panel_rearm_irq(void) {
+  tkl_qspi_irq_init(OWF_PNL_QSPI_PORT, owf_pnl_qspi_evt_cb);
+  tkl_qspi_irq_enable(OWF_PNL_QSPI_PORT);
+}
+
+/* Full controller re-init for the post-suspend wake. The PM cycle leaves the QSPI domain in
+ * an UNDEFINED state: sometimes only the TX-done IRQ enable is lost (flushes time out),
+ * sometimes the module clock is gated outright — and then ANY register access (even
+ * tkl_qspi_irq_init) hangs the AHB and wedges the core mid-instruction, silently (the
+ * breadcrumb-less frozen wake). So the FIRST QSPI touch after wake must be tkl_qspi_init:
+ * it re-votes the module's power/clock inside the vendor driver before writing config
+ * registers. NO deinit first — deinit reads/writes QSPI registers and wedges exactly when
+ * the clock is already off (why the old deinit+init "revive" was a lottery). Panel GRAM and
+ * panel state are untouched; only the controller side is rebuilt. Bus must be parked. */
+void owf_t5_panel_reinit_after_sleep(void) {
+  TUYA_QSPI_BASE_CFG_T qcfg;
+  memset(&qcfg, 0, sizeof(qcfg));
+  qcfg.role           = TUYA_QSPI_ROLE_MASTER;
+  qcfg.mode           = TUYA_QSPI_MODE0;
+  qcfg.type           = TUYA_QSPI_TYPE_LCD;
+  qcfg.freq_hz        = OWF_PNL_QSPI_CLK;
+  qcfg.use_dma        = true;
+  qcfg.dma_data_lines = TUYA_QSPI_4WIRE;
+  Serial.println("[wake] qspi re-init ...");
+  Serial.flush();
+  if (tkl_qspi_init(OWF_PNL_QSPI_PORT, &qcfg) != OPRT_OK)
+    Serial.println("[wake] qspi re-init FAILED");
+  Serial.println("[wake] qspi re-init done; re-arming irq");
+  Serial.flush();
+  owf_t5_panel_rearm_irq();
 }
 
 /* Release the park; the task resumes and drains any frames queued while parked. */
@@ -352,6 +405,14 @@ static inline bool owf_t5_panel_open(void) {
                  OWF_STR(OWF_PNL_ROTATION) ")");
   return true;
 }
+
+/* NOTE (2026-08-15): there is deliberately NO wake-time "revive" function here anymore.
+ * Every AP-side variant was hardware-tested and none was deterministic: ISR-re-arm-only =
+ * crash every wake; tkl_qspi_deinit+init (paced or not) = works/streaks/crash lottery;
+ * + full panel reset/init-seq = same lottery plus green fill; SDK display path with no
+ * revive = crash every wake. Conclusion: the QSPI/DMA domain comes back from low-voltage
+ * sleep in a state the AP cannot reliably repair — the fix belongs on the system core
+ * (keep the domain powered through LV, or restore it in cp0's LV exit). */
 
 /* Allocate a bounce buffer of `bytes` in PSRAM (write-through cached, like the SDK path). */
 static inline owf_pnl_fb_t *owf_t5_panel_create_fb(uint32_t bytes) {

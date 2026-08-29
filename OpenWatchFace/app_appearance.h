@@ -19,6 +19,14 @@
 #pragma once
 #include <lvgl.h>
 
+/* E-PAPER (T-Deck Pro): the panel is 1-bit — an accent picker is meaningless
+ * (every color thresholds to black or white) and mono-accent is FORCED ON in
+ * settings_store.h (the varied per-category tints are what made icons vanish).
+ * So this screen drops the Monochrome toggle and the whole ACCENT COLOR
+ * section, keeping only the WATCH FACE rows. */
+#define APPR_HAS_COLOR (!BOARD_DISPLAY_EPD_GDEQ031T10)
+
+#if APPR_HAS_COLOR
 /* Preset accent palette. Magenta is intentionally Heliotrope (#DF73FF), a soft
  * violet, rather than a harsh magenta. Add/replace freely — the UI adapts. */
 static const uint32_t APPR_COLORS[] = {
@@ -33,9 +41,11 @@ static const uint8_t APPR_COLOR_COUNT = sizeof(APPR_COLORS) / sizeof(APPR_COLORS
 
 static lv_obj_t *appr_swatches[8];        // the swatch buttons (<= APPR_COLOR_COUNT)
 static lv_obj_t *appr_hdr = nullptr;      // the "ACCENT COLOR" header (recolored live)
+#endif  /* APPR_HAS_COLOR */
 static lv_obj_t *appr_wf_hdr = nullptr;   // the "WATCH FACE" header (recolored live)
 static lv_obj_t *appr_volt_sw = nullptr;  // the voltage-readout switch (accent indicator, recolored live)
 
+#if APPR_HAS_COLOR
 /* Monochrome-accent toggle: when ON, every decorative color in the UI collapses to
  * the accent for a plain, uniform look (category icons, menu tile icons, graph/second
  * series, the WiFi/BLE indicators, the green pager, etc.). settings_set_mono_accent
@@ -61,6 +71,7 @@ static void appr_mono_toggle_cb(lv_event_t *e) {
   watchface_apply_indicator_layout();    // the watch-face WiFi/BLE indicators
   lv_async_call(appr_rebuild_async, nullptr);   // repaint this screen after the event
 }
+#endif  /* APPR_HAS_COLOR */
 
 /* Voltage-readout toggle: same labelled-switch row as WiFi/BLE (settings_toggle_row),
  * so it matches the rest of settings and — unlike the old full-width button — doesn't
@@ -78,6 +89,15 @@ static void appr_swap_wb_toggle_cb(lv_event_t *e) {
   settings_set_swap_wifi_ble(lv_obj_has_state(sw, LV_STATE_CHECKED));
 }
 
+/* Weather-on-face toggle: show the under-dial weather widget (icon + temp). Moved here
+ * from the Weather app. settings_set_show_weather persists + applies to the face live
+ * (shows/hides the widget and shifts the weekday/date row). */
+static void appr_weather_toggle_cb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  settings_set_show_weather(lv_obj_has_state(sw, LV_STATE_CHECKED));
+}
+
+#if APPR_HAS_COLOR
 /* Ring the selected swatch (white, thick) and give the rest a faint outline. */
 static void appr_refresh_selection(void) {
   uint32_t cur = settings_get_accent();
@@ -106,6 +126,7 @@ static void appr_swatch_cb(lv_event_t *e) {
     lv_obj_set_style_bg_color(appr_volt_sw, lv_color_hex(ui_accent_hex()),
                               LV_PART_INDICATOR | LV_STATE_CHECKED);
 }
+#endif  /* APPR_HAS_COLOR */
 
 static void app_open_appearance(void) {
   app_screen_begin("Appearance");
@@ -127,10 +148,11 @@ static void app_open_appearance(void) {
   // 448-px S3-1.8 does not — the container overhung the bottom, so the last row
   // stayed clipped however far it scrolled. Derive it from the real screen,
   // keeping the same 10 px bottom margin the 2.06 had (502-84-408 = 10).
-  lv_obj_set_width(col, 374);
-  lv_obj_set_height(col, (int)screenHeight - 84 - 10);
-  lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 84);
-  lv_obj_set_style_pad_all(col, 6, 0);
+  // Width/height/offsets live in ui_app_column_layout() (ui_scale.h): the four
+  // raw-pixel lines that used to sit here were authored on the 410x502 reference
+  // and are wider than the glass on a 360 px round face. Shared so Power, Weather
+  // and Appearance cannot drift apart again.
+  ui_app_column_layout(col, 374);
 #endif
   lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(col, 0, 0);
@@ -148,6 +170,7 @@ static void app_open_appearance(void) {
   lv_obj_set_style_pad_bottom(col, UI_PX(56), 0);
 #endif
 
+#if APPR_HAS_COLOR   /* e-paper: no toggle (mono forced on), no accent picker */
   // ---- MONOCHROME ACCENT (toggle above the swatches, as requested) ----
   // When on, decorative colors across the UI collapse to the chosen accent for a
   // plain look. Sits directly above the accent picker since it governs how that
@@ -198,6 +221,7 @@ static void app_open_appearance(void) {
   lv_label_set_text(hint, "Tip: the accent colors headers, sliders, graphs and "
                           "the pull-down shade.");
   lv_obj_set_style_pad_top(hint, UI_PX(10), 0);
+#endif  /* APPR_HAS_COLOR */
 
   // ---- WATCH FACE ----
   appr_wf_hdr = lv_label_create(col);
@@ -216,6 +240,11 @@ static void app_open_appearance(void) {
   // column. settings_set_swap_wifi_ble persists + re-lays-out the face live.
   settings_toggle_row(col, LV_SYMBOL_BLUETOOTH, "WiFi/BLE swap",
                       settings_get_swap_wifi_ble(), appr_swap_wb_toggle_cb);
+
+  // Toggle: show the weather widget (icon + temp) under the main dial. Moved here from
+  // the Weather app. settings_set_show_weather persists + applies to the face live.
+  settings_toggle_row(col, LV_SYMBOL_REFRESH, "Weather reading",
+                      settings_get_show_weather(), appr_weather_toggle_cb);
 
   // Bottom spacer so the last row clears the screen's rounded corners (the scroll
   // column runs to the bottom; without this the final row clips into the curve).

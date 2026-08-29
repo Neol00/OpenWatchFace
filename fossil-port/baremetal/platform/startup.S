@@ -21,9 +21,51 @@
     .syntax unified
     .arm
 
-    .section .text.vectors, "ax"
+    /* ======================= IMAGE HEAD =====================================
+     * Byte-for-byte the layout of a REAL ARM zImage, because that is what this
+     * watch's aboot loads and hands off to. Diffed against the AsteroidOS hoki
+     * boot.img that provably runs on this device (2026-08-02):
+     *
+     *   0x00..0x1c  8x  mov r0,r0   <- NOP sled; entry is at 0x00 and falls
+     *                                  through it into the branch
+     *   0x20        b   reset       <- (real zImage: ea000003 -> 0x34)
+     *   0x24        0x016f2818      <- magic; aboot parses this to FIND THE
+     *                                  APPENDED DTB (a raw payload gets the
+     *                                  "dtb not found" error we saw)
+     *   0x28        zImage_start = 0
+     *   0x2c        zImage_end       <- where mk-bootimg appends the DTB
+     *   0x30        0x04030201      <- endianness flag. OUR OLD IMAGE HAD A
+     *                                  LITERAL-POOL WORD HERE. A loader that
+     *                                  validates it would reject the image —
+     *                                  and "aboot never transferred control"
+     *                                  is exactly the symptom we are chasing.
+     *   0x34        code
+     *
+     * The old layout put the EXCEPTION VECTOR TABLE at 0x00, which collided
+     * with the NOP sled and the flag word. The vectors now live in their own
+     * aligned block below and VBAR is programmed to point at them, which is
+     * how a normal ARM image does it anyway. */
+    .section .text.head, "ax"
     .global _start
 _start:
+    mov     r0, r0                  /* 0x00 */
+    mov     r0, r0
+    mov     r0, r0
+    mov     r0, r0
+    mov     r0, r0
+    mov     r0, r0
+    mov     r0, r0
+    mov     r0, r0                  /* 0x1c */
+    b       reset                   /* 0x20 */
+    .word   0x016f2818              /* 0x24 zImage magic */
+    .word   0                       /* 0x28 zImage_start (relative) */
+    .word   (__image_copy_end - _start) /* 0x2c zImage_end -> DTB append point */
+    .word   0x04030201              /* 0x30 endianness flag (little-endian) */
+
+    .section .text.vectors, "ax"
+    .align  5                       /* VBAR requires 32-byte alignment */
+    .global _vectors
+_vectors:
     b       reset                   /* 0x00 reset */
     b       hang_undef              /* 0x04 undefined instruction */
     ldr     pc, =FreeRTOS_SWI_Handler   /* 0x08 svc: FreeRTOS yield */
@@ -31,11 +73,49 @@ _start:
     b       hang_dabt               /* 0x10 data abort */
     b       .                       /* 0x14 reserved */
     ldr     pc, =FreeRTOS_IRQ_Handler   /* 0x18 IRQ: FreeRTOS/GIC dispatch */
-    b       .                       /* 0x1c FIQ */
+    b       hang_fiq                /* 0x1c FIQ: unexpected - report it too */
 
     .section .text.startup, "ax"
 reset:
     cpsid   if                  /* mask IRQ+FIQ */
+
+#if defined(WDOG_TEST)
+    /* --- WDOG_TEST: the minimal "did our code execute at all?" probe -------
+     *
+     * THE PROBLEM THIS SOLVES: every image so far shows aboot's logo for ~15 s
+     * and then warm-resets into Wear OS, with no vibration — which is exactly
+     * what the APPS watchdog does when NOTHING pets it. That is indistinguish-
+     * able from "our code never ran". Every other channel is gone: this kernel
+     * is built CONFIG_DEVMEM=n / CONFIG_PSTORE=n (so IMEM and DDR cannot be
+     * read back from Linux), the motor needs SPMI (a suspect), the display is
+     * what we are debugging, and reboot_to_bootloader() is itself unproven —
+     * so even "does it return to fastboot" conflates two failures.
+     *
+     * The watchdog is the way out, because aboot leaves it RUNNING and we know
+     * its registers. Reprogramming its timeout changes WHEN the watch reboots,
+     * and that is observable with a stopwatch and nothing else:
+     *
+     *     reboots after ~3 s   -> OUR CODE RAN (it reprogrammed the dog)
+     *     reboots after ~15 s  -> our code never executed a single instruction
+     *
+     * Dependencies: four MMIO stores to 0x0b017000, a region aboot itself uses.
+     * No MMU, no relocation, no stack, no C, no SPMI, no display, no reboot
+     * path. This runs before literally everything else, so a "3 s" result also
+     * means aboot's handoff, the load address and the image format are all
+     * fine. 3 * 32765 = 98295 ticks (WDT_HZ from the vendor driver). */
+    ldr     r4, =0x0B017000
+    mov     r5, #0
+    str     r5, [r4, #8]        /* WDT0_EN = 0 (pause while reprogramming) */
+    ldr     r5, =98295          /* 3 s at 32765 Hz */
+    str     r5, [r4, #16]       /* WDT0_BARK_TIME */
+    str     r5, [r4, #20]       /* WDT0_BITE_TIME */
+    mov     r5, #1
+    str     r5, [r4, #4]        /* WDT0_RST = 1 (restart the countdown) */
+    str     r5, [r4, #8]        /* WDT0_EN = 1 */
+    dsb
+1:  b       1b                  /* spin: let the dog bite and prove the point */
+#endif
+
     /* force SVC mode (aboot enters SVC; be defensive anyway) */
     mrs     r4, cpsr
     bic     r4, r4, #0x1f
@@ -66,7 +146,8 @@ reset:
 
 at_home:
     /* ---- vectors ----------------------------------------------------------- */
-    ldr     r0, =_start
+    ldr     r0, =_vectors               /* NOT _start: the image head is now a
+                                           zImage prologue, vectors moved out */
     mcr     p15, 0, r0, c12, c0, 0      /* VBAR */
 
     /* ---- VFP/NEON on ------------------------------------------------------- */
@@ -97,19 +178,43 @@ at_home:
     bl      main
     b       .
 
-/* Faults: land in distinct labels so a debugger / ramlog dump can tell them
- * apart; each writes its marker into boot_fault (readable post-mortem) then
- * parks. No UART use here — keep fault paths dependency-free. */
-.macro fault_stub name, code
+/* Faults: land in distinct labels; each writes its marker into boot_fault and
+ * then REPORTS ITSELF by reprogramming the APPS watchdog to a distinct short
+ * timeout before parking (2026-08-03: a silent `b .` made a CPU fault
+ * indistinguishable from a hang — the wdog just bit at whatever was last
+ * armed). Pure asm, no stack: abort/undef modes have no SP set up here.
+ * Stopwatch decode (fault at ~3 s + value): FIQ ~6 s, DABT ~9 s, UNDEF ~12 s,
+ * PABT ~20 s — all clear of the stage-table readings. */
+.macro fault_stub name, code, secs
 \name:
     ldr     r0, =boot_fault
     mov     r1, #\code
     str     r1, [r0]
+    ldr     r0, =0x0B017000         /* APPS wdog: report fault class by time */
+    mov     r1, #0
+    str     r1, [r0, #0x08]         /* EN = 0 while reprogramming */
+    mov     r2, #0x60000            /* ~200 us spin: the wdog runs on the     */
+90: subs    r2, r2, #1              /* 32 kHz sleep clock and each write needs */
+    bne     90b                     /* several slow-clock cycles to latch      */
+    ldr     r1, =(\secs * 32765)
+    str     r1, [r0, #0x10]         /* BARK */
+    str     r1, [r0, #0x14]         /* BITE */
+    mov     r2, #0x60000
+91: subs    r2, r2, #1
+    bne     91b
+    mov     r1, #1
+    str     r1, [r0, #0x08]         /* EN = 1 (before RST: vendor order) */
+    mov     r2, #0x60000
+92: subs    r2, r2, #1
+    bne     92b
+    str     r1, [r0, #0x04]         /* RST = pet -> countdown from now */
+    dsb     sy
     b       .
 .endm
-    fault_stub hang_undef, 1
-    fault_stub hang_pabt,  3
-    fault_stub hang_dabt,  4
+    fault_stub hang_undef, 1, 9
+    fault_stub hang_pabt,  3, 17
+    fault_stub hang_dabt,  4, 6
+    fault_stub hang_fiq,   5, 5
 
     .section .data
     .global boot_r2

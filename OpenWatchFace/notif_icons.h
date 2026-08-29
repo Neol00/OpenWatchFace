@@ -17,10 +17,17 @@
 #define NOTIF_ICONS_HAVE_MDI 1
 #endif
 #if NOTIF_ICONS_HAVE_MDI
-LV_FONT_DECLARE(icons22);                 // the converted MDI font (icons22.c)
+/* PINNED to the full-range icons22 cut on every board — deliberately NOT
+ * UI_ICON_MDI(22): the notification-category glyphs exist ONLY in icons22.c
+ * (icons14/28 carry just the coffee + moon UI glyphs), so letting the group
+ * snap to a smaller cut on the 240-wide boards would render every category as
+ * tofu. The icon is its own size group (one per row, all rows identical), so
+ * uniformity holds; it just rides a step larger than the scaled text on small
+ * panels. TODO: regenerate icons14.c with the notification --range list, then
+ * this can become UI_ICON_MDI(22). */
 #define NOTIF_ICON_FONT (&icons22)
 #else
-#define NOTIF_ICON_FONT (&lv_font_montserrat_20)   // fallback: built-in symbol font
+#define NOTIF_ICON_FONT (&UI_ICON_SYM(22))   // built-in symbols: full coverage at any size
 #endif
 /* ---- per-category MDI codepoints ----
  * Indexed by NotifCat. Verify/adjust each against your MDI version on
@@ -333,7 +340,7 @@ static void notif_icon_apply(lv_obj_t *label, uint8_t cat) {
   char u[5];
   lv_label_set_text(label, notif_icon_utf8(NOTIF_CAT_CP[cat], u));
 #else
-  lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(label, &UI_ICON_SYM(22), 0);
   lv_label_set_text(label, NOTIF_CAT_SYMBOL[cat]);
 #endif
 }

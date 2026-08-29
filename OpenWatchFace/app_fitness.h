@@ -166,7 +166,7 @@ static void app_open_fitness(void) {
   lv_label_set_long_mode(fit_status, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(fit_status, LV_PCT(96));
 #else
-  lv_label_set_long_mode(fit_status, LV_LABEL_LONG_DOT);   // single line, ellipsis if long
+  ui_label_single_line(fit_status);   // single line, ellipsis if long
   lv_obj_set_width(fit_status, LV_PCT(90));
 #endif
   lv_obj_align_to(fit_status, btn, LV_ALIGN_OUT_BOTTOM_MID, 0, UI_PX(14));

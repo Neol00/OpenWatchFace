@@ -96,7 +96,11 @@
 #define portNO_FLOATING_POINT_CONTEXT    ( ( StackType_t ) 0 )
 
 /* Constants required to setup the initial task context. */
-#define portINITIAL_SPSR                 ( ( StackType_t ) 0x1f ) /* System mode, ARM mode, IRQ enabled FIQ enabled. */
+/* fossil-port patch (2026-08-03): F bit SET — tasks run with FIQ MASKED.
+ * Stock 0x1F unmasked FIQ at the first context switch; on this Qualcomm
+ * chain a pending secure-side FIQ then landed in our (parking) FIQ vector
+ * ~1.5 s into boot. We never use FIQ; keep it masked forever. */
+#define portINITIAL_SPSR                 ( ( StackType_t ) 0x5f ) /* System mode, ARM mode, IRQ enabled FIQ MASKED. */
 #define portTHUMB_MODE_BIT               ( ( StackType_t ) 0x20 )
 #define portINTERRUPT_ENABLE_BIT         ( 0x80UL )
 #define portTHUMB_MODE_ADDRESS           ( 0x01UL )
@@ -358,7 +362,11 @@ BaseType_t xPortStartScheduler( void )
 
         /* Sanity check configUNIQUE_INTERRUPT_PRIORITIES matches the read
          * value. */
-        configASSERT( ucMaxPriorityValue == portLOWEST_INTERRUPT_PRIORITY );
+        /* fossil-port patch (2026-08-03): was ==. The hardware implementing
+         * MORE priority levels than configured is harmless (values quantize);
+         * only FEWER is fatal. The == form turned a sanity check into a
+         * boot-killer while probing this device's GIC view. */
+        configASSERT( ucMaxPriorityValue >= portLOWEST_INTERRUPT_PRIORITY );
 
         /* Restore the clobbered interrupt priority register to its original
          * value. */

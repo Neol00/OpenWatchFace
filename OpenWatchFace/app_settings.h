@@ -14,6 +14,9 @@
 #else
 #include "esp_heap_caps.h"   // heap_caps_get_free_size + MALLOC_CAP_* for the per-pool memory readout
 #endif
+#if BOARD_PLATFORM_FOSSIL
+#include "owf_meminfo.h"     // bare-metal: DDR facts + real sbrk/heap_4 accounting
+#endif
 
 /* Library versions for the About screen. LVGL / Espressif core / XPowersLib expose
  * compile-time macros (used directly below). The rest have NO version macro, so
@@ -148,6 +151,33 @@ static void app_open_about(void) {
         resv / 1024,
         deviceRadioName().c_str());
   }
+#elif BOARD_PLATFORM_FOSSIL
+  // Bare-metal on 1 GB of DDR — there is no SRAM/PSRAM split to report. The SoC's
+  // only on-chip RAM is 4 KB of system IMEM (boot cookies) and 32 KB of RPM message
+  // RAM, neither general-purpose, so DDR is the entire memory budget. What matters
+  // to a developer here is not "how much DDR exists" (a gigabyte, essentially all of
+  // it idle) but how close the two pools we actually carved out are to running dry.
+  {
+    owf_meminfo_t m;
+    owf_meminfo(&m);
+    lv_label_set_text_fmt(sys,
+        "Chip:    %s\n"
+        "DDR:     %u MB  (%u MB reserved: TZ/modem/DSP)\n"
+        "Image:   %u KB static @ 0x%08X\n"
+        "Heap:    %u / %u KB used  (app/LVGL)\n"
+        "RTOS:    %u / %u KB used  (min free %u KB)\n"
+        "Radio:   %s",
+        ESP.getChipModel(),
+        (unsigned)(m.ddr_total / (1024 * 1024)),
+        (unsigned)(m.ddr_reserved / (1024 * 1024)),
+        (unsigned)(m.static_bytes / 1024), (unsigned)m.image_base,
+        (unsigned)(m.malloc_used / 1024),
+        (unsigned)(m.malloc_cap / 1024),
+        (unsigned)((m.rtos_total - m.rtos_free) / 1024),
+        (unsigned)(m.rtos_total / 1024),
+        (unsigned)(m.rtos_min_free / 1024),
+        deviceRadioName().c_str());
+  }
 #else
   size_t sram_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   size_t ps_free   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -197,6 +227,14 @@ static void app_open_about(void) {
   }
 
   // ---- Storage (microSD, live at open) ----
+  // SKIPPED ENTIRELY on the Fossil/Mobvoi watches: none of them has a card
+  // slot, and none ever will — they are sealed watches whose only storage is
+  // soldered eMMC. A "Card: none detected" line there is not information, it
+  // is a permanent answer to a question the hardware cannot ask, and it made
+  // the About screen read like something was missing or broken.
+  // (When eMMC storage lands on these watches it deserves its own section
+  // with its own numbers, not this one relabelled.)
+#if !BOARD_PLATFORM_FOSSIL
   about_header(col, "STORAGE");
   lv_obj_t *sd = about_line(col, &FONT_ABOUT_BODY, 0xCCCCCC, "");
 #if BOARD_PLATFORM_MAIX
@@ -241,6 +279,7 @@ static void app_open_about(void) {
     lv_label_set_text(sd, "Card:    none detected");
   }
 #endif  /* BOARD_PLATFORM_MAIX */
+#endif  /* !BOARD_PLATFORM_FOSSIL */
 
   // ---- Software stack ----
   // ALL versions are fetched automatically. LVGL / Espressif core / XPowersLib

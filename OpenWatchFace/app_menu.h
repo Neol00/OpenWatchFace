@@ -40,21 +40,77 @@ static bool      menu_open  = false;
  * The tile BOX size is computed from the real screen width at build time (see
  * app_menu_init) so exactly MENU_COLS fit across — no hard-coded tile pixels that
  * could overflow a narrow panel. */
-#if BOARD_SCREEN_NARROW
+/* The three tiers are mutually exclusive (NARROW <=220, MIDNARROW 221..320, else
+ * wide), so order is not load-bearing here — MIDNARROW is simply listed first. */
+#if BOARD_SCREEN_MIDNARROW
+/* MID-NARROW portrait (S3-1.64, 280x456): a widescreen-shaped panel stood upright.
+ * Wide enough that the 1-column narrow layout would waste it, but 130 px narrower
+ * than the 410 reference — at 3 columns the tiles came out so small that the icon
+ * collided with a label that had to wrap. TWO columns x 3 rows gives 6 per page:
+ * each tile is roughly half the panel width instead of a third, so the icon and a
+ * single-line label fit with room to spare, and the tall panel still shows 3 rows.
+ * The larger tile also affords the full-size 34 px icon. */
+#define MENU_COLS           2
+#define MENU_ROWS           3
+#define MENU_TILE_GAP       12
+#define MENU_TILE_ICON_FONT lv_font_montserrat_34
+#define MENU_HINT_FONT      lv_font_montserrat_16   // HAND-ACCEPTED on the 1.64 — not UI_FONT
+#elif BOARD_SCREEN_NARROW
+/* TRULY NARROW portrait (C6-1.47, 172 wide): lay each page out as ONE COLUMN of
+ * 3 tiles stacked vertically, and swipe horizontally for the next 3. Tiles are
+ * full-width and big. */
 #define MENU_COLS           1
 #define MENU_ROWS           3
 #define MENU_TILE_GAP       10
 #define MENU_TILE_ICON_FONT lv_font_montserrat_34
 #define MENU_HINT_FONT      lv_font_montserrat_10   // "< BOOT" back hint (app screens + menu)
+#elif BOARD_SCREEN_SUBREF
+/* SUB-REFERENCE but still 3-columns-wide (S3-Touch-LCD-2, 240x320): the panel is
+ * square enough for the reference 3x3 grid, but it is 41% narrower than the 410 px
+ * panel those tile/label sizes were authored against. So it keeps the grid SHAPE
+ * and shrinks only the text:
+ *   - MENU_TILE_ICON_FONT stays 34: the icons look right at this size and were
+ *     explicitly reported as good — do not scale them with the labels.
+ *   - MENU_HINT_FONT auto-scales via UI_FONT(20) (12 at 240 wide): the "< BOOT"
+ *     hint is a dim discoverability label, not content, and at the reference
+ *     20 px it dominated a 240 px screen.
+ * The tile CAPTION font is handled in menu_build_tile() (see the SUBREF branch
+ * there) because it also needs the caption's width/offsets to match. */
+#define MENU_COLS           3
+#define MENU_ROWS           3
+/* Tighter gap than the reference 12. The tile side is
+ * (panel - 3*gap - 2*gap_between)/3, so on a 240 px panel every px taken off the
+ * gap goes almost 1:1 into the tile: gap 12 -> 56 px tiles, gap 6 -> 66 px. That
+ * ~18% bigger tile is what stops the caption colliding with the 34 px icon. */
+#define MENU_TILE_GAP       6
+#define MENU_TILE_ICON_FONT lv_font_montserrat_34
+#define MENU_HINT_FONT      UI_FONT(20)
+#elif BOARD_SCREEN_ROUND_SMALL
+/* SMALL ROUND face (C2/S2, 360x360): keeps the reference 3x3 grid — the panel is
+ * wide enough — but the whole page has to fit in 360 px of HEIGHT rather than the
+ * reference 502, with a bottom band for the page dots and the "< BOOT" hint that
+ * the round bezel also pushes inward. Two knobs do the work:
+ *   - MENU_TILE_GAP 8 (from 12): the tile side is roughly
+ *     (usable - 2*gap)/3, so every px off the gap goes almost 1:1 into the tile.
+ *     Buying tile size back from the gap is what keeps the icon + caption legible
+ *     after the vertical budget shrinks (the same trade the SUBREF tier makes).
+ *   - MENU_TILE_ICON_FONT stays 34, like every other tier — the tile icons have
+ *     been accepted at that size on panels from 240 to 466 wide.
+ * The vertical budget itself (title y, pager height, dots strip, hint y) is in
+ * app_menu_init; this block is only the grid shape. */
+#define MENU_COLS           3
+#define MENU_ROWS           3
+#define MENU_TILE_GAP       8
+#define MENU_TILE_ICON_FONT lv_font_montserrat_34
+#define MENU_HINT_FONT      UI_FONT(20)
 #else
-/* C6-1.47 is a TALL portrait panel: lay each page out as ONE COLUMN of 3 tiles
- * stacked vertically (top/middle/bottom), and swipe horizontally for the next 3.
- * 9 apps -> 3 pages. Tiles are full-width and big. */
+/* WIDE panels (S3-2.06 410-wide, S3-1.8 368-wide): the reference layout — a
+ * 3x3 page of tiles, swipe horizontally for the next page. */
 #define MENU_COLS           3
 #define MENU_ROWS           3
 #define MENU_TILE_GAP       12
 #define MENU_TILE_ICON_FONT lv_font_montserrat_34
-#define MENU_HINT_FONT      lv_font_montserrat_20
+#define MENU_HINT_FONT      UI_FONT(20)   // identity at the 410 reference
 #endif
 #define MENU_TILES_PER_PAGE (MENU_COLS * MENU_ROWS)
 #define MENU_PAGE_COUNT  ((MENU_ITEM_COUNT + MENU_TILES_PER_PAGE - 1) / MENU_TILES_PER_PAGE)
@@ -123,15 +179,28 @@ static lv_obj_t *app_screen_begin(const char *title) {
   lv_obj_set_style_text_font(t, &FONT_LABEL, 0);
   lv_obj_set_style_text_color(t, lv_color_white(), 0);
   lv_label_set_text(t, title);
-#if BOARD_SCREEN_NARROW
-  // Narrow panels: a long centered title (e.g. "Find Phone") runs horizontally
-  // into the top-left "< BOOT" hint. Drop the title BELOW the hint row so they
-  // never share a horizontal band, and let it wrap centered if still too wide.
+#if BOARD_SCREEN_NARROW || BOARD_SCREEN_SUBREF
+  // Any panel narrower than the reference: a long centered title (e.g. "Find Phone"
+  // or "Notifications") runs horizontally into the top-left "< BOOT" hint — there is
+  // not enough width beside the hint for it. Drop the title BELOW the hint row so
+  // they never share a horizontal band, and let it wrap centered if still too wide.
+  // (SUBREF, not MIDNARROW: this is about WIDTH vs the title, nothing to do with
+  // how many launcher columns the panel takes.)
   lv_obj_set_width(t, LV_PCT(100));
   lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+#if BOARD_SCREEN_NARROW
   // Sit the title well below the BOOT hint row (hint top UI_PX(14) + its line
   // height). UI_PX(44) still left the title's top touching the hint's bottom.
   lv_obj_align(t, LV_ALIGN_TOP_MID, 0, UI_PX(72));
+#else
+  // MID-WIDTH (SUBREF but not narrow — S3-LCD-2 240, S3-1.64 280): the narrow
+  // tier's 72 was inherited here and left a ~20 px DEAD BAND between the hint
+  // and the title (the hint font on this tier is a small 12, its row ends high),
+  // while the title's bottom ran UNDER the content columns that start at
+  // UI_PX(80..84). 46 clears the hint's line by a few px and ends just above
+  // the content band — the header stops eating into the scroll area.
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, UI_PX(46));
+#endif
 #else
   lv_obj_align(t, LV_ALIGN_TOP_MID, 0, UI_PX(40));
 #endif
@@ -237,16 +306,31 @@ static lv_obj_t *settings_toggle_row(lv_obj_t *parent, const char *symbol,
   lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *ic = lv_label_create(row);
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(ic, lv_color_white(), 0);
   lv_label_set_text(ic, symbol);
   lv_obj_align(ic, LV_ALIGN_LEFT_MID, 20, 0);
 
   lv_obj_t *nm = lv_label_create(row);
+#if BOARD_SCREEN_SUBREF
+  /* Mid-width panels (S3-LCD-2 240, S3-1.64 280): these fixed offsets were
+   * authored for the 410 px reference, where FONT_LABEL at x=60 has ~250 px of
+   * clear run before the switch. Here it has ~70, so "Auto-dim" ran INTO the
+   * switch, and the x=60 start left a dead gutter after the icon (which ends
+   * around x=40). Shrink the TEXT only — the icon at 20 px reads right and the
+   * user confirmed it — pull it in to x=46, and dot-truncate at a width that
+   * stops short of the switch so a longer future caption degrades to "…"
+   * instead of clipping under it. */
+  lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);   // 12 on this tier (label is 16)
+  ui_label_single_line(nm);
+  lv_obj_set_width(nm, LV_PCT(44));
+  lv_obj_align(nm, LV_ALIGN_LEFT_MID, 46, 0);
+#else
   lv_obj_set_style_text_font(nm, &FONT_LABEL, 0);
+  lv_obj_align(nm, LV_ALIGN_LEFT_MID, 60, 0);
+#endif
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
   lv_label_set_text(nm, name);
-  lv_obj_align(nm, LV_ALIGN_LEFT_MID, 60, 0);
 
   lv_obj_t *sw = lv_switch_create(row);
   lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -16, 0);
@@ -274,7 +358,27 @@ static void app_open_timer(void);
 static void app_open_stopwatch(void);
 static void app_open_find_phone(void);
 static void app_open_files(void);
+#if BOARD_HAS_CAMERA
+static void app_open_camera(void);       // defined in app_camera.h (camera boards only)
+static void app_camera_on_close(void);   // releases the sensor + buffers when leaving
+#endif
+/* Gallery availability: photos/videos need PSRAM decode buffers and the ESP32
+ * core's esp_jpeg component — no camera required, so this is its OWN gate (a
+ * board with storage but no sensor still gets the app). Same expression as
+ * app_gallery.h computes; ifndef-guarded so whichever is seen first wins. */
+#ifndef OWF_HAS_GALLERY
+#if BOARD_HAS_PSRAM && !BOARD_PLATFORM_TUYA && __has_include("jpeg_decoder.h")
+#define OWF_HAS_GALLERY 1
+#else
+#define OWF_HAS_GALLERY 0
+#endif
+#endif
+#if OWF_HAS_GALLERY
+static void app_open_gallery(void);      // defined in app_gallery.h
+static void app_gallery_on_close(void);  // frees the decoded thumbs/frames
+#endif
 static void app_open_fitness(void);
+static void app_open_weather(void);
 static void app_open_sleep(void);
 static void app_open_sleep_data(void);
 static void app_open_sleep_trends(void);
@@ -304,6 +408,19 @@ static void nav_open(screen_fn fn) {
 }
 
 static void nav_back(void) {
+#if BOARD_HAS_CAMERA
+  /* Leaving the Camera app (it is a ROOT sub-app, so any back from it exits it):
+   * stop the live preview, power the sensor down and free its PSRAM buffers.
+   * Without this the preview timer would keep firing against deleted widgets and
+   * the sensor would stay powered for as long as the watch is awake. */
+  if (nav_current == app_open_camera) app_camera_on_close();
+#endif
+#if OWF_HAS_GALLERY
+  /* Same shape for the Gallery: decoded thumbnails/frames are PSRAM-heavy and
+   * the video player may hold an open file + timer. This also covers backing
+   * out of a Gallery that was opened FROM the Camera app (nav pops back to it). */
+  if (nav_current == app_open_gallery) app_gallery_on_close();
+#endif
   if (nav_depth > 0) {                        // deeper than a root sub-app -> previous screen
     nav_current = nav_stack[--nav_depth];
     nav_current();                            // rebuild it (app_screen_begin replaces app_scr)
@@ -336,7 +453,21 @@ static const MenuItem MENU_ITEMS[] = {
   { "WiFi & BLE",    LV_SYMBOL_WIFI,         0x33A0FF, app_open_wifi_ble },
   { "Player",        LV_SYMBOL_AUDIO,        0xFF375F, app_open_player },
   { "Find Phone",    LV_SYMBOL_CALL,         0x00C2A8, app_open_find_phone },
+  { "Weather",       LV_SYMBOL_REFRESH,      0xFFD60A, app_open_weather, MDI_WX_PARTLY },
   { "Files",         LV_SYMBOL_DRIVE,        0x9B8CFF, app_open_files },
+#if BOARD_HAS_CAMERA
+  /* Only on a board with a camera sensor wired up (the S3-Touch-LCD-2's DVP
+   * header). Elsewhere the app itself doesn't exist, so the tile must not either
+   * — same reasoning as the IMU-gated tiles below. */
+  { "Camera",        LV_SYMBOL_VIDEO,        0x5AC8FA, app_open_camera },
+#endif
+#if OWF_HAS_GALLERY
+  /* Deliberately NOT camera-gated: the Gallery browses whatever media is on
+   * the SD card / flash, so it is useful on any board that can decode it.
+   * Burnt orange, DELIBERATELY not Appearance's amber 0xFF9F0A — two orange
+   * tiles at the same hue read as the same app at a glance. */
+  { "Gallery",       LV_SYMBOL_IMAGE,        0xFF6B2D, app_open_gallery },
+#endif
   { "About",         LV_SYMBOL_LIST,         0xFFFF80, app_open_about },
 #if BOARD_HAS_IMU_QMI8658
   /* Both are IMU-driven: Fitness is the hardware step counter, Sleep tracks
@@ -347,6 +478,30 @@ static const MenuItem MENU_ITEMS[] = {
 #endif
 };
 static const int MENU_ITEM_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
+
+/* THE one caption font for the whole app grid: the largest stock Montserrat, up
+ * to the tier's authored caption size, at which EVERY name in MENU_ITEMS fits
+ * `cap_w` on one line — i.e. the group is fitted to its worst member, so all
+ * tiles render the same size (mixed per-tile sizes read as a glitch). Cached:
+ * the answer only depends on cap_w (constant per board) and the static list. */
+static const lv_font_t *menu_caption_font(int cap_w) {
+  static const lv_font_t *cached = nullptr;
+  static int cached_w = -1;
+  if (cached && cached_w == cap_w) return cached;
+#if BOARD_SCREEN_NARROW
+  const int authored_px = 10;   // the C6 tier's hand caption size
+#else
+  const int authored_px = 12;   // authored on the 2.06 (UI_FONT identity there)
+#endif
+  const lv_font_t *worst = ui_font_fit(MENU_ITEMS[0].name, cap_w, authored_px);
+  for (int i = 1; i < MENU_ITEM_COUNT; i++) {
+    const lv_font_t *f = ui_font_fit(MENU_ITEMS[i].name, cap_w, authored_px);
+    if (lv_font_get_line_height(f) < lv_font_get_line_height(worst)) worst = f;
+  }
+  cached = worst;
+  cached_w = cap_w;
+  return cached;
+}
 
 static void menu_tile_cb(lv_event_t *e) {
   const MenuItem *it = (const MenuItem *)lv_event_get_user_data(e);
@@ -415,20 +570,50 @@ static lv_obj_t *menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, 
 
     lv_obj_t *name = lv_label_create(tile);
     lv_obj_set_style_text_color(name, lv_color_white(), 0);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(name, item->name);
+
+    // CAPTION FONT IS AUTO-FITTED **UNIFORMLY** (menu_caption_font): ONE font for
+    // every tile — the largest stock Montserrat, up to the tier's authored size,
+    // at which EVERY app name in MENU_ITEMS fits its caption on ONE line. Two
+    // rules meet here and both are hard requirements:
+    //   1. a caption must NEVER wrap — the second line runs up into the 34 px
+    //      icon (the reported bug: "Notifications" wrapping on the 240-wide
+    //      panels), and
+    //   2. the size must be THE SAME on every tile — per-label fitting made
+    //      "Timer" render bigger than "Notifications" next to it, which reads as
+    //      a layout glitch, not a design.
+    // So the group is fitted to its WORST member: the 2.06's ~100 px captions
+    // keep the authored 12 everywhere; the 240-wide panels drop the whole set to
+    // whatever "Notifications" needs.
+    //
+    // Belt-and-braces: even the 8 px floor can lose to some future long name, so
+    // the label ALSO gets DOT truncation with a FIXED ONE-LINE box. Both parts of
+    // that are load-bearing: DOT against an auto-height label still wraps (LVGL
+    // only truncates against a fixed size — the silent gotcha that defeated the
+    // previous montserrat_10+DOT fix on the LCD-2), so the height must be pinned
+    // to the font's line height.
+    const lv_font_t *cap = menu_caption_font(w - 4);
+    lv_obj_set_style_text_font(name, cap, 0);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);   // truncate, never wrap
+    lv_obj_set_size(name, w - 4, lv_font_get_line_height(cap));  // fixed 1-line box
 
 #if BOARD_SCREEN_NARROW
     // C6: scale the icon/name placement to the small tile.
     lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, h / 6);
-    lv_obj_set_style_text_font(name, &lv_font_montserrat_10, 0);
-    lv_obj_set_width(name, w - 4);
     lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -(h / 12));
+#elif BOARD_SCREEN_SUBREF
+    // SUB-REFERENCE 3-column panel (S3-LCD-2 / S3-1.69, 240 wide). The tile here
+    // is ~66 px against the 2.06's ~112 px — barely over half — but the icon stays
+    // at 34 px (deliberate: the icons read well at that size), so placement is
+    // tightened: the icon sits higher (h*10/104 vs h*18/104) and the caption hugs
+    // the bottom, maximising the clear band between them.
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, h * 10 / 104);
+    lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -(h * 6 / 104));
 #else
-    // S3-2.06 look: montserrat_34 icon near the top, montserrat_12 caption pinned
-    // just up from the bottom. The offsets were originally HARD-CODED for that
-    // board's 104 px tile on a 410 px panel (icon +18, caption -12, width 100).
+    // S3-2.06 look: montserrat_34 icon near the top, caption pinned just up from
+    // the bottom. The offsets were originally HARD-CODED for that board's 104 px
+    // tile on a 410 px panel (icon +18, caption -12, width 100).
     //
     // The caption WIDTH especially must derive from the tile, not be a constant:
     // a label wider than its parent makes the tile demand more width than we set,
@@ -436,13 +621,7 @@ static lv_obj_t *menu_build_tile(lv_obj_t *parent, const MenuItem *item, int w, 
     // drops the last column onto a new row. That is why shrinking the tile alone
     // never fixed the "3 columns became 2" bug on the 368 px S3-1.8 — the tile got
     // smaller but its 100 px caption did not, so the row still overflowed.
-    //
-    // Derive all three from the tile box (w/h). On a 104 px tile these evaluate to
-    // ~100 / 18 / 12 — i.e. the S3-2.06 keeps its original look — while a smaller
-    // tile now scales its contents down with it instead of overflowing.
     lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, h * 18 / 104);
-    lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
-    lv_obj_set_width(name, w - 4);
     lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -(h * 12 / 104));
 #endif
   }
@@ -488,10 +667,26 @@ static void app_menu_init(void) {
   lv_obj_clear_flag(menu_scr, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *title = lv_label_create(menu_scr);
+#if BOARD_SCREEN_ROUND_SMALL
+  // SMALL ROUND face: the requested "move Apps up so the tiles don't have to
+  // shrink so much". Two things buy that height back:
+  //   - a 22 px title instead of the 28 px FONT_LABEL (~27 px line instead of ~34)
+  //   - y = UI_PX(4) instead of UI_PX(8)
+  // The title can't simply be slid to y=0: this is a CIRCLE, and the usable chord
+  // narrows fast near the top. At y=4 on the 360 C2 the chord is only ~2*38 px
+  // wide, and "Apps" at 28 px is ~62 px — it would touch the arc. At 22 px it is
+  // ~48 px and clears. So the font drop is what makes the move up possible, not a
+  // separate cosmetic change.
+  lv_obj_set_style_text_font(title, &UI_FONT(22), 0);
+  lv_obj_set_style_text_color(title, lv_color_white(), 0);
+  lv_label_set_text(title, "Apps");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, UI_PX(2));
+#else
   lv_obj_set_style_text_font(title, &FONT_LABEL, 0);
   lv_obj_set_style_text_color(title, lv_color_white(), 0);
   lv_label_set_text(title, "Apps");
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, UI_PX(8));
+#endif
 
   // The PAGER: a horizontal scroll-snap row that fills the area between the title
   // and the dots. Each child is one full-screen-width PAGE holding a wrapped grid.
@@ -503,8 +698,40 @@ static void app_menu_init(void) {
   // Reserve a fixed strip at the very bottom for the page dots, and give the pager
   // the rest. The dots live in that strip — BELOW the pager — so they can never
   // overlap a tile, and the tiles get the full remaining height (no shrinking).
+#if BOARD_SCREEN_ROUND_SMALL
+  // SMALL ROUND face: the reported bug was the bottom tile row sitting ON the page
+  // dots and covering half the "< BOOT" hint. The old strip was 22 RAW px, which
+  // reserved room for the dots ALONE and left the hint to overlap whatever was
+  // above it — invisible on a 466 px face that has ~30 px of slack anyway, fatal
+  // on a 360 px one that has none. Reserve the WHOLE bottom band instead:
+  //
+  //     hint  "< BOOT" at 20 px, line ~25, bottom-anchored at UI_PX(-12) = -10
+  //           -> y 325..350
+  //     dots  8 px tall, bottom-anchored at UI_PX(-46) = -40   -> y 312..320
+  //     band  = 360 - 316 = 44
+  //
+  // FIRST PASS reserved 44 and predicted a 12 px gap between the last tile row and
+  // the dots; on glass the bottom row still just touched the dot strip, so the
+  // prediction was a little optimistic (LVGL's grid CONTENT tracks size to the
+  // tile's drawn box, which carries the button border the estimate under-counts).
+  // Reserve 60 instead and stop predicting the margin down to single px.
+  //
+  // Note the strip cannot be widened ALONE: the tile size is derived from whatever
+  // height is left over, so growing the strip shrinks the tiles 1:1. Pairing it
+  // with the smaller "Apps" header (which frees ~10 px at the top) is what keeps
+  // the tiles at 75 px — 2 px off the previous 77 — instead of paying the full
+  // 16 px out of the tile.
+  const int qs_dots_strip = 60;
+#else
   const int qs_dots_strip = 22;                 // bottom strip height for the page dots
-#if BOARD_SCREEN_ROUND
+#endif
+#if BOARD_SCREEN_ROUND_SMALL
+  // Title is now ~27 px tall at y=UI_PX(4)=3, so it ends at ~30. Start the pager
+  // just below it rather than at the generic UI_PX(40)=35 — on this panel the old
+  // value both overlapped the 34 px title AND wasted the height the tiles need.
+  const int qs_pager_top  = UI_PX(26);
+  const int qs_pager_h    = (int)screenHeight - qs_pager_top - qs_dots_strip;
+#elif BOARD_SCREEN_ROUND
   // ROUND panel (T5 466x466): pull the whole 3x3 grid UP toward the "Apps" header so the
   // bottom row clears the "< BOOT" hint (was clipping Files). Tiles stay FULL SIZE — only
   // the grid's vertical position moves; the "Apps" title is NOT moved.
@@ -565,7 +792,15 @@ static void app_menu_init(void) {
   int tile_sz = (fit_w < fit_h) ? fit_w : fit_h;   // square side = the limiting axis
   if (tile_sz < 32) tile_sz = 32;
 
-#if BOARD_SCREEN_ROUND
+#if BOARD_SCREEN_ROUND_SMALL
+  // SMALL ROUND face: 96 is still the PREFERRED size (same look as the other round
+  // boards), but cap it to what actually fits on BOTH axes. The generic round line
+  // below caps to fit_w only, which is wrong here: on the 360 C2 fit_w is ~102 and
+  // fit_h is ~77, so a width-only cap hands back 96 and relies entirely on the
+  // anti-wrap loop to claw it back. That works, but it means the tile size is set
+  // by a fallback rather than by the fit — cap honestly instead.
+  if (tile_sz > 96) tile_sz = 96;
+#elif BOARD_SCREEN_ROUND
   // ROUND (T5): full 104 px tiles sat a touch tight; shrink VERY slightly to 96 so the
   // grid is a bit more compact (the user wanted only a small reduction). Cap to fit_w.
   tile_sz = (fit_w < 96) ? fit_w : 96;
@@ -728,7 +963,12 @@ static void app_menu_init(void) {
   // Align AFTER the dots are added: the row is LV_SIZE_CONTENT, so its size is only
   // known once it has children. Aligning before (size 0) put it in the wrong place.
   // Anchor 8px BELOW the bottom edge, in the strip reserved below the pager.
-#if BOARD_SCREEN_ROUND
+#if BOARD_SCREEN_ROUND_SMALL
+  // Small round face: sit the dots in the reserved 44 px band, clear of BOTH the
+  // last tile row above and the "< BOOT" hint below (see the band arithmetic at
+  // qs_dots_strip). UI_PX(-46) = -40 on the C2 -> the 8 px row occupies y 312..320.
+  lv_obj_align(menu_dots, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-42));
+#elif BOARD_SCREEN_ROUND
   // Round face: lift the dots well clear of the curved bottom edge, sitting them in
   // the reserved strip just under the last tile row (above the BOOT hint).
   lv_obj_align(menu_dots, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-44));
@@ -741,7 +981,12 @@ static void app_menu_init(void) {
   lv_obj_set_style_text_font(hint, &MENU_HINT_FONT, 0);
   lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
   lv_label_set_text(hint, LV_SYMBOL_LEFT " BOOT");
-#if BOARD_SCREEN_ROUND
+#if BOARD_SCREEN_ROUND_SMALL
+  // Small round face: the dots now own the band from UI_PX(-46) upward, so the hint
+  // drops to UI_PX(-12) (= -10 on the C2, y 325..350). It still clears the bezel:
+  // at y=340 the inscribed circle is ~164 px wide and "< BOOT" at 20 px is ~60 px.
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-8));
+#elif BOARD_SCREEN_ROUND
   // Round face: the very bottom-center is the lowest point of the circle; pull the
   // hint up into the visible band so it isn't clipped by the curved bezel.
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, UI_PX(-18));
@@ -803,6 +1048,15 @@ static void app_menu_open(void) {
 }
 
 static void app_menu_close(void) {
+#if BOARD_HAS_CAMERA
+  /* Same teardown as nav_back(), for the path that jumps straight to the clock
+   * (BOOT from the menu, or anything else that closes the UI outright) without
+   * walking back through the app. */
+  if (nav_current == app_open_camera) app_camera_on_close();
+#endif
+#if OWF_HAS_GALLERY
+  if (nav_current == app_open_gallery) app_gallery_on_close();
+#endif
   if (app_scr) { lv_obj_del(app_scr); app_scr = nullptr; }
   if (menu_scr) lv_obj_add_flag(menu_scr, LV_OBJ_FLAG_HIDDEN);
   nav_current = nullptr;

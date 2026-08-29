@@ -44,7 +44,24 @@
 #include "freertos/task.h"
 #endif
 
-#if !BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_FOSSIL
+/* Fossil: the bare-metal runtime measures this itself (fossil-port pwr_diag.c):
+ * loop-body time minus delay() sleep minus display-transfer wait, per 10 s
+ * window — validated against the on-cable PWR census. The ESP idle-hook path
+ * below cannot work here (esp_register_freertos_idle_hook is a compat no-op,
+ * which would read a constant — the same trap the Tuya note describes). */
+extern "C" int pwr_cpu_pct(void);
+#define CPU_CORE_COUNT  1
+#define CPU_CORE_MAX    1
+static void cpu_usage_init(void)         {}
+static void cpu_usage_sample(void)       {}   /* pwr_diag windows on its own */
+static void cpu_usage_reset_window(void) {}
+static void cpu_usage_profile_tick(void) {}
+static uint8_t cpu_usage_pct(uint8_t core) {
+  int p = (core == 0) ? pwr_cpu_pct() : -1;
+  return (p < 0) ? 0 : (p > 100 ? 100 : (uint8_t)p);
+}
+#elif !BOARD_PLATFORM_TUYA
 /* Number of CPU cores to profile. The S3-2.06 is dual-core; the C6-1.47 is
  * single-core, where xTaskGetIdleTaskHandleForCore(1) / an idle hook on core 1
  * ASSERT (xCoreID < 1). Driven by the board's BOARD_DUAL_CORE flag. */

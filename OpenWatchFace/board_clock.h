@@ -64,6 +64,34 @@ static inline uint8_t owf_dec2bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) 
 
 static inline bool board_clock_persists(void) { return true; }
 
+/* Distinguish "the I2C read FAILED" from "the chip answered and says its time is unset":
+ * both come back as the 1970 sentinel from board_clock_now(), but only the second may be
+ * repaired by stamping a default — stamping after a mere read failure DESTROYS the good
+ * time the chip kept (e.g. through a deep sleep, where the rail never drops). Set by every
+ * board_clock_now() call; consumed by the boot-time clock block in the .ino. */
+static bool s_owf_rtc_read_failed = false;
+static inline bool board_clock_read_failed(void) { return s_owf_rtc_read_failed; }
+
+/* Bus recovery: the deep-sleep entry's PM pad shutdown tri-states SCL/SDA at an arbitrary
+ * bit boundary, which can leave a slave on the shared bus (touch/IMU/RTC) mid-transaction
+ * holding SDA low — every transfer then fails. Classic fix: clock SCL until the slave
+ * releases SDA (<=9 pulses), issue a manual STOP, then re-take the pins as I2C. */
+static void owf_t5_i2c_bus_recover(void) {
+  Wire.end();
+  pinMode(IIC_SCL, OUTPUT);
+  digitalWrite(IIC_SCL, HIGH);
+  pinMode(IIC_SDA, INPUT_PULLUP);                  // observe SDA (external 4.7k pulls exist)
+  for (int i = 0; i < 9 && digitalRead(IIC_SDA) == LOW; i++) {
+    digitalWrite(IIC_SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(IIC_SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(IIC_SDA, OUTPUT);                        // manual STOP: SDA low->high, SCL high
+  digitalWrite(IIC_SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(IIC_SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(IIC_SDA, HIGH); delayMicroseconds(5);
+  OWF_WIRE_BEGIN(IIC_SDA, IIC_SCL);
+}
+
 /* Probe the chip: read Control_1. Returns true if it ACKs on the bus. */
 static bool board_clock_begin(void) {
   Wire.beginTransmission(BOARD_RTC_I2C_ADDR);
@@ -74,10 +102,12 @@ static bool board_clock_begin(void) {
 
 /* Read date/time from registers 0x04..0x0A. Caller holds the I2C lock. */
 static RTC_DateTime board_clock_now(void) {
+  s_owf_rtc_read_failed = true;                    // cleared below once the transfer succeeds
   Wire.beginTransmission(BOARD_RTC_I2C_ADDR);
   Wire.write(0x04);                                // point at the seconds register
   if (Wire.endTransmission() != 0) return RTC_DateTime();        // STOP, then a fresh read
   if (Wire.requestFrom((uint8_t)BOARD_RTC_I2C_ADDR, (size_t)7) != 7) return RTC_DateTime();
+  s_owf_rtc_read_failed = false;                   // chip answered; the value is authoritative
   uint8_t sec  = (uint8_t)Wire.read();
   uint8_t mint = (uint8_t)Wire.read();
   uint8_t hour = (uint8_t)Wire.read();
@@ -86,8 +116,14 @@ static RTC_DateTime board_clock_now(void) {
   uint8_t mon  = (uint8_t)Wire.read();
   uint8_t yr   = (uint8_t)Wire.read();
   // sec bit7 = OS (oscillator stopped / low-voltage) -> time invalid; report 1970 so the
-  // .ino's "year < 2024" check re-initializes / NTP-syncs it.
-  if (sec & 0x80) return RTC_DateTime();
+  // .ino's "year < 2024" check re-initializes / NTP-syncs it. This is the CHIP saying its
+  // supply really dropped — log it once per boot to distinguish from a failed I2C read.
+  if (sec & 0x80) {
+    static bool s_os_logged = false;
+    if (!s_os_logged) { s_os_logged = true;
+      USBSerial.println("[rtc] PCF85063 OS flag set - chip really lost power (time invalid)"); }
+    return RTC_DateTime();
+  }
   return RTC_DateTime((uint16_t)2000 + owf_bcd2dec(yr),
                       owf_bcd2dec(mon & 0x1F), owf_bcd2dec(day & 0x3F),
                       owf_bcd2dec(hour & 0x3F), owf_bcd2dec(mint & 0x7F),
@@ -117,6 +153,10 @@ static inline void board_clock_persist_restore(void) {}
 
 #else  /* non-Tuya RTC boards: SensorLib as before --------------------------- */
 #include "SensorPCF85063.hpp"
+
+/* Read-validity probe is a T5-only concept (SensorLib reads don't report transport
+ * failure); report "never failed" so shared callers compile everywhere. */
+static inline bool board_clock_read_failed(void) { return false; }
 
 static SensorPCF85063 rtc;        // module-private — use the accessors below
 
@@ -189,6 +229,9 @@ public:
 #define BOARD_RTC_I2C_ADDR  0x00
 
 static inline bool board_clock_persists(void) { return false; }
+
+/* No I2C RTC — reads can't "fail"; see the T5 branch for what this means there. */
+static inline bool board_clock_read_failed(void) { return false; }
 
 static bool board_clock_begin(void) {
   // Set the LOCAL timezone at boot so localtime()/mktime() apply the right offset

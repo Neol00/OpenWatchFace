@@ -8,7 +8,8 @@
  *    - the known-WiFi store: s_wifi_nets / s_wifi_net_count / wifi_nets_remove /
  *      WIFI_NET_MAX, plus store_lock/unlock and the FONT_* macros.
  *
- *  Two switches (WiFi / BLE) at the top, then a scrollable list of saved
+ *  Two switches (WiFi / BLE) at the top, TX-power rows, an "Available networks"
+ *  scan section (see WIFI_SCAN_SUPPORTED below), then a scrollable list of saved
  *  networks. Each network has a trash button that opens a Forget confirmation
  *  dialog (destructive, so it can't be a single misclick). BLE provisioning
  *  isn't wired up yet — its switch only records intent.
@@ -45,12 +46,15 @@ static void wb_poll_cb(lv_timer_t *t) {
 }
 static lv_obj_t *s_wtxp_val;   // TX-power value labels (defined below) — nulled here
 static lv_obj_t *s_btxp_val;   // on screen teardown so they can never dangle
-static void wb_cleanup_cb(lv_event_t *e) {
-  (void)e;
-  if (s_wb_timer) { lv_timer_del(s_wb_timer); s_wb_timer = nullptr; }
-  s_wtxp_val = nullptr;
-  s_btxp_val = nullptr;
-}
+/* wb_cleanup_cb is DEFINED below the scan section — it also has to tear down the
+ * scan poll timer, whose statics don't exist yet at this point in the file. */
+static void wb_cleanup_cb(lv_event_t *e);
+
+/* Update-check result. The TEXT is kept across screen rebuilds; the LABEL
+ * pointer is cleared in wb_cleanup_cb when LVGL frees the screen. */
+static char s_ota_line[96] = "";
+static lv_obj_t *s_ota_lbl = nullptr;
+
 
 static void ble_sw_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
@@ -192,7 +196,7 @@ static lv_obj_t *radio_txp_row(lv_obj_t *parent, const char *icon, const char *n
   lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *ic = lv_label_create(row);
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);
   lv_label_set_text(ic, icon);
   lv_obj_align(ic, LV_ALIGN_LEFT_MID, UI_PX(16), 0);
@@ -298,6 +302,281 @@ static void wifi_forget_prompt_cb(lv_event_t *e) {
   lv_obj_center(fl);
 }
 
+/* =====================  Available networks (WiFi scan)  =====================
+ * A refresh-button section listing every AP in range. Joining differs by board:
+ *   - Keyboard boards (T-Deck Pro): ANY network is selectable. A secured one
+ *     opens a password prompt typed on the physical keyboard.
+ *   - No keyboard: only OPEN networks and already-saved ones are listed at all —
+ *     there is no way to enter a password on those devices.
+ * Gated off the platforms whose WiFi shim has no scan API (Tuya's compat WiFi
+ * class, Maix, Fossil). */
+#define WIFI_SCAN_SUPPORTED (!BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_FOSSIL)
+
+#if WIFI_SCAN_SUPPORTED
+/* Raised when the user just saved a network from the scan list. The net task
+ * (notif_net.h, included after this file) converts it into an immediate fetch —
+ * which is what actually connects WiFi — so joining gives feedback within
+ * seconds instead of waiting for the next scheduled sync. */
+static volatile bool s_wifi_join_kick = false;
+
+#define WSCAN_MAX 16
+struct WifiScanNet { char ssid[WIFI_SSID_MAX]; int16_t rssi; bool secured; };
+static WifiScanNet s_wscan[WSCAN_MAX];
+static uint8_t     s_wscan_count = 0;
+static bool        s_wscan_busy  = false;   // async scan in flight
+static bool        s_wscan_ran   = false;   // a scan completed at least once
+static lv_timer_t *s_wscan_timer = nullptr; // polls the async scan; exists only while the screen does
+static lv_obj_t   *s_wb_list     = nullptr; // the scroll list (to keep scroll across rebuilds)
+
+static bool wifi_ssid_known(const char *ssid) {
+  for (uint8_t i = 0; i < s_wifi_net_count; i++)
+    if (strncmp(s_wifi_nets[i].ssid, ssid, WIFI_SSID_MAX) == 0) return true;
+  return false;
+}
+
+/* Rebuild the screen, keeping the current scroll position (scan results arrive
+ * while the user may be scrolled down to this section). */
+static void wb_rebuild_keep_scroll(void) {
+  if (s_wb_list) s_wb_scroll_y = lv_obj_get_scroll_y(s_wb_list);
+  lv_async_call(wb_rebuild_async, nullptr);
+}
+
+static void wscan_poll_cb(lv_timer_t *t) {
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  lv_timer_del(t);                        // self-delete is safe in LVGL
+  s_wscan_timer = nullptr;
+  s_wscan_busy  = false;
+  s_wscan_ran   = true;
+  s_wscan_count = 0;
+  for (int i = 0; i < n && s_wscan_count < WSCAN_MAX; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;     // hidden network: nothing to show
+    bool dup = false;                     // same SSID visible on several channels/BSSIDs
+    for (uint8_t j = 0; j < s_wscan_count && !dup; j++)
+      dup = (strncmp(s_wscan[j].ssid, ssid.c_str(), WIFI_SSID_MAX) == 0);
+    if (dup) continue;
+    WifiScanNet &w = s_wscan[s_wscan_count++];
+    strncpy(w.ssid, ssid.c_str(), WIFI_SSID_MAX - 1);
+    w.ssid[WIFI_SSID_MAX - 1] = '\0';
+    w.rssi    = (int16_t)WiFi.RSSI(i);
+    w.secured = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+  }
+  if (n >= 0) WiFi.scanDelete();
+  // The scan brought the STA driver up; don't leave the radio burning when nothing
+  // is connected (the scheduled connect manages its own bring-up/teardown).
+  if (WiFi.status() != WL_CONNECTED) WiFi.mode(WIFI_OFF);
+  wb_rebuild_keep_scroll();
+}
+
+static void wscan_start_cb(lv_event_t *e) {
+  (void)e;
+  if (s_wscan_busy || !settings_get_wifi_enabled()) return;
+  // Same WiFi+BLE coexistence guard as wifi_connect(): bringing the STA driver up
+  // under a starved internal heap fails AND leaks (see WIFI_MIN_FREE_INTERNAL in
+  // notif_net.h — that header is included after this one, hence the mirrored
+  // per-PSRAM constants; keep them in sync).
+  size_t floor_b = BOARD_HAS_PSRAM ? (16u * 1024u) : (40u * 1024u);
+  if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < floor_b) {
+    USBSerial.println("[wscan] refused: internal SRAM below coexistence floor");
+    return;
+  }
+  WiFi.scanDelete();                      // drop stale results from a prior scan
+  WiFi.mode(WIFI_STA);                    // no-op if the driver is already up
+  if (WiFi.scanNetworks(true /*async*/) == WIFI_SCAN_FAILED) {
+    if (WiFi.status() != WL_CONNECTED) WiFi.mode(WIFI_OFF);
+    return;
+  }
+  s_wscan_busy = true;
+  // No timer here: the rebuild below recreates the poll timer whenever a scan is
+  // in flight (that also revives it after any other mid-scan rebuild).
+  wb_rebuild_keep_scroll();               // show the "Scanning..." state
+}
+
+/* Save a network chosen from the scan list and nudge the net task to connect. */
+static void wifi_join_commit(const char *ssid, const char *pass) {
+  store_lock();                           // list is shared with the net task
+  bool added = wifi_nets_add(ssid, pass);
+  if (added) wifi_nets_save();
+  store_unlock();
+  if (added) s_wifi_join_kick = true;
+  wb_rebuild_keep_scroll();               // row now shows its "saved" tag
+}
+
+#if BOARD_HAS_KEYBOARD_TCA8418
+/* ---- Password prompt (keyboard boards only) ----
+ * A modal box with a one-line textarea. The textarea joins the keypad indev's
+ * default group on creation, so focusing it routes the physical QWERTY straight
+ * into it; Enter (LV_EVENT_READY) joins, same as the Join button. The text is
+ * shown in the CLEAR on purpose: on a slow e-paper panel you need to see what
+ * you typed, and a watch screen is not a shoulder-surfing surface. */
+static lv_obj_t *wifi_pass_box = nullptr;
+static lv_obj_t *wifi_pass_ta  = nullptr;
+static char      wifi_pass_ssid[WIFI_SSID_MAX];
+
+static void wifi_pass_close(void) {
+  if (wifi_pass_box) { lv_obj_del(wifi_pass_box); wifi_pass_box = nullptr; wifi_pass_ta = nullptr; }
+}
+/* Parent app_scr tears the box down on Back or any rebuild — never dangle. */
+static void wifi_pass_deleted_cb(lv_event_t *e) {
+  if (lv_event_get_target(e) == wifi_pass_box) { wifi_pass_box = nullptr; wifi_pass_ta = nullptr; }
+}
+static void wifi_pass_cancel_cb(lv_event_t *e) { (void)e; wifi_pass_close(); }
+
+static void wifi_pass_join_cb(lv_event_t *e) {
+  (void)e;
+  if (!wifi_pass_ta) return;
+  char pass[WIFI_PASS_MAX];
+  strncpy(pass, lv_textarea_get_text(wifi_pass_ta), WIFI_PASS_MAX - 1);
+  pass[WIFI_PASS_MAX - 1] = '\0';
+  // No explicit close: the commit's ASYNC rebuild replaces app_scr, which deletes
+  // the box (and the deleted-cb clears the pointers). Deleting the box right here
+  // would pull the event target's ancestor out from under LVGL mid-event.
+  wifi_join_commit(wifi_pass_ssid, pass);
+}
+
+static void wifi_pass_prompt(const char *ssid) {
+  wifi_pass_close();                      // only ever one dialog
+  strncpy(wifi_pass_ssid, ssid, WIFI_SSID_MAX - 1);
+  wifi_pass_ssid[WIFI_SSID_MAX - 1] = '\0';
+
+  wifi_pass_box = lv_obj_create(app_scr);
+  lv_obj_add_event_cb(wifi_pass_box, wifi_pass_deleted_cb, LV_EVENT_DELETE, nullptr);
+  lv_obj_set_size(wifi_pass_box, UI_PX(380), UI_PX(300));
+  lv_obj_center(wifi_pass_box);
+  lv_obj_set_style_bg_color(wifi_pass_box, lv_color_hex(0x202020), 0);
+  lv_obj_set_style_radius(wifi_pass_box, UI_PX(16), 0);
+  lv_obj_clear_flag(wifi_pass_box, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *q = lv_label_create(wifi_pass_box);
+  lv_obj_set_style_text_font(q, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(q, lv_color_white(), 0);
+  lv_obj_set_style_text_align(q, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(q, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(q, UI_PX(340));
+  lv_label_set_text_fmt(q, "Password for\n\"%s\"", wifi_pass_ssid);
+  lv_obj_align(q, LV_ALIGN_TOP_MID, 0, UI_PX(14));
+
+  wifi_pass_ta = lv_textarea_create(wifi_pass_box);
+  lv_textarea_set_one_line(wifi_pass_ta, true);
+  lv_textarea_set_max_length(wifi_pass_ta, WIFI_PASS_MAX - 1);
+  lv_textarea_set_placeholder_text(wifi_pass_ta, "type on keyboard");
+  lv_obj_set_width(wifi_pass_ta, UI_PX(340));
+  lv_obj_align(wifi_pass_ta, LV_ALIGN_TOP_MID, 0, UI_PX(100));
+  lv_obj_set_style_text_font(wifi_pass_ta, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(wifi_pass_ta, lv_color_white(), 0);
+  lv_obj_set_style_bg_color(wifi_pass_ta, lv_color_hex(0x101010), 0);
+  lv_obj_add_event_cb(wifi_pass_ta, wifi_pass_join_cb, LV_EVENT_READY, nullptr);
+  lv_group_focus_obj(wifi_pass_ta);       // physical keys now type here
+
+  lv_obj_t *cancel = lv_btn_create(wifi_pass_box);
+  lv_obj_set_size(cancel, UI_PX(150), UI_PX(56));
+  lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, UI_PX(8), UI_PX(-10));
+  lv_obj_set_style_bg_color(cancel, lv_color_hex(0x333333), 0);
+  lv_obj_set_style_radius(cancel, UI_PX(14), 0);
+  lv_obj_add_event_cb(cancel, wifi_pass_cancel_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *cl = lv_label_create(cancel);
+  lv_obj_set_style_text_font(cl, &FONT_SMALL, 0);
+  lv_label_set_text(cl, "Cancel");
+  lv_obj_center(cl);
+
+  lv_obj_t *join = lv_btn_create(wifi_pass_box);
+  lv_obj_set_size(join, UI_PX(150), UI_PX(56));
+  lv_obj_align(join, LV_ALIGN_BOTTOM_RIGHT, UI_PX(-8), UI_PX(-10));
+  lv_obj_set_style_bg_color(join, lv_color_hex(0x2A2A2A), 0);
+  lv_obj_set_style_radius(join, UI_PX(14), 0);
+  lv_obj_add_event_cb(join, wifi_pass_join_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *jl = lv_label_create(join);
+  lv_obj_set_style_text_font(jl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(jl, lv_color_hex(ui_accent_hex()), 0);
+  lv_label_set_text(jl, "Join");
+  lv_obj_center(jl);
+}
+#endif  /* BOARD_HAS_KEYBOARD_TCA8418 */
+
+static void wifi_scan_row_cb(lv_event_t *e) {
+  uint8_t idx = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+  if (idx >= s_wscan_count) return;
+  if (wifi_ssid_known(s_wscan[idx].ssid)) return;   // already saved; row shows the tag
+  if (!s_wscan[idx].secured) { wifi_join_commit(s_wscan[idx].ssid, ""); return; }
+#if BOARD_HAS_KEYBOARD_TCA8418
+  wifi_pass_prompt(s_wscan[idx].ssid);
+#endif
+  // No keyboard: secured unknown networks are never rendered, so no else-branch.
+}
+
+/* One scan-result row: WiFi icon + SSID + a right-aligned status tag. The whole
+ * row is the tap target (no sub-button, so it stays a single line everywhere). */
+static void wifi_scan_row(lv_obj_t *parent, uint8_t idx) {
+  const WifiScanNet &w = s_wscan[idx];
+  bool known = wifi_ssid_known(w.ssid);
+
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, UI_PX(96));
+#else
+  lv_obj_set_size(row, UI_PX(320), UI_PX(56));
+#endif
+  lv_obj_set_style_bg_color(row, lv_color_hex(0x1A1A1A), 0);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(row, UI_PX(14), 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(row, wifi_scan_row_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)idx);
+
+  lv_obj_t *ic = lv_label_create(row);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_style_text_font(ic, &lv_font_montserrat_14, 0);
+#else
+  lv_obj_set_style_text_font(ic, &UI_FONT(20), 0);
+#endif
+  lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);
+  lv_label_set_text(ic, LV_SYMBOL_WIFI);
+  lv_obj_align(ic, LV_ALIGN_LEFT_MID, UI_PX(16), 0);
+
+  lv_obj_t *nm = lv_label_create(row);
+  lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(nm, lv_color_white(), 0);
+  lv_label_set_text(nm, w.ssid);
+  ui_label_single_line(nm);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_width(nm, LV_PCT(52));
+  lv_obj_align(nm, LV_ALIGN_LEFT_MID, UI_PX(78), 0);
+#else
+  lv_obj_set_width(nm, UI_PX(190));
+  lv_obj_align(nm, LV_ALIGN_LEFT_MID, UI_PX(50), 0);
+#endif
+
+  // No lock glyph in LVGL's built-in symbol font, so plain words tag the state.
+  lv_obj_t *tag = lv_label_create(row);
+  lv_obj_set_style_text_font(tag, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(tag, lv_color_hex(known ? ui_accent_hex() : 0xAAAAAA), 0);
+  lv_label_set_text(tag, known ? "saved" : (w.secured ? "locked" : "open"));
+  lv_obj_align(tag, LV_ALIGN_RIGHT_MID, UI_PX(-14), 0);
+}
+#endif  /* WIFI_SCAN_SUPPORTED */
+
+/* Screen teardown (fires on Back AND on every rebuild — timers are recreated by
+ * the next build, so nothing here may assume the screen is gone for good). */
+static void wb_cleanup_cb(lv_event_t *e) {
+  (void)e;
+  /* LVGL frees the label with the screen; drop our copy of the pointer so a
+   * later callback cannot write through it. The TEXT survives in s_ota_line. */
+  s_ota_lbl = nullptr;
+  if (s_wb_timer) { lv_timer_del(s_wb_timer); s_wb_timer = nullptr; }
+#if WIFI_SCAN_SUPPORTED
+  // Stop polling the scan; if one is in flight it finishes inside the driver and
+  // the next build (or screen entry) revives the timer to collect the results
+  // (s_wscan_busy stays true until they're read).
+  if (s_wscan_timer) { lv_timer_del(s_wscan_timer); s_wscan_timer = nullptr; }
+  s_wb_list = nullptr;
+#endif
+  s_wtxp_val = nullptr;
+  s_btxp_val = nullptr;
+}
+
 /* One saved-network row inside the scroll list: SSID label + a trash button that
  * opens the forget confirmation. `idx` is the network's index in s_wifi_nets. */
 static void wifi_net_row(lv_obj_t *parent, uint8_t idx) {
@@ -323,7 +602,7 @@ static void wifi_net_row(lv_obj_t *parent, uint8_t idx) {
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_text_font(ic, &lv_font_montserrat_14, 0);
 #else
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(20), 0);
 #endif
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);
   lv_label_set_text(ic, LV_SYMBOL_WIFI);
@@ -332,7 +611,7 @@ static void wifi_net_row(lv_obj_t *parent, uint8_t idx) {
   lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
   lv_label_set_text(nm, s_wifi_nets[idx].ssid);
-  lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+  ui_label_single_line(nm);
 
   lv_obj_t *del = lv_btn_create(row);
   lv_obj_set_style_bg_color(del, lv_color_hex(0x3A2020), 0);
@@ -340,7 +619,7 @@ static void wifi_net_row(lv_obj_t *parent, uint8_t idx) {
   lv_obj_add_event_cb(del, wifi_forget_prompt_cb, LV_EVENT_CLICKED,
                       (void *)(uintptr_t)idx);
   lv_obj_t *dl = lv_label_create(del);
-  lv_obj_set_style_text_font(dl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(dl, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(dl, lv_color_hex(0xFF8888), 0);
   lv_label_set_text(dl, LV_SYMBOL_TRASH "  Forget");
   lv_obj_center(dl);
@@ -404,7 +683,7 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
 #if BOARD_SCREEN_NARROW
   lv_obj_set_style_text_font(ic, &lv_font_montserrat_14, 0);
 #else
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(20), 0);
 #endif
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);   // BLE blue (matches the toggle)
   lv_label_set_text(ic, LV_SYMBOL_BLUETOOTH);
@@ -413,14 +692,14 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
   lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
   lv_label_set_text(nm, label);
-  lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);   // names can outgrow the row, MACs can't
+  ui_label_single_line(nm);   // names can outgrow the row, MACs can't
 
   lv_obj_t *del = lv_btn_create(row);
   lv_obj_set_style_bg_color(del, lv_color_hex(0x3A2020), 0);
   lv_obj_set_style_radius(del, UI_PX(12), 0);
   lv_obj_add_event_cb(del, ble_forget_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
   lv_obj_t *dl = lv_label_create(del);
-  lv_obj_set_style_text_font(dl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(dl, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(dl, lv_color_hex(0xFF8888), 0);
   lv_label_set_text(dl, LV_SYMBOL_TRASH "  Forget");
   lv_obj_center(dl);
@@ -439,6 +718,34 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
   lv_obj_align(del, LV_ALIGN_RIGHT_MID, UI_PX(-10), 0);
   lv_label_set_text(dl, LV_SYMBOL_TRASH);   // wide: icon only
 #endif
+}
+
+/* ---- Software update check -----------------------------------------------
+ * The check ONLY (ota_check.h): fetch the manifest, compare versions, report.
+ * Nothing is downloaded or installed. It lives here rather than behind its own
+ * menu tile because until an installer exists, "check for updates" is really a
+ * network diagnostic — and this is the network screen.
+ *
+ * Blocking, on the UI task: the fetch takes a second or two and the button is
+ * user-initiated, so the label is set to "Checking..." and the screen forced to
+ * redraw before the call, rather than pretending it is async. */
+static void ota_check_cb(lv_event_t *e) {
+  (void)e;
+  if (s_ota_lbl) {
+    lv_label_set_text(s_ota_lbl, "Checking...");
+    lv_refr_now(nullptr);            /* paint it before we block */
+  }
+  OtaManifest m;
+  ota_check(&m);
+  if (!m.ok) {
+    snprintf(s_ota_line, sizeof s_ota_line, "Check failed: %s", m.err);
+  } else if (m.newer) {
+    snprintf(s_ota_line, sizeof s_ota_line, "Update available: %s (%u KB)\n%s",
+             m.version, (unsigned)(m.size / 1024), m.notes);
+  } else {
+    snprintf(s_ota_line, sizeof s_ota_line, "Up to date (%s)", DEVICE_VERSION);
+  }
+  if (s_ota_lbl) lv_label_set_text(s_ota_lbl, s_ota_line);
 }
 
 static void app_open_wifi_ble(void) {
@@ -477,7 +784,7 @@ static void app_open_wifi_ble(void) {
   // a fixed 400 px from y=84 needs 484 px of screen — fine on the 502-px 2.06,
   // but it overhung the 448-px S3-1.8 so the last row could never scroll clear.
   // Same 18 px bottom margin the 2.06 had (502-84-400 = 18).
-  lv_obj_set_width(list, 360);              // runs to the screen bottom (BOOT = back)
+  lv_obj_set_width(list, UI_COL_W(360));    // runs to the screen bottom (BOOT = back)
   lv_obj_set_height(list, (int)screenHeight - 84 - 18);
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 84);
   lv_obj_set_style_pad_all(list, 4, 0);
@@ -508,6 +815,102 @@ static void app_open_wifi_ble(void) {
   wtxp_label_refresh();
   s_btxp_val = radio_txp_row(list, LV_SYMBOL_BLUETOOTH, "BLE TX",  btxp_cycle_cb);
   btxp_label_refresh();
+
+#if WIFI_SCAN_SUPPORTED
+  // ---- Available networks (scan) ----
+  s_wb_list = list;                        // scan rebuilds keep this list's scroll
+  lv_obj_t *shdr = lv_label_create(list);
+  lv_obj_set_style_text_font(shdr, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(shdr, lv_color_hex(0xAAAAAA), 0);
+  lv_label_set_text(shdr, "Available networks");
+
+  lv_obj_t *sbtn = lv_btn_create(list);
+#if BOARD_SCREEN_NARROW
+  lv_obj_set_size(sbtn, LV_PCT(88), UI_PX(80));
+#else
+  lv_obj_set_size(sbtn, UI_PX(320), UI_PX(48));
+#endif
+  lv_obj_set_style_bg_color(sbtn, lv_color_hex(0x2A2A2A), 0);
+  lv_obj_set_style_radius(sbtn, UI_PX(12), 0);
+  lv_obj_set_style_shadow_width(sbtn, 0, 0);
+  lv_obj_add_event_cb(sbtn, wscan_start_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *sbl = lv_label_create(sbtn);
+  lv_obj_set_style_text_font(sbl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(sbl, lv_color_hex(ui_accent_hex()), 0);
+  lv_label_set_text(sbl, s_wscan_busy ? "Scanning..." : LV_SYMBOL_REFRESH "  Scan");
+  lv_obj_center(sbl);
+
+
+  if (!settings_get_wifi_enabled()) {
+    lv_obj_t *off = lv_label_create(list);
+    lv_obj_set_style_text_font(off, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(off, lv_color_hex(0x777777), 0);
+    lv_label_set_text(off, "Turn on WiFi to scan");
+  } else if (!s_wscan_busy) {
+    uint8_t shown = 0;
+    for (uint8_t i = 0; i < s_wscan_count; i++) {
+#if !BOARD_HAS_KEYBOARD_TCA8418
+      // No keyboard = no way to type a password: hide secured networks unless
+      // they're already saved (their password came from elsewhere: BLE, CSV).
+      if (s_wscan[i].secured && !wifi_ssid_known(s_wscan[i].ssid)) continue;
+#endif
+      wifi_scan_row(list, i);
+      shown++;
+    }
+    if (shown == 0) {
+      lv_obj_t *none = lv_label_create(list);
+      lv_obj_set_style_text_font(none, &FONT_SMALL, 0);
+      lv_obj_set_style_text_color(none, lv_color_hex(0x777777), 0);
+      lv_label_set_text(none, s_wscan_ran ? "No networks found" : "Tap Scan to search");
+    }
+  }
+
+  // A scan in flight but no poll timer (this build replaced the one that started
+  // it, or the user left and came back mid-scan): revive the poll so the results
+  // are collected and rendered.
+  if (s_wscan_busy && !s_wscan_timer)
+    s_wscan_timer = lv_timer_create(wscan_poll_cb, 500, nullptr);
+#endif  /* WIFI_SCAN_SUPPORTED */
+
+  /* ---- Software update ----
+   * OUTSIDE the WIFI_SCAN_SUPPORTED block on purpose. Scanning for access
+   * points and checking for a firmware update are unrelated capabilities, and
+   * that macro excludes Tuya, Maix AND both Fossil watches — so nesting this
+   * inside it hid the control on exactly the boards over-the-air updates exist
+   * for. On a board with no radio yet the check still renders and reports why
+   * it failed, which is more useful than an absent button. */
+  {
+    lv_obj_t *uhdr = lv_label_create(list);
+    lv_obj_set_style_text_font(uhdr, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(uhdr, lv_color_hex(0xAAAAAA), 0);
+    lv_label_set_text(uhdr, "Software update");
+
+    lv_obj_t *ubtn = lv_btn_create(list);
+#if BOARD_SCREEN_NARROW
+    lv_obj_set_size(ubtn, LV_PCT(88), UI_PX(80));
+#else
+    lv_obj_set_size(ubtn, UI_PX(320), UI_PX(48));
+#endif
+    lv_obj_set_style_bg_color(ubtn, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_radius(ubtn, UI_PX(12), 0);
+    lv_obj_set_style_shadow_width(ubtn, 0, 0);
+    lv_obj_add_event_cb(ubtn, ota_check_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ubl = lv_label_create(ubtn);
+    lv_obj_set_style_text_font(ubl, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(ubl, lv_color_hex(ui_accent_hex()), 0);
+    lv_label_set_text(ubl, LV_SYMBOL_DOWNLOAD "  Check for updates");
+    lv_obj_center(ubl);
+
+    /* Result line. Kept across rebuilds of this screen via s_ota_line, so a
+     * scan or a BLE toggle does not wipe the answer you just asked for. */
+    s_ota_lbl = lv_label_create(list);
+    lv_obj_set_style_text_font(s_ota_lbl, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(s_ota_lbl, lv_color_hex(0x999999), 0);
+    lv_obj_set_width(s_ota_lbl, LV_PCT(92));
+    lv_label_set_long_mode(s_ota_lbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_ota_lbl, s_ota_line[0] ? s_ota_line
+                                               : "Running " DEVICE_VERSION);
+  }
 
   // Section header for the saved networks. The cap depends on the backing store:
   // The CSV backend (SD card if present, else the on-flash FAT partition) holds up to

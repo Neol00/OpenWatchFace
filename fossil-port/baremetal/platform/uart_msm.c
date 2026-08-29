@@ -26,6 +26,13 @@
 /* Bounded waits: never hang the boot on a dead/gated UART. */
 #define UART_SPIN_MAX  100000u
 
+#if defined(PLAT_UART_DISABLED)
+/* Board says: do not touch this block at all — an access to a clock-gated MSM
+ * peripheral hangs the bus, and there is no pad to read anyway. The ramlog is
+ * the console. See the note in boards/fossil_gen6.h. */
+void uart_init(void)      { }
+void uart_putc(char c)    { (void)c; }
+#else
 void uart_init(void)
 {
     mmio_write(UARTDM_CR, CR_TX_ENABLE);
@@ -40,5 +47,6 @@ void uart_putc(char c)
     mmio_write(UARTDM_NCF_TX, 1);               /* 1 char follows */
     mmio_write(UARTDM_TF, (uint32_t)(uint8_t)c);
 }
+#endif
 
 #endif /* PLAT_UART_TYPE_MSM */

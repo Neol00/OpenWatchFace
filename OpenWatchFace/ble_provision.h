@@ -61,6 +61,7 @@ static bool gb_send(const char *json);
 #define BLE_PROV_UUID      "6b1f0002-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // WiFi provision (write, encrypted)
 #define BLE_FIND_UUID      "6b1f0003-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // find-phone (notify, watch→phone)
 #define BLE_FINDWATCH_UUID "6b1f0004-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // find-watch (write, phone→watch)
+#define BLE_LOCATION_UUID  "6b1f0005-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // weather location (write, phone→watch)
 
 /* GATT SCHEMA VERSION — BUMP THIS whenever the server's attribute table changes
  * (a service/characteristic/descriptor added, removed, or reordered). iOS and
@@ -265,12 +266,45 @@ class BleGbRxCB : public BLECharacteristicCallbacks {
   }
 };
 
+/* Weather-location write (phone → watch): the iOS companion app sends the phone's
+ * current location so the watch can fetch weather for it. Payload is plain text:
+ *     "LOC,<lat>,<lon>,<name>"      e.g. "LOC,59.3293,18.0686,Stockholm"
+ * lat/lon are decimal degrees; <name> is an optional display label (may contain
+ * spaces; it's the rest of the string after the 3rd comma). Coordinates arrive
+ * resolved, so NO geocoding is needed — weather_set_location stores them directly
+ * and marks the location as phone-set (overriding the compile-time preset). Runs on
+ * the NimBLE task: it only touches weather_store (store_lock-guarded) + raises the
+ * fetch request; the actual WiFi fetch happens on the net task. */
+class BleLocationCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    String v = ch->getValue();
+    if (!v.length()) return;
+    // Expect "LOC,<lat>,<lon>,<name>". Be lenient: also accept a bare "<lat>,<lon>[,name]".
+    const char *s = v.c_str();
+    if (strncmp(s, "LOC,", 4) == 0) s += 4;
+    char *end = nullptr;
+    double lat = strtod(s, &end);
+    if (end == s || *end != ',') { USBSerial.println("[ble] bad LOC payload"); return; }
+    const char *s2 = end + 1;
+    double lon = strtod(s2, &end);
+    if (end == s2) { USBSerial.println("[ble] bad LOC payload"); return; }
+    const char *name = (*end == ',') ? end + 1 : "";   // rest of string = display name
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+      USBSerial.println("[ble] LOC out of range"); return;
+    }
+    USBSerial.printf("[ble] location <- %.4f,%.4f \"%s\"\n", lat, lon, name);
+    if (weather_set_location(name, (float)lat, (float)lon))
+      weather_request_fetch();     // fetch the new place now (net task, WiFi)
+  }
+};
+
 /* Callback singletons (not new'd per begin) so toggling BLE never leaks. */
 static BleServerCB    s_cb_server;
 static BleSecurityCB  s_cb_security;
 static BleProvCB      s_cb_prov;
 static BleFindWatchCB s_cb_findwatch;
 static BleGbRxCB      s_cb_gb_rx;
+static BleLocationCB  s_cb_location;
 
 /* ----------------------------- public API -------------------------------- */
 
@@ -376,6 +410,17 @@ static void ble_begin(void) {
       BLECharacteristic::PROPERTY_WRITE_ENC |
       BLECharacteristic::PROPERTY_WRITE_AUTHEN);
   fw->setCallbacks(&s_cb_findwatch);
+
+  // Weather location: the phone writes "LOC,<lat>,<lon>,<name>" here. Plain
+  // (unencrypted) WRITE on purpose — location is non-sensitive and this way a write
+  // never SILENTLY drops for want of a bond (an enc/authen requirement drops a
+  // write-without-response instead of prompting to pair). Both write-with and
+  // write-without-response are accepted so the phone can use either.
+  BLECharacteristic *locch = svc->createCharacteristic(
+      BLE_LOCATION_UUID,
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_WRITE_NR);
+  locch->setCallbacks(&s_cb_location);
 
   svc->start();
 
@@ -742,9 +787,10 @@ static void ble_ui_tick(void) {
   // --- pair-code overlay (while pairing) ---
   if (s_ble_show_key && !s_ble_key_box) {
     s_ble_key_box = lv_obj_create(lv_layer_sys());
-    // Narrow panels: a fixed 300 px box overruns the screen. Use a width-percent so
-    // it fits; keep the original fixed size on wide panels. Fonts unchanged.
-#if BOARD_SCREEN_NARROW
+    // Sub-reference panels: a fixed 300 px box overruns the screen (it is wider
+    // than the whole 240 px S3-Touch-LCD-2). Use a width-percent so it fits; keep
+    // the original fixed size on reference-class panels. Fonts unchanged.
+#if BOARD_SCREEN_NARROW || BOARD_SCREEN_SUBREF
     lv_obj_set_size(s_ble_key_box, LV_PCT(92), 140);
 #else
     lv_obj_set_size(s_ble_key_box, 300, 140);
@@ -766,7 +812,7 @@ static void ble_ui_tick(void) {
     // panel's FONT_LABEL renders it small — bump to a large glyph there. S3 keeps
     // its original FONT_LABEL.
 #if BOARD_SCREEN_NARROW
-    lv_obj_set_style_text_font(k, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(k, &UI_FONT(28), 0);
 #else
     lv_obj_set_style_text_font(k, &FONT_LABEL, 0);
 #endif
@@ -786,9 +832,9 @@ static void ble_ui_tick(void) {
     s_ble_toast = BLE_TOAST_NONE;
 
     s_ble_toast_box = lv_obj_create(lv_layer_sys());
-    // Narrow panels: a fixed 340 px box overruns the screen. Width-percent fits it;
-    // wide panels keep the original fixed size. Fonts unchanged.
-#if BOARD_SCREEN_NARROW
+    // Sub-reference panels: a fixed 340 px box overruns the screen. Width-percent
+    // fits it; reference-class panels keep the original fixed size. Fonts unchanged.
+#if BOARD_SCREEN_NARROW || BOARD_SCREEN_SUBREF
     lv_obj_set_size(s_ble_toast_box, LV_PCT(92), 92);
 #else
     lv_obj_set_size(s_ble_toast_box, 340, 92);
@@ -824,11 +870,11 @@ static void ble_ui_tick(void) {
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
     // Wrap so a 2-line message flows instead of being clipped/dotted off the side
     // of the narrower box; width follows the box.
-#if BOARD_SCREEN_NARROW
+#if BOARD_SCREEN_NARROW || BOARD_SCREEN_SUBREF
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(l, LV_PCT(90));
 #else
-    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    ui_label_single_line(l);
     lv_obj_set_width(l, 312);
 #endif
     lv_label_set_text(l, msg);

@@ -9,14 +9,31 @@
 #include "task.h"
 #include "lvgl.h"
 
+/* Display geometry. QEMU keeps the historical 390x390; the real watches use
+ * their board's panel size (Gen 4: 454x454 confirmed from the stock DTB).
+ * On the Gen 6 this is only a fallback — fb_init() detects the true size from
+ * what aboot programmed into the MDP and ui_task uses that instead. */
+#if defined(PLAT_BOARD_QEMU_VIRT)
 #define UI_W 390
 #define UI_H 390
+#else
+#define UI_W PLAT_PANEL_W
+#define UI_H PLAT_PANEL_H
+#endif
 
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_sub_label;
 
+#if defined(PLAT_BOARD_FOSSIL_GEN6)
+uint32_t fb_width(void);
+uint32_t fb_height(void);
+void     fb_flush_all(void);
+#endif
+
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6)
 #if defined(PLAT_BOARD_FOSSIL_GEN4)
 int mdp3_flush(const void *buf);
+#endif
 int touch_init(void);
 int touch_read(uint16_t *x, uint16_t *y);
 
@@ -47,6 +64,12 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
      * the obvious follow-up optimisation.) */
     if (lv_display_flush_is_last(disp))
         mdp3_flush(lv_display_get_buf_active(disp)->data);
+#elif defined(PLAT_BOARD_FOSSIL_GEN6)
+    /* The MDP is already scanning the splash buffer on its own, so there is no
+     * DMA to kick — we only have to push our writes out of D-cache so the
+     * scanout master sees them. */
+    if (lv_display_flush_is_last(disp))
+        fb_flush_all();
 #endif
     lv_display_flush_ready(disp);      /* direct mode: pixels already in the fb */
 }
@@ -94,24 +117,71 @@ static void ui_build(void)
 void ui_task(void *arg)
 {
     (void)arg;
-    void *fb = fb_init(UI_W, UI_H);
+    uint32_t w = UI_W, h = UI_H;
+
+    void *fb = fb_init(w, h);
+#if defined(GFX_TEXT_TEST)
+    /* Renderer verification (no hardware): draw a synthetic storage log and
+     * park, so tools/qemu-screenshot.sh can photograph what the watch would
+     * show. */
+    fb_text_dump("EMMC: RESET ALL DONE\n"
+                 "EMMC: HC MODE EN + PADS\n"
+                 "EMMC: PWRCTL REQ 0X2 ACKED\n"
+                 "EMMC: OCR=0XC0FF8080\n"
+                 "EMMC: CID0=0X45483850\n"
+                 "EMMC: CMD3 R=0X00000500\n"
+                 "EMMC: CMD7 FAIL E=0X00010000\n"
+                 "STORAGE: NO EMMC\n");
+    for (;;) { }
+#endif
     if (!fb) {
         con_puts("ui: no framebuffer, task idle\n");
+#if defined(PLAT_SOC_MSM)
+        /* 3 short buzzes = display stack failed. Distinguishes "the display is
+         * broken" from "the image never ran" (no buzz at all) without needing
+         * the screen we just failed to bring up. */
+        vib_buzz(3, 120);
+#endif
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+#if defined(PLAT_BOARD_FOSSIL_GEN6)
+    /* Use the geometry aboot actually programmed, not the compile-time guess —
+     * the Gen 6 panel node is not in any DTB we have, so this read-back is the
+     * only authoritative source for the real resolution. */
+    w = fb_width();
+    h = fb_height();
+#endif
+
+#if defined(PLAT_SOC_MSM)
+    /* 2 short buzzes = fb_init() returned a buffer. If you feel this but the
+     * screen stays dark, the fault is in the pixel path (scanout/cache/color
+     * order), NOT in display bring-up. */
+    vib_buzz(2, 120);
+#endif
 
     lv_init();
     lv_tick_set_cb(timer_ms);
 
-    lv_display_t *disp = lv_display_create(UI_W, UI_H);
+    lv_display_t *disp = lv_display_create((int32_t)w, (int32_t)h);
+#if defined(PLAT_BOARD_FOSSIL_GEN6)
+    /* aboot's splash pipe may be RGB888 (3 B/px); match what fb_splash read. */
+    uint32_t fb_bpp(void);
+    uint32_t bpp = fb_bpp();
+    lv_display_set_color_format(disp, bpp == 3 ? LV_COLOR_FORMAT_RGB888
+                                               : LV_COLOR_FORMAT_XRGB8888);
+    lv_display_set_buffers(disp, fb, NULL, w * h * bpp, LV_DISPLAY_RENDER_MODE_DIRECT);
+#else
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
-    lv_display_set_buffers(disp, fb, NULL, UI_W * UI_H * 4, LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_buffers(disp, fb, NULL, w * h * 4, LV_DISPLAY_RENDER_MODE_DIRECT);
+#endif
     lv_display_set_flush_cb(disp, flush_cb);
 
-#if defined(PLAT_BOARD_FOSSIL_GEN4)
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6)
     /* Touch is optional: a controller that does not answer must not stop the
      * UI from running (it is also the most likely thing to be mis-addressed
-     * until the stock DTB confirms the bus and address). */
+     * until the device confirms the bus and address — the Gen 6 driver
+     * auto-probes every QUP for exactly that reason). */
     if (touch_init() == 0) {
         lv_indev_t *indev = lv_indev_create();
         lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);

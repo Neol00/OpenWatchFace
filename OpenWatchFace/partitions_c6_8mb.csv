@@ -1,32 +1,47 @@
-# partitions_c6_8mb.csv — custom 8 MB layout for the ESP32-C6-Touch-LCD-1.47.
+# partitions_c6_8mb.csv -- custom 8 MB layout for the ESP32-C6-Touch-LCD-1.47.
 #
-# Total flash on the C6-1.47 = 8 MB (0x800000). The S3-2.06 uses the 32 MB
-# partitions.csv in this folder; this is the C6 equivalent. SELECT IT in the IDE:
-# Tools > Partition Scheme can't point at an arbitrary file, so either
-#   (a) set the board's "Partition Scheme" to "Custom" and ensure the IDE picks
-#       up this file (rename to partitions.csv per build), OR
-#   (b) add a build.partitions entry — see board_ws_c6_touch_lcd_147.h notes.
+# Total flash = 8 MB (0x800000). The tightest board that can still do OTA.
 #
-# NO OTA: app1 was removed (flashing is always by cable to app0), freeing its 3 MB
-# slot for a 1 MB EXTENDED NVS partition ("nvsext" — the firmware's Preferences
-# store, see BOARD_NVS_EXT_LABEL in the board header) with the remainder going to
-# the on-flash FAT filesystem. Same scheme as the two S3 tables.
+# OTA ENABLED: app0 and app1 are an ota_0/ota_1 PING-PONG PAIR. An update is
+# written to whichever slot is NOT running, verified, and only then marked
+# bootable in otadata -- so a download that is corrupt, truncated or interrupted
+# leaves the running firmware untouched, and a new image that fails to boot
+# rolls back to the previous slot. That safety is the entire reason for spending
+# a second copy of the app on flash.
 #
-# CRITICAL — the same fixed-offset rules as the 32 MB table apply (or BLACK
-# SCREEN): partition table at 0x8000, boot_app0 at 0xe000 (so otadata at 0xe000),
-# the app .bin at 0x10000 (so app0 starts at exactly 0x10000). The head nvs stays
-# 20 KB for the system consumers (WiFi PHY/cal, BLE bonds); Preferences live in
-# "nvsext".
+# BOTH SLOTS MUST BE THE SAME SIZE. esp_ota_get_next_update_partition() picks the
+# idle slot and the image has to fit it; a smaller app1 means updates fail only
+# once the app grows past it, long after the table was written.
 #
-# Sizing: the compiled app is ~2.15 MB, so app0 keeps the 3 MB slot (~40%
-# headroom). nvsext 0x310000..0x410000 (1 MB), FFat fills the rest up to the
-# coredump: 0x410000..0x7F0000 = 0x3E0000 (~3.875 MB FAT, up from ~1.875 MB).
-# Nothing exceeds 0x800000.
+# ============================ CHANGING THIS TABLE ============================
+# Re-flashing a DIFFERENT partition table is DESTRUCTIVE. nvsext and ffat move,
+# so saved settings (Preferences) and everything on the FAT volume are lost --
+# the data is still on the flash but no longer where the firmware looks. Back up
+# anything on FFat first, and expect the watch to come up with default settings.
+# This is a one-time cost: the whole point is that after this, updates arrive
+# over the air and never need the cable again.
+#
+# CRITICAL -- fixed offsets (or BLACK SCREEN):
+#   0x8000  partition table
+#   0xe000  boot_app0.bin  -> otadata MUST be at 0xe000
+#   0x10000 the app .bin   -> app0 MUST start at exactly 0x10000
+# App partitions start on a 64 KB (0x10000) boundary. The head nvs stays 20 KB:
+# it serves the SYSTEM consumers of the default "nvs" (WiFi PHY/cal, NimBLE
+# bonds); the firmware's own Preferences live in "nvsext".
+#
+# SIZING IS TIGHT, and the app slots SHRANK from 3 MB to 2.5 MB to make room for
+# the second one. The compiled C6 app is ~2.15 MB, so 2.5 MB leaves ~350 KB of
+# headroom per slot -- enough, but watch it: if the app ever exceeds 2.5 MB the
+# update will fail to fit the idle slot, and the fix is a table change, i.e. a
+# cable. Keeping 3 MB slots was possible but left only ~0.9 MB of FFat.
+#   app0/app1 2.5 MB each, nvsext 1 MB,
+#   FFat 0x610000..0x7F0000 = 0x1E0000 (~1.9 MB, down from ~3.9 MB before OTA).
 #
 # Name,     Type, SubType,  Offset,    Size,      Flags
-nvs,        data, nvs,      0x9000,    0x5000,
-otadata,    data, ota,      0xe000,    0x2000,
-app0,       app,  ota_0,    0x10000,   0x300000,
-nvsext,     data, nvs,      0x310000,  0x100000,
-ffat,       data, fat,      0x410000,  0x3E0000,
-coredump,   data, coredump, 0x7F0000,  0x10000,
+nvs,        data, nvs,      0x9000,    0x5000,   
+otadata,    data, ota,      0xe000,    0x2000,   
+app0,       app,  ota_0,    0x10000,   0x280000, 
+app1,       app,  ota_1,    0x290000,  0x280000, 
+nvsext,     data, nvs,      0x510000,  0x100000, 
+ffat,       data, fat,      0x610000,  0x1e0000, 
+coredump,   data, coredump, 0x7f0000,  0x10000,  

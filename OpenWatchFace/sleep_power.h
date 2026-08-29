@@ -27,6 +27,20 @@
  *  my_touchpad_read in the .ino.
  * ========================================================================== */
 #pragma once
+
+/* Sleep bring-up chatter. Each of these described one step of the ESP32 sleep
+ * path while it was being written; on a board that sleeps reliably they are
+ * four lines of noise per sleep, and on the Fossil port most of them describe
+ * hardware that is not even present. Silent unless -DOWF_SLEEP_VERBOSE.
+ * Anything reporting a FAILURE still prints. */
+#if defined(OWF_SLEEP_VERBOSE)
+  #define SLEEP_LOG(...)   USBSerial.printf(__VA_ARGS__)
+  #define SLEEP_LOGLN(s)   USBSerial.println(s)
+#else
+  #define SLEEP_LOG(...)   do {} while (0)
+  #define SLEEP_LOGLN(s)   do {} while (0)
+#endif
+
 #if BOARD_PLATFORM_TUYA
 #include "tuya/compat/esp_sleep.h"
 #include "tuya/compat/driver/rtc_io.h"
@@ -272,11 +286,13 @@ static void rails_cut_for_sleep(void) {
   }
   // Dump the PMU enable bits as they will be for the whole sleep — the ground truth
   // for chasing sleep drain (anything '1' here is powered all night).
-  USBSerial.printf("[sleep] rails cut: %u; enable bits at sleep entry:", ncut);
+  SLEEP_LOG("[sleep] rails cut: %u; enable bits at sleep entry:", ncut);
+#if defined(OWF_SLEEP_VERBOSE)
   for (uint8_t i = 0; i < RAIL_COUNT; i++)
     USBSerial.printf(" %s=%d", rail_name(i), (int)rail_is_on(i));
   USBSerial.println();
   USBSerial.flush();
+#endif
 }
 
 /* Probe any not-yet-classified rails. Runs once the full UI is up (interactive
@@ -450,7 +466,7 @@ static void arm_wakes_and_sleep(void) {
     esp_sleep_enable_timer_wakeup(us);
     USBSerial.printf("[sleep] timer wake armed in %llus\n", (unsigned long long)(us / 1000000ULL));
   } else {
-    USBSerial.println("[sleep] no timer wake (button only)");
+    SLEEP_LOGLN("[sleep] no timer wake (button only)");
   }
 
   board_wake_arm_button();                 // arm the button wake (EXT0 boards; C6 uses RST)
@@ -487,7 +503,7 @@ static void arm_wakes_and_sleep(void) {
     // an earlier session left them on, a session-less sleep would otherwise keep them powered and
     // burn ~tens of mA every cycle — the bimodal 10-vs-50 mA drain. This makes "no session" mean
     // a genuinely clean low-power sleep regardless of prior state.
-    USBSerial.println("[sleep] no IMU session -> accel off, ULP halted, RTC_PERIPH auto");
+    SLEEP_LOGLN("[sleep] no IMU session -> accel off, ULP halted, RTC_PERIPH auto");
     imu_ensure_off_for_sleep();
     rails_cut_for_sleep();                  // cut the proven-safe peripheral rails, last
   }
@@ -516,9 +532,24 @@ static void enter_deep_sleep(void) {
   // depends on s_checks_enabled. The old estimate-based notes here were removed to avoid
   // double-counting the sleep span.)
 
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  /* E-PAPER: blank the glass to WHITE, then stop the panel's driving voltages.
+   * A retained watch face was tried first, but it reads as a hung device (the
+   * time it shows is frozen and goes stale within a minute) — a clean white
+   * panel is the unambiguous "asleep" signal. One full refresh, ghost-free,
+   * then zero power for the whole sleep. */
+  epd_clear_white();
+  epd_power_off();
+#elif !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
   gfx->fillScreen(RGB565_BLACK);
   gfx->displayOff();                      // AMOLED into its own low-power sleep
+#endif
+#if BOARD_HAS_CHARGER_BQ25896
+  /* Same reasoning as the power-off path: the charger runs independently of the
+   * SoC, so a sleeping watch on USB would otherwise sit with the LED lit. */
+  i2c_lock();
+  bq25896_led_off();
+  i2c_unlock();
 #endif
 
 #if BOARD_PLATFORM_TUYA
@@ -562,6 +593,23 @@ static void enter_deep_sleep(void) {
     uint32_t wake_s = 0;                                // 0 = button-only
     if (soonest != UINT64_MAX) wake_s = (soonest < 1) ? 1 : (uint32_t)soonest;
 
+#if OWF_T5_DS_QUICK
+    // REAL deep sleep (~16uA vs ~43uA suspended) whenever nothing is scheduled to FIRE:
+    // no running countdown, no armed alarm clock. Those must stay in suspend — deep sleep
+    // cannot self-wake on battery (an unattended reboot-wake dies with no finger holding
+    // Q3's gate; see owf_tuya_deep_sleep_quick). Background notification checks are the
+    // deliberate sacrifice on this path: they resume after the wake. Wake = quick PWR
+    // press (the vendor entry_main patch re-latches GPIO19 early in boot); the wake is a
+    // reboot into setup(), which reads the kv marker via owf_tuya_deep_sleep_boot_check().
+    if (timer_s == UINT64_MAX && almc_s == UINT64_MAX) {
+      // RAM does not survive: persist what the ESP path keeps in RTC memory / saves in
+      // arm_wakes_and_sleep — the step total (notif-id rides the kv marker itself).
+      if (imu_steps_count() != 0) prefs.putUInt("steps", imu_steps_count());
+      drain_diag_note_sleep();                          // VBAT + epoch for the boot report
+      owf_tuya_deep_sleep_quick(rtc_last_notif_id);     // NO RETURN on success
+      // Still here: PM did not engage — fall through to a normal suspend pass.
+    }
+#endif
     if (owf_tuya_suspend_sleep(wake_s)) break;          // button press -> full wake
     if (soonest == UINT64_MAX) continue;                // spurious: no deadline was armed
 
@@ -591,23 +639,31 @@ static void enter_deep_sleep(void) {
   USBSerial.flush();
   owf_tuya_display_wake();                // CO5300 sleep-out + display-on
   settings_apply_brightness(s_brightness);
+  USBSerial.println("[power] brightness applied; restoring BLE");
+  USBSerial.flush();
   // Restore the radios the suspend entry quiesced. On the ESP boards the wake is a
   // reboot, so setup() re-runs ble_apply_enabled(); this resume-in-place path must do
   // it itself or BLE stays down until manually toggled (bonded iPhone can't reconnect,
   // paired list reads empty). WiFi reconnects lazily on demand as everywhere else.
   ble_apply_enabled();
+  USBSerial.println("[power] resume complete -> back to loop");
+  USBSerial.flush();
   return;
 #else
   arm_wakes_and_sleep();                  // timer + BOOT wake; does not return
 #endif
 }
 
-/* ---- Low-battery protective power-off --------------------------------------
+/* ---- Power off (user action + low-battery protective cutoff) ---------------
  * Unlike enter_deep_sleep() (which arms an RTC timer to wake for background
- * checks), this is a TRUE off: NO timer wake, so the chip stays down and stops
- * draining the cell — critical on the C6, which has no PMU to enforce a cutoff
- * in hardware. The user revives it by charging the battery and pressing RST
- * (C6) / BOOT (S3, still armed below so a deliberate press can bring it back).
+ * checks), this is a TRUE off: NO timer wake AND — on the PMU-less boards that
+ * fall through to deep sleep — NO button wake either, so the chip stays down
+ * and stops draining the cell. Revived only by the hardware RST button (a cold
+ * boot from deep sleep) or, on PMU boards, PWR/USB. This matches the confirm
+ * dialog, which promises exactly "Press RST to turn back on" on PMU-less
+ * boards; the BOOT/EXT0 wake used to be armed here anyway, which made "off"
+ * indistinguishable from ordinary sleep (any pocket press relit the watch).
+ * BOOT-as-wake remains the normal path for ORDINARY sleep (arm_wakes_and_sleep).
  * Never returns. */
 static void enter_power_off(void) {
   USBSerial.println("[power] battery critically low -> powering off");
@@ -616,7 +672,17 @@ static void enter_power_off(void) {
   rtc_sleep_intent = SLEEP_INTENT_MAGIC;   // clean, intended sleep
   ble_end();
 
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if BOARD_DISPLAY_DEFERRED_REFRESH
+  /* E-PAPER on the critical-battery power-off. Unlike deep sleep above, blanking
+   * IS wanted here: the watch is shutting down and a stale UI frozen on the glass
+   * would look like a running-but-hung device. A cleared panel reads as "off",
+   * which is the truth. Costs one 3 s full refresh, which is affordable on the
+   * way to a shutdown that will not come back on its own. */
+  if (s_display_ready) {
+    epd_clear_white();
+    epd_power_off();
+  }
+#elif !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
   if (s_display_ready) {                    // skip on the screen-less wake path
     gfx->fillScreen(RGB565_BLACK);
     gfx->displayOff();
@@ -625,6 +691,16 @@ static void enter_power_off(void) {
 
   haptics_prepare_sleep();
   audio_alarm_prepare_sleep();
+#if BOARD_HAS_CHARGER_BQ25896
+  // Kill the red STAT LED before we stop running. The charger is on its own power
+  // domain and keeps operating on VBUS after the SoC is off, so its default
+  // "input present -> LED on" behaviour would leave a powered-off watch with a lit
+  // LED. Forcing the pin off here is the only chance to prevent that; it stays off
+  // until firmware runs again and bq25896_service_led() re-evaluates.
+  i2c_lock();
+  bq25896_led_off();
+  i2c_unlock();
+#endif
   // Low battery = the one case where the IMU must NEVER stay on: force the accel off and
   // tear down any ULP state (this path used to skip it entirely — a running session would
   // keep the accel + ULP burning through the "protective" power-off on PMU-less boards).
@@ -643,11 +719,22 @@ static void enter_power_off(void) {
   owf_tuya_power_off();
   delay(200);                               // let the rail collapse
 #endif
+#ifdef BOARD_PWR_LATCH_GPIO
+  // Soft-latch boards (S3-1.69): TRUE power-off = drop the SYS_EN keep-alive. On
+  // battery the P-FET opens and the supply collapses (does not return); revived by
+  // a PWR-key press. On USB, VBUS feeds the LDO around the latch, so we fall
+  // through to the no-wake deep sleep below — the dropped-latch flag keeps
+  // board_enter_sleep()'s isolation pass from re-asserting SYS_EN, so the true
+  // off completes the moment USB is unplugged.
+  board_power_latch_off();
+  delay(200);                               // let the rail collapse
+#endif
 
-  // PMU-less boards (C6): deliberately arm NO timer wake — the watch must NOT
-  // wake itself for background checks while the battery is empty (that would keep
-  // draining it). Revived by the hardware RST button (a cold boot from sleep).
-  board_wake_arm_button();                 // C6: RST only (no-op arm)
+  // PMU-less boards: deliberately arm NO wake source at all — no timer (the
+  // watch must not wake itself for background checks while "off" or on an empty
+  // battery) and no BOOT/EXT0 press either (see the header comment: "off" must
+  // not be woken by a pocket press; the dialog promises RST). esp_deep_sleep
+  // with zero wake sources is valid — the chip sleeps until the RST line.
   rails_cut_for_sleep();
   drain_diag_note_sleep();                 // record VBAT + epoch for the boot-side report
   board_enter_sleep();                     // deep sleep; does not return

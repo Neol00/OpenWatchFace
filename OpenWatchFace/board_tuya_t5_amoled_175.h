@@ -16,7 +16,20 @@
  * ========================================================================== */
 #pragma once
 
-#define BOARD_NAME "Waveshare T5-E1-Touch-AMOLED-1.75"
+#define BOARD_NAME   "Waveshare T5-E1-Touch-AMOLED-1.75"
+#define BOARD_VENDOR "Waveshare"
+
+/* ---- Over-the-air update identity ----------------------------------------
+ * The key this board looks for in ota/latest.json, and the name its firmware
+ * is published under in a GitHub release:
+ *
+ *     owf-tuya-t5-amoled-175-<version>.bin
+ *
+ * It lives HERE, next to the rest of the board's identity, rather than in a
+ * per-board ladder inside the updater — adding a board should mean editing one
+ * file. It must match the key in the manifest exactly; a mismatch is reported
+ * by the update check as "No build for tuya-t5-amoled-175", which names the fix. */
+#define BOARD_OTA_KEY "tuya-t5-amoled-175"
 
 /* ---- Platform flag: gate ESP/Arduino runtime assumptions ------------------
  * Used in the .ino + board layer to skip MCU-only bring-up (Arduino_GFX panel,
@@ -181,6 +194,18 @@
  * the suspend loop in enter_deep_sleep(), sleep_power.h). */
 #ifndef OWF_T5_DEEP_SLEEP
 #define OWF_T5_DEEP_SLEEP 1
+#endif
+
+/* REAL deep sleep — DISABLED (0) after hardware-testing both chip modes to a dead end
+ * (2026-08-12). Mode 2 does not hold the pads through the wake reset: the GPIO19 power
+ * latch drops and only a ~1s PWR hold (finger on Q3's gate via D5) bridges the boot gap;
+ * shorter OR mistimed presses cold power-off the watch and lose the RTC. Mode 3 (super
+ * deep) holds the rail via pad retention but refuses GPIO12/18 as wake pins = hard wedge
+ * (RST-only recovery). Timing-window wakes and accidental power-offs are not acceptable
+ * watch behavior, so the watch always suspends: ~43uA, instant wake from EITHER button,
+ * rail never at risk. Leave at 0 unless the latch circuit itself changes. */
+#ifndef OWF_T5_DS_QUICK
+#define OWF_T5_DS_QUICK 0
 #endif
 
 /* Unused on this platform (no firmware-owned partial render buffers — the SDK's

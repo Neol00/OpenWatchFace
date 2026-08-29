@@ -2,6 +2,15 @@
 
 #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)
 
+// LOCAL (OpenWatchFace): the SoC's per-transaction SPI DMA length cap, needed to size
+// async segments (see writePixelsAsync). On the S3 the length register is 18 bits ->
+// 32 KB per transaction, SMALLER than the 48 KB bus max_transfer_sz; a segment above
+// it is rejected by spi_master's check_trans_valid ("txdata transfer > hardware max
+// supported len") at queue time.
+#if __has_include("hal/spi_ll.h")
+#include "hal/spi_ll.h"
+#endif
+
 /**
  * @brief Arduino_ESP32SPIDMA
  *
@@ -1077,10 +1086,26 @@ bool Arduino_ESP32SPIDMA::writePixelsAsync(const uint8_t *data, uint32_t len,
   }
 
   // One DMA transaction per tile when possible: SEG matches the bus max_transfer_sz
-  // (48 KB), so a full partial tile goes out as a SINGLE queued transfer. Multi-segment
-  // async tiles rendered as a stale band; keeping it to one segment avoids that and is
-  // faster (one IRQ). Still a multiple of 2 for whole RGB565 pixels.
-  const uint32_t SEG = 48 * 1024; // bytes (== bus max_transfer_sz)
+  // (48 KB), so a full partial tile goes out as a SINGLE queued transfer where the
+  // silicon allows it. Multi-segment async tiles once rendered as a stale band;
+  // keeping segments few avoids that and is faster (fewer IRQs).
+  //
+  // BUT the SoC also has a PER-TRANSACTION cap (the SPI DMA length register), and on
+  // some chips it is SMALLER than 48 KB — the ESP32-S3's is 18 bits = 32 KB. A segment
+  // above that cap is REJECTED by spi_master at queue time ("txdata transfer >
+  // hardware max supported len"), which made every full-screen tile on the S3 fail
+  // over to the blocking path after paying for the swap + addr window (and a swap
+  // back). So clamp SEG to the hardware cap; a 240x320 full-screen tile then goes out
+  // as five 32 KB segments in the one CS bracket, all queued up-front — still one
+  // waitAsync per tile. Kept a multiple of 2 for whole RGB565 pixels.
+  uint32_t SEG = 48 * 1024; // bytes (== bus max_transfer_sz)
+#ifdef SPI_LL_DMA_MAX_BIT_LEN
+  const uint32_t HW_SEG = (SPI_LL_DMA_MAX_BIT_LEN / 8) & ~1u;
+  if (SEG > HW_SEG)
+  {
+    SEG = HW_SEG;
+  }
+#endif
   uint32_t nseg = (len + SEG - 1) / SEG;
   if (nseg > (uint32_t)ASYNC_MAX_SEG)
   {

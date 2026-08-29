@@ -44,7 +44,13 @@
 #define QS_TEXT_FONT lv_font_montserrat_20  // narrow: bigger, readable (panel has the room)
 #endif
 #define QS_SCRIM_OPA   LV_OPA_COVER   // scrim is fully opaque black (flat fill = cheap; no per-frame blend)
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+// T-Deck Pro: "brightness" is the KEYBOARD backlight (the e-paper has none),
+// and turning a keyboard light fully OFF is a legitimate setting — no floor.
+#define QS_BRIGHT_MIN_PCT 0
+#else
 #define QS_BRIGHT_MIN_PCT 3   // slider floor (~raw 8, near-dark but never fully off); 100% = raw 255
+#endif
 
 static lv_obj_t *qs_scrim  = nullptr;   // full-screen dim behind the panel (modal + tap-to-close)
 static lv_obj_t *qs_panel  = nullptr;   // the sliding shade
@@ -55,6 +61,7 @@ static lv_obj_t *qs_val     = nullptr;  // numeric brightness readout
 static lv_obj_t *qs_caf_btn  = nullptr; // caffeine (keep-awake) toggle
 static lv_obj_t *qs_mute_btn = nullptr; // mute toggle
 static lv_obj_t *qs_mute_icon= nullptr; // speaker glyph inside the mute button
+static lv_obj_t *qs_caf_icon = nullptr; // coffee glyph inside the caffeine button (recolored on e-paper)
 
 static bool    qs_open     = false;     // logically open (panel resting at y=0)?
 static bool    qs_dragging = false;     // a finger drag is in progress
@@ -200,20 +207,22 @@ static void quick_shade_force_close(void) {
  * watchface, which otherwise has nothing to trigger a framebuffer push. */
 static inline bool quick_shade_active(void) { return qs_open || qs_dragging; }
 
-/* Put the coffee-outline icon (Material Design Icons font, 28px to match the mute
- * speaker glyph beside it) into the caffeine button. Was hand-built from white shapes
- * (no coffee glyph in the symbol font); now the MDI glyph for a crisp, consistent
- * look. The button's bg color signals state; the glyph is click-transparent so a tap
- * anywhere on it still reaches the button. */
+/* Put the coffee-outline icon into the caffeine button. UI_ICON_MDI(28) so it is
+ * ALWAYS the same size as the mute speaker glyph in the button beside it
+ * (UI_ICON_SYM(28)) — the two buttons are one visual group, and the icon-group
+ * helpers snap both faces to the same per-board cut (28 on the reference, 14 on
+ * the 240-wide boards). The button's bg color signals state; the glyph is
+ * click-transparent so a tap anywhere on it still reaches the button. */
 static void qs_build_coffee(lv_obj_t *btn) {
   lv_obj_t *c = lv_label_create(btn);
-  lv_obj_set_style_text_font(c, &icons28, 0);
+  lv_obj_set_style_text_font(c, &UI_ICON_MDI(28), 0);
   lv_obj_set_style_text_color(c, lv_color_white(), 0);
   { char u[5]; lv_label_set_text(c, mdi_utf8(MDI_COFFEE, u)); }
   lv_obj_center(c);
   // Decorative overlay: don't let the glyph swallow a tap aimed at the button.
   lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(c, LV_OBJ_FLAG_EVENT_BUBBLE);
+  qs_caf_icon = c;   // kept so qs_refresh_toggles can recolor it (e-paper contrast flip)
 }
 
 /* Paint both toggle buttons to match their state: accent bg = engaged. The mute
@@ -228,6 +237,19 @@ static void qs_refresh_toggles(void) {
   if (qs_mute_icon)
     lv_label_set_text(qs_mute_icon,
         settings_get_mute() ? LV_SYMBOL_MUTE : LV_SYMBOL_VOLUME_MAX);
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+  /* 1-bit inverted e-paper: the engaged button's accent bg renders as a SOLID
+   * BLACK pill and the white glyph also renders black — icon swallowed. Flip
+   * the glyph's luminance with the state: engaged = LVGL black (renders WHITE
+   * on the glass, cut out of the black pill), off = LVGL white (renders black
+   * on the white pill). Emissive boards keep the always-white glyphs. */
+  if (qs_caf_icon)
+    lv_obj_set_style_text_color(qs_caf_icon,
+        caffeine_get() ? lv_color_black() : lv_color_white(), 0);
+  if (qs_mute_icon)
+    lv_obj_set_style_text_color(qs_mute_icon,
+        settings_get_mute() ? lv_color_black() : lv_color_white(), 0);
+#endif
 }
 
 static void qs_caf_cb(lv_event_t *e) {
@@ -459,9 +481,25 @@ static void quick_shade_init(void) {
   lv_obj_set_style_pad_row(toggles, qs_tog_gap, 0);
 #else
   // S3 (wide): two toggles side by side spread to the panel edges.
+#if BOARD_SCREEN_SUBREF
+  // Any sub-reference panel (S3-1.64 280 wide, S3-Touch-LCD-2 240 wide): UI_PX
+  // scales the reference sizes down (68% / 58% respectively), which left the two
+  // toggles small to hit. Enlarge the reference values so the scaled result is
+  // bigger — but the row must still FIT. Checked on both panels:
+  //     280 px @68%: row UI_PX(390)=265, buttons 2x UI_PX(184)=250  -> fits
+  //     240 px @58%: row UI_PX(390)=226, buttons 2x UI_PX(184)=214  -> fits
+  // Going to the "obvious" UI_PX(440)/UI_PX(210) would be 299 px of row on the
+  // 280 px screen — i.e. it would clip, which is the very bug being fixed here.
+  // (SUBREF, not MIDNARROW: this is about the panel being narrower than the
+  // reference, not about the launcher grid.)
+  const int qs_btn_w = UI_PX(184);   // ~126 px vs the previous ~102 px
+  const int qs_btn_h = UI_PX(104);   // ~71 px vs the previous ~54 px
+  lv_obj_set_size(toggles, UI_PX(390), UI_PX(104));
+#else
   const int qs_btn_w = UI_PX(150);
   const int qs_btn_h = UI_PX(80);
   lv_obj_set_size(toggles, UI_PX(330), UI_PX(80));
+#endif
   lv_obj_align(toggles, LV_ALIGN_CENTER, 0, UI_PX(46));
   lv_obj_set_flex_flow(toggles, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(toggles, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
@@ -481,7 +519,7 @@ static void quick_shade_init(void) {
   lv_obj_set_style_shadow_width(qs_mute_btn, 0, 0);
   lv_obj_add_event_cb(qs_mute_btn, qs_mute_cb, LV_EVENT_CLICKED, nullptr);
   qs_mute_icon = lv_label_create(qs_mute_btn);
-  lv_obj_set_style_text_font(qs_mute_icon, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(qs_mute_icon, &UI_ICON_SYM(28), 0);
   lv_obj_set_style_text_color(qs_mute_icon, lv_color_white(), 0);
   // Fixed-width, LEFT-aligned box so the speaker cone (the left of both glyphs)
   // stays put when the "waves" vanish — otherwise the narrower mute glyph

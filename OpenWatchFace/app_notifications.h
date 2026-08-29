@@ -161,7 +161,7 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
                           const char *body, bool unread, uint8_t cat) {
   lv_obj_t *row = lv_obj_create(list);    // plain container, made clickable below
   lv_obj_remove_style_all(row);
-  lv_obj_set_width(row, 330);
+  lv_obj_set_width(row, UI_COL_W(330));
   // Fixed height: roomy enough for a two-line title. The list shows the TITLE ONLY
   // (the body preview used to sit under it and overlap on short rows); the title now
   // gets the whole row and may wrap to two lines. Full body is shown in the reader.
@@ -210,7 +210,7 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
   lv_obj_set_style_text_color(t, unread ? lv_color_white() : lv_color_hex(0xBBBBBB), 0);
   lv_label_set_text(t, title);
   lv_obj_align(t, LV_ALIGN_LEFT_MID, text_x, 0);
-  lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);   // long title truncates with "…" on line 2
+  ui_label_single_line(t);   // long title truncates with "…" on line 2
   lv_obj_set_width(t, text_w);
 
   lv_obj_t *x = lv_btn_create(row);
@@ -220,7 +220,7 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
   lv_obj_set_style_radius(x, 18, 0);     // round
   lv_obj_add_event_cb(x, notif_entry_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)idx);
   lv_obj_t *xl = lv_label_create(x);
-  lv_obj_set_style_text_font(xl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(xl, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(xl, lv_color_hex(ui_accent_hex()), 0);
   lv_label_set_text(xl, LV_SYMBOL_CLOSE);
   lv_obj_center(xl);
@@ -237,7 +237,13 @@ static void app_open_notif_detail(void) {
   // Scrollable reader column. No title header, so it starts just below the BOOT
   // hint band (which the shell draws at the very top-left) and fills the screen.
   lv_obj_t *col = lv_obj_create(app_scr);
-  lv_obj_set_size(col, 372, 440);
+  // Width: 372 on reference panels, % of screen on mid-narrow (372 overhangs a
+  // 280-px panel). Height derived from the real screen rather than the fixed 440:
+  // 440 from y=52 needs 492 px, which the 502-px 2.06 has but the 456-px S3-1.64
+  // does not — the column ran 36 px off the bottom so the last lines never
+  // scrolled clear. Same 10 px bottom margin the 2.06 effectively had.
+  lv_obj_set_width(col, UI_COL_W(372));
+  lv_obj_set_height(col, (int)screenHeight - 52 - 10);
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 52);
   lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(col, 0, 0);
@@ -259,7 +265,7 @@ static void app_open_notif_detail(void) {
     lv_obj_set_style_pad_top(col, 60, 0);
 
     lv_obj_t *ic = lv_label_create(col);
-    lv_obj_set_style_text_font(ic, &lv_font_montserrat_40, 0);   // built-in for a crisp large glyph
+    lv_obj_set_style_text_font(ic, &UI_FONT(40), 0);   // built-in for a crisp large glyph
     lv_obj_set_style_text_color(ic, lv_color_hex(notif_icon_color(NCAT_CALL)), 0);
     lv_label_set_text(ic, LV_SYMBOL_CALL);
 
@@ -324,7 +330,8 @@ static void app_open_notifications(void) {
   // Scrollable list area, from below the title down to just above the bottom bar.
   // When paged, leave extra room at the bottom for the Prev/Next row.
   lv_obj_t *list = lv_obj_create(app_scr);
-  lv_obj_set_size(list, 360, multipage ? 280 : 320);
+  lv_obj_set_width(list, UI_COL_W(360));
+  lv_obj_set_height(list, multipage ? 280 : 320);
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 90);
   lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(list, 0, 0);
@@ -348,7 +355,8 @@ static void app_open_notifications(void) {
   if (multipage) {
     lv_obj_t *pager = lv_obj_create(app_scr);
     lv_obj_remove_style_all(pager);
-    lv_obj_set_size(pager, 360, 44);
+    lv_obj_set_width(pager, UI_COL_W(360));
+    lv_obj_set_height(pager, 44);
     lv_obj_align(pager, LV_ALIGN_BOTTOM_MID, 0, -84);
     lv_obj_clear_flag(pager, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -395,7 +403,7 @@ static void app_open_notifications(void) {
   lv_obj_set_style_radius(clr, 12, 0);
   lv_obj_add_event_cb(clr, notif_clear_all_cb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t *cl = lv_label_create(clr);
-  lv_obj_set_style_text_font(cl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(cl, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(cl, lv_color_hex(ui_accent_hex()), 0);
   lv_label_set_text(cl, LV_SYMBOL_TRASH "  Clear");
   lv_obj_center(cl);

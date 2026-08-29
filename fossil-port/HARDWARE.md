@@ -41,6 +41,13 @@ lpm_levels.sleep_disabled=1 selinux=0 ...
 - **Debug UART exists**: MSM HSL UART @ phys 0x78af000 (BLSP1 UART). Whether it
   reaches any accessible pad is unknown — but the peripheral + protocol is known,
   and a bare-metal putc against it is ~20 lines.
+  **DO NOT TOUCH IT (2026-08-28).** The first Gen 4 image that ran died
+  instantly, and disabling `uart_init()` was what made the firmware boot.
+  Nothing proves aboot leaves BLSP1 UART1 clocked at handoff, and a read of a
+  clock-gated MSM block does not fail — the AHB transaction never completes and
+  the CPU hangs there. `boards/fossil_gen4.h` now sets `PLAT_UART_DISABLED`;
+  re-enable only together with a GCC driver for the BLSP1 UART clocks AND a pad
+  that something can actually listen on (open question #3, still open).
 - Both variants report `androidboot.hardware=ray`.
 
 ## SoC / platform
@@ -68,7 +75,7 @@ lpm_levels.sleep_disabled=1 selinux=0 ...
 | Block | Fact | Source |
 |---|---|---|
 | Display path | MDP3 + MIPI-DSI (mdss_mdp; AsteroidOS patches `video/mdp3`) | patch 0005, msm8909-mdss*.dtsi |
-| Panel | Round, 390×390 (firefish) / 390×390-class (ray). Best in-tree template: `dsi-panel-auo-400p-cmd.dtsi` — AUO 400×400 **command-mode** DSI, 24bpp, full on/off command tables. Exact Fossil panel comes from the stock DTB. | dts tarball |
+| Panel | **CONFIRMED from the stock DTB: "AUO h139 AMOLED command mode dsi panel" (pref-prim-pan phandle 0x9b), round 454×454 (0x1c6), 24bpp, framerate 45, `rgb_swap_rgb`, active area at column offset 10.** Earlier notes said 390×390 — that was a pre-dump guess and is WRONG. The DTB is checked in at `firefish-stock.dtb`/`.dts`; the command tables are ported verbatim in `baremetal/platform/dsi_panel.c`. | stock DTB |
 | Touch | **Raydium RM_TS** I2C (`CONFIG_TOUCHSCREEN_RM_TS=y`; it7260/synaptics disabled). Driver: `drivers/input/touchscreen/raydium/` | defconfig |
 | Touch bus (ref boards) | BLSP1 QUP5 i2c @ 0x78b9000 (reference wear DT; confirm Fossil's from stock DTB) | apq8009w-swoctp.dtsi |
 | PMIC | PM8916-class over SPMI (`msm-pm8916.dtsi` on wear refs; charger ext.) | swoctp dtsi |
@@ -157,10 +164,36 @@ hardware, not a CPU benchmark), highest-leverage first:
 - Fastboot entry gesture: boot, wait for vibration to stop, then immediately
   touch top-left + bottom-right screen edges.
 
-## Open questions (resolve when the watch arrives)
+## Confirmed on hardware (2026-08-28, first boots of the real firmware)
 
-1. Exact panel controller + init table → stock DTB dump.
-2. Fossil's touch/pin map deltas vs the swoctp reference DT → stock DTB dump.
+- **The firmware boots and renders.** The OpenWatchFace UI is on the glass, via
+  the MDP3 DMA_P takeover of aboot's splash engine (`platform/fb_mdp3.c`): no
+  DSI, PHY, PLL or panel-init code of our own runs at all. Build and flag
+  details: [`BUILD-GEN4.md`](BUILD-GEN4.md).
+- **The panel wants RGB pack order** (`MDP3_DMA_OUTPUT_PACK_PATTERN_RGB`,
+  0x21), NOT BGR. The DT's `rgb_swap_rgb` and `mdp3_ctrl.c`'s BGR-for-8888 rule
+  both pointed at BGR; on the glass that gave red-as-blue and bright-blue-as-
+  orange with black and white correct, i.e. R and B swapped once too often.
+- **`uart_init()` is fatal** — see the boot.img section above.
+- **The APPS watchdog must be petted from the first instruction.** aboot arms
+  it at an 11 s bark (`qcom,bark-time = 0x2af8`), so a build without
+  `-DWDOG_TRACE` warm-resets into Wear OS a few seconds in, looking exactly
+  like an image that never ran.
+- **Three MDP3 register/enum errors** were found by re-reading the vendor
+  source rather than trusting the earlier port: `DMA_P_FETCH_CFG` is at 0x90074
+  (not 0x90048), `PACK_PATTERN_BGR` is 0x12 (0x06 is GBR), and
+  `color_comp_out_bits` is three 2-bit fields = 0x3F (not a bare 3, which
+  leaves two components at 4 bits).
+
+## Open questions
+
+1. ~~Exact panel controller + init table~~ — ANSWERED: AUO h139, 454x454,
+   command mode; table decoded verbatim into `dsi_panel.c`. (Only needed for
+   the `-DGEN4_DSI_INIT` fallback; the normal path never sends it.)
+2. Fossil's touch/pin map deltas vs the swoctp reference DT → ANSWERED from the
+   dump: touch is Raydium @0x39 on i2c@78b9000 (the DT's `i2c5` = BLSP1 QUP5,
+   pins gpio18/19, function `blsp_i2c5` = func-sel 2), reset GPIO 12, IRQ GPIO
+   13. Whether the controller actually answers is not yet confirmed.
 3. Is the HSL UART bonded out anywhere reachable (pogo pads / test points)?
 4. Which DTB does Fossil's aboot actually select (board-id) — affects our
    appended-DTB packaging.

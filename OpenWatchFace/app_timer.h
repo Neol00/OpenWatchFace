@@ -148,7 +148,7 @@ static void alarm_fire_ex(const char *title, const char *subtitle, bool fromTime
     lv_obj_add_event_cb(alarm_scr, alarm_click_cb, LV_EVENT_CLICKED, nullptr);
 
   lv_obj_t *ic = lv_label_create(alarm_scr);
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(ic, &UI_FONT(28), 0);
   lv_obj_set_style_text_color(ic, lv_color_hex(0xFF4D4D), 0);
   lv_label_set_text(ic, LV_SYMBOL_BELL);
   lv_obj_align(ic, LV_ALIGN_CENTER, 0, UI_PX(-96));

@@ -70,6 +70,25 @@ static void pl_cmd_cb(lv_event_t *e) {
   // missed update within a couple seconds, so the button always reflects reality.
 }
 
+/* Transport button diameters (reference px; UI_PX scales them per panel).
+ * Mid-narrow (S3-1.64) enlarges them: UI_PX scales to 68% there, which left
+ * PREV/NEXT at ~45 px and PLAY at ~57 px — usable but small, as reported. The
+ * bumped references give ~60 px and ~79 px instead. The row still fits easily:
+ * 2*88 + 116 + two 22 px gaps = 336 reference px -> ~229 px on the 280 px panel.
+ * Every other board keeps the original 66/84, unchanged. */
+/* SUBREF, not MIDNARROW: these are REFERENCE px that UI_PX then scales down, so
+ * the question is "is this panel narrower than the reference" — not how many
+ * launcher columns it takes. The S3-Touch-LCD-2 (240 wide) needs the same bump for
+ * the same reason the S3-1.64 did: at the plain 66/84 references its scaled
+ * transport buttons come out too small to hit comfortably. */
+#if BOARD_SCREEN_SUBREF
+#define PL_BTN_SIDE 88
+#define PL_BTN_PLAY 116
+#else
+#define PL_BTN_SIDE 66
+#define PL_BTN_PLAY 84
+#endif
+
 /* One round transport button (glyph centered). Returns the label so the caller can
  * keep a handle (the play/pause one changes its glyph). */
 static lv_obj_t *pl_make_btn(lv_obj_t *parent, const char *glyph, PlayerCmd cmd,
@@ -81,7 +100,7 @@ static lv_obj_t *pl_make_btn(lv_obj_t *parent, const char *glyph, PlayerCmd cmd,
   lv_obj_set_style_shadow_width(b, 0, 0);
   lv_obj_add_event_cb(b, pl_cmd_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)cmd);
   lv_obj_t *l = lv_label_create(b);
-  lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(l, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(l, lv_color_white(), 0);
   lv_label_set_text(l, glyph);
   lv_obj_center(l);
@@ -96,69 +115,117 @@ static void app_open_player(void) {
 #if BOARD_SCREEN_NARROW
   lv_obj_set_height(col, (int)screenHeight - UI_PX(124) - UI_PX(8));
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(124));
+#elif BOARD_SCREEN_ROUND_SMALL
+  // SMALL ROUND face: this screen is a TOP-ANCHORED flex column, so the transport
+  // row does not have a position of its own — it lands wherever the stack above it
+  // ends. On the C2 that stack measured ~299 px starting at y=82, putting the row at
+  // y 287..381 on a 360 px panel: the reported "play and skip buttons half off the
+  // bottom". The buttons themselves are the right size (UI_PX(84)/UI_PX(66) = 73/57
+  // px), so nothing here shrinks them — the fix is to reclaim the ~45 px of vertical
+  // slack that the stack above spends, and start it higher:
+  //     column top   UI_PX(84) -> UI_PX(70)          -10 px
+  //     pad_all      UI_PX(10) -> UI_PX(6)            -8 px
+  //     pad_row      UI_PX(8)  -> UI_PX(3)           -20 px (5 gaps)
+  //     header glyph UI_FONT(40) -> UI_FONT(30)      -12 px
+  //     glyph pad_top 8 -> 2, state pad_top 4 -> 0    -10 px
+  // That lands the row at y 229..319 with the play button bottom at ~309, where the
+  // inscribed circle is still ~251 px wide against the row's 225 px.
+  lv_obj_set_height(col, (int)screenHeight - UI_PX(70) - UI_PX(24));
+  lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(70));
 #else
   lv_obj_set_height(col, (int)screenHeight - UI_PX(84) - UI_PX(8));
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(84));
 #endif
   lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(col, 0, 0);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_pad_all(col, UI_PX(6), 0);
+#else
   lv_obj_set_style_pad_all(col, UI_PX(10), 0);
+#endif
   lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   ui_apply_scrollbar_nudge(col);  // narrow-panel: shift scrollbar toward the edge (no-op on S3)
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_pad_row(col, UI_PX(3), 0);
+#else
   lv_obj_set_style_pad_row(col, UI_PX(8), 0);
+#endif
 
   // Big music glyph up top.
   lv_obj_t *ic = lv_label_create(col);
-  lv_obj_set_style_text_font(ic, &lv_font_montserrat_40, 0);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_text_font(ic, &UI_FONT(30), 0);
+#else
+  lv_obj_set_style_text_font(ic, &UI_FONT(40), 0);
+#endif
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_accent_hex()), 0);
   lv_label_set_text(ic, LV_SYMBOL_AUDIO);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_pad_top(ic, 2, 0);
+#else
   lv_obj_set_style_pad_top(ic, 8, 0);
+#endif
 
   pl_title_lbl = lv_label_create(col);
   lv_obj_set_style_text_font(pl_title_lbl, &FONT_LABEL, 0);
   lv_obj_set_style_text_color(pl_title_lbl, lv_color_white(), 0);
   lv_obj_set_width(pl_title_lbl, LV_PCT(96));
   lv_obj_set_style_text_align(pl_title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(pl_title_lbl, LV_LABEL_LONG_DOT);
+  ui_label_single_line(pl_title_lbl);
 
   pl_artist_lbl = lv_label_create(col);
   lv_obj_set_style_text_font(pl_artist_lbl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(pl_artist_lbl, lv_color_hex(0xCCCCCC), 0);
   lv_obj_set_width(pl_artist_lbl, LV_PCT(96));
   lv_obj_set_style_text_align(pl_artist_lbl, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(pl_artist_lbl, LV_LABEL_LONG_DOT);
+  ui_label_single_line(pl_artist_lbl);
 
   pl_album_lbl = lv_label_create(col);
   lv_obj_set_style_text_font(pl_album_lbl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(pl_album_lbl, lv_color_hex(0x888888), 0);
   lv_obj_set_width(pl_album_lbl, LV_PCT(96));
   lv_obj_set_style_text_align(pl_album_lbl, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(pl_album_lbl, LV_LABEL_LONG_DOT);
+  ui_label_single_line(pl_album_lbl);
 
   pl_state_lbl = lv_label_create(col);
   lv_obj_set_style_text_font(pl_state_lbl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(pl_state_lbl, lv_color_hex(ui_accent_soft_hex()), 0);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_pad_top(pl_state_lbl, 0, 0);
+#else
   lv_obj_set_style_pad_top(pl_state_lbl, 4, 0);
+#endif
 
   // Transport row: prev / play-pause (bigger) / next. Height must clear the TALLEST
   // button (the 84px play button) plus the top gap, or the button clips at the bottom.
   lv_obj_t *ctl = lv_obj_create(col);
   lv_obj_remove_style_all(ctl);
   lv_obj_set_width(ctl, LV_PCT(100));
-  lv_obj_set_height(ctl, UI_PX(84 + 24));    // tallest button + headroom so nothing clips
+#if BOARD_SCREEN_ROUND_SMALL
+  // Headroom trimmed 24 -> 20 and the row's own top pad 16 -> 8 (below), so the
+  // box still fully contains the tallest button (UI_PX(84) = 73 px) instead of
+  // reserving slack this panel cannot afford: 7 + 73 = 80 <= UI_PX(104) = 90.
+  lv_obj_set_height(ctl, UI_PX(PL_BTN_PLAY + 20));
+#else
+  lv_obj_set_height(ctl, UI_PX(PL_BTN_PLAY + 24));  // tallest button + headroom so nothing clips
+#endif
   lv_obj_clear_flag(ctl, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(ctl, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(ctl, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(ctl, UI_PX(22), 0);
+#if BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_style_pad_top(ctl, UI_PX(8), 0);
+#else
   lv_obj_set_style_pad_top(ctl, UI_PX(16), 0);
+#endif
 
-  pl_make_btn(ctl, LV_SYMBOL_PREV, PCMD_PREV, UI_PX(66), 0x2A2A2A);
-  pl_play_lbl = pl_make_btn(ctl, LV_SYMBOL_PLAY, PCMD_TOGGLE, UI_PX(84), ui_accent_hex());
-  pl_make_btn(ctl, LV_SYMBOL_NEXT, PCMD_NEXT, UI_PX(66), 0x2A2A2A);
+  pl_make_btn(ctl, LV_SYMBOL_PREV, PCMD_PREV, UI_PX(PL_BTN_SIDE), 0x2A2A2A);
+  pl_play_lbl = pl_make_btn(ctl, LV_SYMBOL_PLAY, PCMD_TOGGLE, UI_PX(PL_BTN_PLAY), ui_accent_hex());
+  pl_make_btn(ctl, LV_SYMBOL_NEXT, PCMD_NEXT, UI_PX(PL_BTN_SIDE), 0x2A2A2A);
 
   pl_refresh();
   pl_timer = lv_timer_create(pl_timer_cb, 400, nullptr);   // pick up live updates

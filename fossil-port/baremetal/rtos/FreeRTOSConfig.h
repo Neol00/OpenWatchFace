@@ -12,13 +12,28 @@
    * verifies this against the hardware at boot). */
   #define configUNIQUE_INTERRUPT_PRIORITIES        256
   #define configMAX_API_CALL_INTERRUPT_PRIORITY    144
-#elif defined(PLAT_BOARD_FOSSIL_GEN4)
+#elif defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6) || \
+      defined(PLAT_BOARD_TICWATCH_C2)
+  /* Every MSM watch here uses qcom,msm-qgic2 at the SAME addresses — the Gen 6
+   * DTB's interrupt-controller@b000000 reg is byte-identical to the Gen 4's,
+   * and the TicWatch C2 is the Gen 4's SoC outright. This block cannot use
+   * PLAT_SOC_MSM: the file is included from assembly and must stay
+   * self-contained, so it never sees platform.h's derived tiers. */
   #define configINTERRUPT_CONTROLLER_BASE_ADDRESS          0x0B000000UL
   #define configINTERRUPT_CONTROLLER_CPU_INTERFACE_OFFSET  0x00002000UL
-  /* GIC-400 implements 5 priority bits -> 32 levels. VERIFY on hardware: the
-   * port asserts the real bit count at scheduler start. */
-  #define configUNIQUE_INTERRUPT_PRIORITIES        32
-  #define configMAX_API_CALL_INTERRUPT_PRIORITY    18
+  /* GIC priority bits: MEASURED ON HARDWARE 2026-08-03, twice, both ways.
+   * The line-number-encoding vAssertCalled read "8 s" = port.c:365 = the
+   * read-back assert with 32 configured -> the register reads back 0xF0 ->
+   * 15 -> NON-SECURE 4-bit view, 16 levels. (An earlier "3 s" reading was
+   * misattributed to this assert firing with 16 configured; it was actually
+   * a post-scheduler-start event — with 16 the GIC checks all PASS.)
+   * 16 is the measured truth; do not "correct" it back to 32.
+   *
+   * The C2 inherits this MEASURED-on-Fossil value untested. Same GIC-400 in
+   * the same non-secure view, so 16 is very likely right — but if the C2
+   * asserts early in port.c, this is the first line to suspect. */
+  #define configUNIQUE_INTERRUPT_PRIORITIES        16
+  #define configMAX_API_CALL_INTERRUPT_PRIORITY    12
 #else
   #error "FreeRTOSConfig.h: unknown PLAT_BOARD_*"
 #endif
@@ -59,7 +74,7 @@ void vAssertCalled( const char * pcFile, unsigned long ulLine );
 #define configSUPPORT_STATIC_ALLOCATION          0
 #define configSUPPORT_DYNAMIC_ALLOCATION         1
 
-#define configUSE_IDLE_HOOK                      0
+#define configUSE_IDLE_HOOK                      1  /* WFI idle — see irq.c (the 100%-duty bug) */
 #define configUSE_TICK_HOOK                      0
 #define configCHECK_FOR_STACK_OVERFLOW           2
 #define configUSE_MALLOC_FAILED_HOOK             1

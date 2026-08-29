@@ -73,6 +73,8 @@ static volatile bool  s_net_request     = false;     // loop -> task: please fet
 static volatile bool  s_net_busy        = false;     // task is currently working
 static volatile int   s_net_new_count   = 0;         // task -> loop: # new this fetch
 static volatile bool  s_net_result_ready= false;     // task -> loop: result to consume
+static volatile bool  s_weather_request = false;     // loop/BLE -> task: please fetch weather
+static volatile bool  s_weather_ready   = false;     // task -> loop: new weather to render
 
 /* Minimal JSON string-field extractor for our known, simple server payload:
  *   {"items":[{"id":..,"app":"..","title":"..","body":"..","ts":..}]}
@@ -395,12 +397,267 @@ static int notif_fetch_raw(String &outTitle, String &outBody, uint64_t &maxId) {
   return added;
 }
 
+/* ===========================================================================
+ *  WEATHER fetch (open-meteo, no API key) — runs on the SAME core-0 net task.
+ *  ---------------------------------------------------------------------------
+ *  The phone (BLE) only sets the LOCATION; the actual weather for that lat/lon
+ *  is fetched here over WiFi and written into s_wx (weather_store.h). It shares
+ *  wifi_connect() with the notification fetch, so the WiFi+BLE coexistence guard
+ *  above protects it too. Plain HTTP (open-meteo serves it) — no TLS cert, no
+ *  pinned CA, and nothing secret in the request, so the handshake cost is saved.
+ * ========================================================================= */
+
+/* Extract a JSON NUMBER field ("key":<num>) as a double. Companion to
+ * json_find_string (which is string-values only). Returns false if absent.
+ * `from` lets the caller scope the search (e.g. inside the "current" object). */
+static bool json_find_number(const String &src, int from, const char *key, double &out) {
+  String pat = String("\"") + key + "\":";
+  int k = src.indexOf(pat, from);
+  if (k < 0) return false;
+  int vstart = k + pat.length();
+  while (vstart < (int)src.length() && (src[vstart] == ' ' || src[vstart] == '\t')) vstart++;
+  const char *p = src.c_str() + vstart;
+  char *end = nullptr;
+  double v = strtod(p, &end);
+  if (end == p) return false;    // "key":null / non-numeric
+  out = v;
+  return true;
+}
+
+/* Copy ONE JSON array's first N numbers (e.g. "temperature_2m_max":[..]) into
+ * out[]. Returns how many were parsed (<= maxn). Used for the daily forecast
+ * arrays. Tolerant of nulls (skips to the next value). */
+static int json_find_num_array(const String &src, const char *key, double *out, int maxn) {
+  String pat = String("\"") + key + "\":[";
+  int k = src.indexOf(pat);
+  if (k < 0) return 0;
+  int i = k + pat.length();
+  int n = 0;
+  while (n < maxn && i < (int)src.length()) {
+    while (i < (int)src.length() && (src[i] == ' ' || src[i] == ',')) i++;
+    if (i >= (int)src.length() || src[i] == ']') break;
+    const char *p = src.c_str() + i;
+    char *end = nullptr;
+    double v = strtod(p, &end);
+    if (end == p) {                        // null or a quoted date string -> skip to next comma/]
+      while (i < (int)src.length() && src[i] != ',' && src[i] != ']') i++;
+      continue;
+    }
+    out[n++] = v;
+    i += (int)(end - p);
+  }
+  return n;
+}
+
+/* Round a double to a clamped int16 (°C). Guards NaN/insane values from a bad
+ * parse so the UI never shows garbage temperatures. */
+static int16_t wx_round_c(double v) {
+  if (!(v > -120.0 && v < 120.0)) return INT16_MIN;   // also catches NaN
+  return (int16_t)(v < 0 ? v - 0.5 : v + 0.5);
+}
+
+/* URL scheme per platform: plain http on ESP32 (no TLS to hang), https on Tuya
+ * (its HTTPClient compat is port-443-only). See wx_http_get() for the rationale. */
+#if BOARD_PLATFORM_TUYA
+#define WX_SCHEME "https://"
+#else
+#define WX_SCHEME "http://"
+#endif
+
+/* Build the open-meteo request URL for the stored lat/lon into `buf`. Asks for
+ * the current block + a daily block (max/min temp + weather code + weekday index
+ * is derived from the returned dates). temperature in °C, wind in km/h. */
+static void weather_build_url(char *buf, size_t n, float lat, float lon) {
+  snprintf(buf, n,
+    WX_SCHEME "api.open-meteo.com/v1/forecast"
+    "?latitude=%.4f&longitude=%.4f"
+    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+    "weather_code,wind_speed_10m,is_day"
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+    "&timezone=auto&forecast_days=%d",
+    (double)lat, (double)lon, WEATHER_FC_DAYS);
+}
+
+/* GET a (keyless, public) open-meteo endpoint -> `out` body. Returns true on HTTP 200.
+ *
+ * TRANSPORT DIFFERS BY PLATFORM, and this is deliberate:
+ *   - ESP32 core: PLAIN HTTP (a bare WiFiClient). open-meteo serves http:// directly,
+ *     and using it here SIDESTEPS TLS entirely — no handshake to stall (the "refresh
+ *     hangs for a minute" symptom), no 16 KB TLS RX buffer to size for a big CDN cert
+ *     chain, no cert-date dependency on the RTC. Nothing secret is sent, so there is
+ *     no security cost. This is why the notification path (a private server) pins a CA
+ *     but weather does not need to.
+ *   - Tuya compat (tuya/compat/HTTPClient.h): it is HTTPS-only (hardcoded port 443,
+ *     unverified when no CA is set) and has no begin(WiFiClient&,...) overload, so the
+ *     Tuya build uses https:// + the single-arg begin(). weather_build_url / the
+ *     geocode URL are built per-platform to match (http on ESP32, https on Tuya).
+ * Assumes WiFi is already up. The client is static so its buffers live off the 8 KB
+ * net-task stack; the net task is the only, serialized caller so this is safe. */
+static bool wx_http_get(const char *url, String &out) {
+  HTTPClient http;
+  bool started;
+#if BOARD_PLATFORM_TUYA
+  started = http.begin(String(url));                 // https, unverified TLS on the Tuya layer
+#else
+  static WiFiClient client;                           // PLAIN http — no TLS, no handshake to hang
+  started = http.begin(client, url);
+#endif
+  if (!started) { USBSerial.println("[wx] http begin() failed"); return false; }
+  http.setConnectTimeout(6000);
+  http.setTimeout(6000);
+#if !BOARD_PLATFORM_TUYA
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // in case the http endpoint 3xx-redirects
+#endif
+  int code = http.GET();
+  bool ok = (code == 200);
+  if (ok) out = http.getString();
+  else    USBSerial.printf("[wx] GET -> %d\n", code);
+  http.end();
+  return ok;
+}
+
+/* Resolve the stored place NAME to lat/lon via open-meteo's geocoding API (keyless).
+ * Used when a BLE push set a name but no coordinates. Returns true and records the
+ * coords on success; on failure the old coords stay (so weather still works for the
+ * previous place). Assumes WiFi is already up (called from weather_fetch_raw). */
+static bool weather_geocode(void) {
+  char name[WEATHER_LOC_MAX];
+  store_lock(); strncpy(name, s_wx.loc_name, sizeof(name)); store_unlock();
+  name[sizeof(name) - 1] = '\0';
+  if (!*name) return false;
+
+  // URL-encode the name (spaces -> %20; keep it simple, city names are mostly ASCII).
+  String q; q.reserve(64);
+  for (const char *c = name; *c; c++) {
+    if (*c == ' ') q += "%20";
+    else if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+             (*c >= '0' && *c <= '9') || *c == '-' || *c == '.') q += *c;
+    // drop anything else (commas, accents) — the API tolerates a partial name
+  }
+  char url[192];
+  snprintf(url, sizeof(url),
+           WX_SCHEME "geocoding-api.open-meteo.com/v1/search?name=%s&count=1&format=json",
+           q.c_str());
+
+  bool ok = false;
+  String p;
+  if (wx_http_get(url, p)) {
+    // First result object: {"results":[{"name":..,"latitude":..,"longitude":..}]}
+    int r = p.indexOf("\"results\":");
+    double la, lo;
+    if (r >= 0 &&
+        json_find_number(p, r, "latitude",  la) &&
+        json_find_number(p, r, "longitude", lo)) {
+      weather_set_resolved_coords((float)la, (float)lo);
+      ok = true;
+      USBSerial.printf("[wx] geocode \"%s\" -> %.4f,%.4f\n", name, la, lo);
+    }
+  }
+  if (!ok) USBSerial.printf("[wx] geocode FAIL for \"%s\"\n", name);
+  return ok;
+}
+
+/* Fetch + parse weather for the stored location into s_wx. Network-only (no LVGL),
+ * safe on the net task. Returns true on a successful parse. */
+static bool weather_fetch_raw(void) {
+  s_wifi_active = 1;
+  if (!wifi_connect()) {
+    USBSerial.println("[wx] wifi_connect() failed -> no fetch");
+    s_wifi_active = 0;
+    return false;
+  }
+
+  // If a BLE push set a NAME but no coordinates, resolve them first. A geocode
+  // failure is non-fatal — fall through and fetch for the previous coords.
+  bool need_geo; store_lock(); need_geo = s_wx.needs_geocode; store_unlock();
+  if (need_geo) weather_geocode();
+
+  float lat, lon;
+  store_lock(); lat = s_wx.lat; lon = s_wx.lon; store_unlock();
+
+  char url[256];
+  weather_build_url(url, sizeof(url), lat, lon);
+  USBSerial.printf("[wx] fetching %.4f,%.4f\n", (double)lat, (double)lon);
+
+  bool ok = false;
+  String p;
+  if (wx_http_get(url, p)) {
+    {
+      // --- current block ---
+      int cur = p.indexOf("\"current\":");
+      if (cur < 0) cur = 0;
+      double t, feels, hum, wmo, wind, isday;
+      bool have_t = json_find_number(p, cur, "temperature_2m", t);
+      if (have_t) {
+        // Read the RTC ONCE, up front, under i2c_lock (shared bus; the UI reads touch
+        // on core 1). Done BEFORE store_lock so the two locks never nest. today_wd
+        // labels the forecast days; the epoch stamps "last fetched".
+        RTC_DateTime dt; int today_wd; uint32_t fetch_epoch;
+        i2c_lock();
+        dt = board_clock_now();
+        i2c_unlock();
+        today_wd = dt.getWeek();                     // 0=Sun..6=Sat
+        {
+          struct tm tmv = {0};
+          tmv.tm_year = dt.getYear() - 1900; tmv.tm_mon = dt.getMonth() - 1;
+          tmv.tm_mday = dt.getDay(); tmv.tm_hour = dt.getHour();
+          tmv.tm_min  = dt.getMinute(); tmv.tm_sec = dt.getSecond();
+          fetch_epoch = (uint32_t)mktime(&tmv);
+        }
+
+        store_lock();
+        s_wx.have_current = true;
+        s_wx.cur_temp_c  = wx_round_c(t);
+        s_wx.cur_feels_c = json_find_number(p, cur, "apparent_temperature", feels)
+                             ? wx_round_c(feels) : INT16_MIN;
+        s_wx.cur_humidity = json_find_number(p, cur, "relative_humidity_2m", hum)
+                             ? (uint8_t)(hum < 0 ? 0 : hum > 100 ? 100 : hum) : 0xFF;
+        s_wx.cur_wmo     = json_find_number(p, cur, "weather_code", wmo) ? (uint8_t)wmo : 3;
+        s_wx.cur_wind_kmh = json_find_number(p, cur, "wind_speed_10m", wind)
+                             ? (uint8_t)(wind < 0 ? 0 : wind > 254 ? 254 : wind + 0.5) : 0xFF;
+        s_wx.cur_is_day  = json_find_number(p, cur, "is_day", isday) ? (isday >= 0.5) : true;
+
+        // --- daily forecast arrays (parallel arrays, index-aligned) ---
+        double dmax[WEATHER_FC_DAYS], dmin[WEATHER_FC_DAYS], dcode[WEATHER_FC_DAYS];
+        int nmax  = json_find_num_array(p, "temperature_2m_max", dmax,  WEATHER_FC_DAYS);
+        int nmin  = json_find_num_array(p, "temperature_2m_min", dmin,  WEATHER_FC_DAYS);
+        int ncode = json_find_num_array(p, "weather_code",       dcode, WEATHER_FC_DAYS);
+        int days  = nmax; if (nmin < days) days = nmin; if (ncode < days) days = ncode;
+        if (days > WEATHER_FC_DAYS) days = WEATHER_FC_DAYS;
+        s_wx.fc_n = (uint8_t)days;
+        // Weekday for each forecast day: TODAY's RTC weekday + offset (read above).
+        for (int i = 0; i < days; i++) {
+          s_wx.fc[i].hi_c = wx_round_c(dmax[i]);
+          s_wx.fc[i].lo_c = wx_round_c(dmin[i]);
+          s_wx.fc[i].wmo  = (uint8_t)dcode[i];
+          s_wx.fc[i].wday = (today_wd >= 0) ? (uint8_t)((today_wd + i) % 7) : 0;
+        }
+        s_wx.last_fetch_epoch = fetch_epoch;
+        store_unlock();
+
+        weather_save_snapshot();   // persist so the face shows this at next boot
+        ok = true;
+      }
+    }
+  }
+  s_wifi_active = 0;
+  USBSerial.printf("[wx] fetch %s: %s\n", ok ? "ok" : "FAIL", s_wx.loc_name);
+  return ok;
+}
+
 /* The network task body (pinned to core 0). It sleeps until the loop raises
- * s_net_request, runs the (blocking) fetch, and publishes the result for the
- * loop to act on. It NEVER calls LVGL — the loop does the card display. */
+ * s_net_request (notifications) or s_weather_request (weather), runs the
+ * (blocking) fetch, and publishes the result for the loop to act on. It NEVER
+ * calls LVGL — the loop does the card display / face refresh. */
 static void net_task_fn(void *arg) {
   (void)arg;
   for (;;) {
+#if WIFI_SCAN_SUPPORTED
+    // The user just joined a network from the scan list (app_wifi_ble.h): promote
+    // it to an immediate fetch so the new credentials are tried within seconds
+    // instead of on the next scheduled sync.
+    if (s_wifi_join_kick) { s_wifi_join_kick = false; s_net_request = true; }
+#endif
     if (s_net_request) {
       s_net_request = false;
       s_net_busy = true;
@@ -413,7 +670,13 @@ static void net_task_fn(void *arg) {
       s_net_result_ready = true;
       s_net_busy = false;
     }
-    vTaskDelay(pdMS_TO_TICKS(50));    // poll the request flag ~20x/sec
+    if (s_weather_request) {
+      s_weather_request = false;
+      s_net_busy = true;
+      if (weather_fetch_raw()) s_weather_ready = true;   // loop repaints the face/app
+      s_net_busy = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));    // poll the request flags ~20x/sec
   }
 }
 
@@ -421,4 +684,11 @@ static void net_task_fn(void *arg) {
  * in flight. Called from the loop (core 1). */
 static void notif_request_fetch(void) {
   if (!s_net_busy) s_net_request = true;
+}
+
+/* Ask the network task to refresh weather (non-blocking). Called from the loop on
+ * a slow timer and immediately after a BLE location change. The task serializes it
+ * behind any in-flight notification fetch, so it's safe to raise anytime. */
+static void weather_request_fetch(void) {
+  s_weather_request = true;
 }

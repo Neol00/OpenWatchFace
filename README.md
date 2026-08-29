@@ -38,6 +38,7 @@ media — all in a single Arduino translation unit on top of LVGL.
 - [Screenshots](#screenshots)
 - [Installation](#installation) — **per-device guides** in [`docs/devices/`](docs/devices/README.md)
 - [Apps](#apps)
+  - [Gallery: supported formats](#gallery-supported-formats)
   - [Controls — the BOOT button](#controls--the-boot-button)
 - [Architecture overview](#architecture-overview)
 - [Deep sleep & the timed wake](#deep-sleep--the-timed-wake)
@@ -64,15 +65,21 @@ flashing, so you only follow the steps that apply to the hardware you own.
 |---|---|---|---|
 | Waveshare ESP32-S3-Touch-AMOLED-2.06 | ESP32-S3R8 | 410×502 CO5300 AMOLED | [Guide](docs/devices/s3-touch-amoled-2.06.md) |
 | Waveshare ESP32-S3-Touch-AMOLED-1.8 | ESP32-S3R8 | 368×448 SH8601 AMOLED | [Guide](docs/devices/s3-touch-amoled-1.8.md) |
+| Waveshare ESP32-S3-Touch-AMOLED-1.64 | ESP32-S3R8 | 280×456 SH8601 AMOLED | [Guide](docs/devices/s3-touch-amoled-1.64.md) |
 | Waveshare ESP32-C6-Touch-LCD-1.47 | ESP32-C6 | 172×320 JD9853 LCD | [Guide](docs/devices/c6-touch-lcd-1.47.md) |
 | Waveshare ESP32-S3-Touch-LCD-1.47 | ESP32-S3 | 172×320 JD9853 LCD | [Guide](docs/devices/s3-touch-lcd-1.47.md) |
+| Waveshare ESP32-S3-Touch-LCD-2 | ESP32-S3R8 | 240×320 ST7789T3 LCD | [Guide](docs/devices/s3-touch-lcd-2.md) |
+| Waveshare ESP32-S3-Touch-LCD-1.69 | ESP32-S3R8 | 240×280 ST7789V2 LCD | [Guide](docs/devices/s3-touch-lcd-1.69.md) |
 | Waveshare T5-E1-Touch-AMOLED-1.75 | Tuya T5-E1 | 466×466 CO5300 AMOLED | [Guide](docs/devices/tuya-t5-amoled-1.75.md) |
 | Sipeed MaixCam-Pro | SG2002 (Linux) | MaixCDK-owned panel | [Guide](docs/devices/maixcam-pro.md) |
+| Fossil Gen 6 (hoki) | Wear 4100 (SDA429W) | 416×416 AMOLED | [Guide](docs/devices/fossil-gen6.md) |
 | Fossil Gen 4 (firefish/ray) | Wear 2100 | 390×390 AMOLED | [Guide](docs/devices/fossil-gen4.md) |
 
 Most boards build in the **Arduino IDE** against the bundled libraries in
 `libraries/` (the exact versions the firmware was built against) plus the ESP32 core
-from the Boards Manager. The MaixCam and Fossil ports use their own toolchains.
+from the Boards Manager. The MaixCam and Fossil ports use their own toolchains —
+the Fossil Gen 6 is bare-metal ARM, built with `arm-none-eabi-gcc` and flashed
+with `fastboot`.
 
 > **Shared reference:** the out-of-tree library patches are documented once in
 > [`patches/README.md`](patches/README.md); every Arduino device page links to it.
@@ -95,7 +102,40 @@ back/menu key (clock → menu → app → back out). Current apps:
 | **Player** | 🎵 | Now-playing (iPhone via AMS, Android via Gadgetbridge): track/artist + transport controls |
 | **Find Phone** | 📞 | Ring the phone (Gadgetbridge on Android, or a companion app) |
 | **Files** | 💾 | Browse the SD card / flash FAT storage; view, move and delete files |
+| **Gallery** | 🖼️ | Browse photos and videos on the SD card / flash: thumbnail grid, swipe pager with zoom + pan, video player, delete. No camera required — [see the formats it reads](#gallery-supported-formats) |
 | **About** | 📋 | Live spec sheet: chip/flash/PSRAM, per-pool SRAM & PSRAM free, SD usage, and reported library versions |
+
+### Gallery: supported formats
+
+The Gallery reads files from `/DCIM` and the root of both stores. Decoding is done
+on-device with no external libraries: `media_codecs.h` handles still images,
+`media_video.h` handles containers. Everything is decoded **straight to RGB565 and
+downscaled during decode**, so a 12-megapixel import costs a screen-sized buffer
+rather than a 12-megapixel one.
+
+| | Format | Notes |
+|---|---|---|
+| **Photos** | **JPEG** (`.jpg`, `.jpeg`, `.jfif`) | Baseline. Progressive JPEGs are reported, not decoded — tjpgd cannot read them |
+| | **PNG** (`.png`) | 1/2/4/8/16-bit, greyscale / RGB / palette / alpha, including Adam7-interlaced. Alpha is composited over black. Inflate comes from the ESP32 ROM, so it costs no flash |
+| | **BMP** (`.bmp`, `.dib`) | 1/4/8-bit palette, 16-bit 555 and BITFIELDS, 24-bit, 32-bit, either row order. RLE-compressed BMPs are reported, not decoded |
+| | **GIF** (`.gif`) | Single-frame GIFs are treated as photos |
+| **Videos** | **MJPEG in AVI** (`.avi`) | Any muxer's AVI, not just this firmware's recordings: the RIFF tree is parsed, the video track is located among several streams, and audio / index / padding chunks are skipped. Playback is paced by the file's own frame rate |
+| | **MJPEG stream** (`.mjpg`, `.mjpeg`) | Bare SOI/EOI-delimited streams, as IP cameras and `ffmpeg -f mjpeg` produce. The format carries no timing, so 10 fps is assumed |
+| | **GIF** (`.gif`) | Multi-frame GIFs play in the video player, honouring per-frame delays, transparency and all three disposal methods |
+
+**What it deliberately does not do.** An ESP32-S3 has no video decoder and no headroom
+for a software H.264/HEVC/VP9 one, and WebP/HEIC/AVIF decoders do not fit the flash
+budget. Those files are still **listed**, as a placeholder tile naming the format
+(`MP4`, `WEBP`, …) — a file that silently vanishes looks like a broken card, whereas
+*"H.264 not supported"* tells you exactly what to convert. The same tile carries the
+decoder's own reason when a supported file fails to decode.
+
+To convert something the watch can read:
+
+```bash
+ffmpeg -i clip.mp4 -c:v mjpeg -q:v 5 -vf scale=320:-2 -r 15 -an VID_001.AVI
+magick photo.heic -resize 800x800 IMG_001.JPG
+```
 
 A pull-down **quick shade** (`quick_shade.h`) over the watch face gives one-drag access
 to brightness and mute for sudden lighting changes (e.g. stepping into sunlight),
@@ -496,6 +536,16 @@ project makes to it (the bundled `BLE` and `ESP_I2S` libraries, and `Esp.cpp`) a
 - Hardware: **Waveshare**; this firmware builds on Waveshare's references.
 - Apple **ANCS** (Apple Notification Center Service) and **AMS** (Apple Media Service)
   are Apple-defined BLE services used by the notification and player integrations.
+
+### Thanks
+
+- **[AsteroidOS](https://asteroidos.org/)** — the Fossil ports owe an enormous
+  amount to this project. Their device trees, kernels and documentation made
+  porting this firmware to Qualcomm-based Fossil watches *vastly* easier than
+  starting from nothing: their work is what turns an opaque, undocumented piece
+  of hardware into something you can actually reason about, and their `boot.img`
+  is also what makes a rooted shell — and therefore a stock backup — possible
+  before flashing. Thank you to the AsteroidOS developers.
 
 ### Author
 

@@ -11,28 +11,41 @@
 PLATFORM ?= qemu
 CROSS    ?= arm-none-eabi-
 
+# gen4 = Fossil Gen 4 SoC (guard PLAT_BOARD_FOSSIL_GEN4, shared by all drivers)
+# plus a size sub-variant: firefish=44mm (DTB-confirmed), ray=40mm (TODO).
+# Plain "gen4" == firefish. BUILD dir stays "gen4" for the packaging tooling.
+VARIANT_DEF :=
+BUILD_TAG   := $(PLATFORM)
 ifeq ($(PLATFORM),qemu)
   PLAT_DEF  := PLAT_BOARD_QEMU_VIRT
   LINK_BASE := 0x40008000
-else ifeq ($(PLATFORM),gen4)
-  PLAT_DEF  := PLAT_BOARD_FOSSIL_GEN4
-  LINK_BASE := 0x80008000
+else ifeq ($(filter $(PLATFORM),gen4 gen4-firefish),$(PLATFORM))
+  PLAT_DEF    := PLAT_BOARD_FOSSIL_GEN4
+  LINK_BASE   := 0x80008000
+  VARIANT_DEF := PLAT_FOSSIL_VARIANT_FIREFISH
+  BUILD_TAG   := gen4
+else ifeq ($(PLATFORM),gen4-ray)
+  PLAT_DEF    := PLAT_BOARD_FOSSIL_GEN4
+  LINK_BASE   := 0x80008000
+  VARIANT_DEF := PLAT_FOSSIL_VARIANT_RAY
+  BUILD_TAG   := gen4
 else
-  $(error unknown PLATFORM '$(PLATFORM)' (qemu|gen4))
+  $(error unknown PLATFORM '$(PLATFORM)' (qemu|gen4|gen4-firefish|gen4-ray))
 endif
 
-BUILD := build/$(PLATFORM)
+BUILD := build/$(BUILD_TAG)
 
 CFLAGS := -mcpu=cortex-a7 -marm -mfpu=neon-vfpv4 -mfloat-abi=hard \
           -ffreestanding -fno-builtin -nostdlib -O2 -g \
-          -Wall -Wextra -D$(PLAT_DEF) -Iplatform
+          -Wall -Wextra -D$(PLAT_DEF) $(if $(VARIANT_DEF),-D$(VARIANT_DEF),) -Iplatform
 ASFLAGS := $(CFLAGS)
 LDFLAGS := -nostdlib -Wl,--build-id=none -Wl,--defsym=LINK_BASE=$(LINK_BASE) \
            -T platform/linker.ld -Wl,-Map=$(BUILD)/owf.map
 
 SRC_C := main.c platform/console.c platform/ramlog.c platform/timer.c \
          platform/uart_pl011.c platform/uart_msm.c \
-         platform/msm_dsi.c platform/dsi_panel.c platform/msm_mdp3.c platform/msm_i2c.c platform/touch_raydium.c
+         platform/msm_dsi.c platform/dsi_panel.c platform/msm_mdp3.c platform/msm_i2c.c platform/touch_raydium.c \
+         platform/reboot_msm.c
 SRC_S := platform/startup.S
 OBJ   := $(patsubst %.c,$(BUILD)/%.o,$(SRC_C)) $(patsubst %.S,$(BUILD)/%.o,$(SRC_S))
 

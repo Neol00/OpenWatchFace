@@ -42,9 +42,9 @@
 typedef struct { uint16_t mhz; uint8_t cksel; uint8_t div; uint8_t cpu1_dbl; uint16_t mv; } owf_t5_dvfs_t;
 static const owf_t5_dvfs_t OWF_T5_DVFS[] = {
   /* mhz  cksel div cpu1   mv    -> rate / voltage */
-  { 240,   3,   1,   1,    800 },   /* 480/2 = 240 MHz @ 800 mV  */
-  { 320,   2,   0,   1,    875 },   /* 320/1 = 320 MHz @ 875 mV  */
-  { 480,   3,   0,   1,    950 },   /* 480/1 = 480 MHz @ 950 mV  */
+  { 240,   3,   1,   1,    775 },   /* 480/2 = 240 MHz @ 800 mV  */
+  { 320,   2,   0,   1,    825 },   /* 320/1 = 320 MHz @ 875 mV  */
+  { 480,   3,   0,   1,    875 },   /* 480/1 = 480 MHz @ 950 mV  */
 };
 static const int OWF_T5_DVFS_N = (int)(sizeof(OWF_T5_DVFS) / sizeof(OWF_T5_DVFS[0]));
 

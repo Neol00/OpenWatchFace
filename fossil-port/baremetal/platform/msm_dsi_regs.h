@@ -37,8 +37,18 @@
 #define DSI_RDBK_DATA0              0x006c
 #define DSI_TRIG_CTRL               0x0084
 #define DSI_EXT_MUX                 0x0088
-#define DSI_CMD_MODE_DMA_SW_TRIGGER 0x008c
-#define DSI_CMD_MODE_MDP_SW_TRIGGER 0x0090
+/* THESE TWO WERE SWAPPED (fixed 2026-08-28) and it cost the whole first
+ * brightness attempt: every DCS write kicked 0x08c, no DMA ever started, and
+ * the completion check of the day reported success anyway.
+ *
+ * Ground truth is mdss_dsi_host.c's command-DMA path, which writes the buffer
+ * address to 0x048, the length to 0x04c, and then triggers at 0x090:
+ *     MIPI_OUTP((ctrl->ctrl_base) + 0x048, ctrl->dma_addr);
+ *     MIPI_OUTP((ctrl->ctrl_base) + 0x04c, len);
+ *     MIPI_OUTP((ctrl->ctrl_base) + 0x090, 0x01);
+ * (mdss_dsi_cmd_dma_tx, and again in mdss_dsi_cmd_mdp_busy's sibling path.) */
+#define DSI_CMD_MODE_MDP_SW_TRIGGER 0x008c
+#define DSI_CMD_MODE_DMA_SW_TRIGGER 0x0090
 #define DSI_RESET_SW_TRIGGER        0x0094
 #define DSI_MISR_CMD_CTRL           0x009c
 #define DSI_LANE_CTRL               0x00ac
@@ -122,6 +132,7 @@
 #define DCS_EXIT_SLEEP_MODE         0x11
 #define DCS_SET_DISPLAY_OFF         0x28
 #define DCS_SET_DISPLAY_ON          0x29
+#define DCS_WRITE_DISPLAY_BRIGHTNESS 0x51  /* bl_ctrl_dcs; 1 byte, max 0xff */
 #define DCS_SET_COLUMN_ADDRESS      0x2a
 #define DCS_SET_PAGE_ADDRESS        0x2b
 #define DCS_WRITE_MEMORY_START      0x2c

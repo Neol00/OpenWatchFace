@@ -559,7 +559,7 @@ static void app_open_sleep_trends(void) {
   // FONT_TIME is the custom clock font (digits + colon only) so a '%' fed to it renders as a
   // missing-glyph box, and at 110px it's oversized for this number anyway.
   lv_obj_t *avg = lv_label_create(app_scr);
-  lv_obj_set_style_text_font(avg, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(avg, &UI_FONT(48), 0);
   lv_obj_align_to(avg, seg, LV_ALIGN_OUT_BOTTOM_MID, 0, UI_PX(14));
   lv_obj_t *avgcap = lv_label_create(app_scr);
   lv_obj_set_style_text_font(avgcap, &FONT_SMALL, 0);

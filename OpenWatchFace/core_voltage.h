@@ -68,7 +68,7 @@
 #endif
 
 /* === the only things most people need to touch ============================ */
-#define UNDERVOLT_CORE_ENABLE 0     // 0 = leave IDF stock voltages; 1 = apply CORE_UV_MV[]
+#define UNDERVOLT_CORE_ENABLE 1     // 0 = leave IDF stock voltages; 1 = apply CORE_UV_MV[]
 #define CORE_UV_FLOOR_MV      900   // hard floor; values below this are clamped up
 
 typedef struct { uint16_t mhz; uint16_t mv; } core_uv_entry_t;
@@ -91,9 +91,9 @@ static const core_uv_entry_t CORE_UV_MV[] = {
  *   Aggressive (validate!):   240->1100  160->1050   80->1000
  * S3-2.06 (ESP32-S3): stock 1.15 V; IDF leaves 80/160 over-volted -> big headroom. */
 static const core_uv_entry_t CORE_UV_MV[] = {
-  { 240, 1150 },   // stock
-  { 160, 1150 },   // over-volted by default -> good headroom
-  {  80, 1150 },   // most over-volted -> lots of room to drop
+  { 240, 1100 },   // stock
+  { 160, 1100 },   // over-volted by default -> good headroom
+  {  80, 1100 },   // most over-volted -> lots of room to drop
 };
 #endif
 static const uint8_t CORE_UV_COUNT = sizeof(CORE_UV_MV) / sizeof(CORE_UV_MV[0]);

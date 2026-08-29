@@ -89,11 +89,16 @@ static inline void screen_cache_invalidate_all(void) {
  * render. Pushes the whole screen via the same call the flush path uses. */
 static inline bool screen_cache_blit(uint8_t slot) {
   if (!screen_cache_valid(slot)) return false;
-#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA
+#if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL && !BOARD_DISPLAY_DEFERRED_REFRESH
   gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)s_sc[slot].buf, screenWidth, screenHeight);
   return true;
 #else
-  return false;   // screen cache disabled when an external framework owns flush (Maix/Tuya)
+  /* Disabled when an external framework owns flush (Maix/Tuya), and on a
+   * DEFERRED-REFRESH panel (e-paper) for a different reason: there is no `gfx`
+   * to blit through, and the point of this path — making a screen APPEAR
+   * instantly — cannot be delivered by a panel that needs 0.5-3 s to show
+   * anything. Callers fall back to a normal render, which is no slower here. */
+  return false;
 #endif
 }
 

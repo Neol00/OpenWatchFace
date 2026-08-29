@@ -41,7 +41,7 @@
  * Set these to YOUR cell. Mine is 400 mAh at 3.7V nominal. Health is expressed
  * as a % of design, so changing BATT_DESIGN_MAH re-scales the % automatically
  * and does not corrupt stored learning. */
-#define BATT_DESIGN_MAH   1000      // design capacity of your pack (mAh)
+#define BATT_DESIGN_MAH   400      // design capacity of your pack (mAh)
 #define BATT_NOMINAL_MV   3700     // nominal pack voltage (mV)
 
 /* PURE deep-sleep floor guess (mA), used before a real floor is learned. Feeds

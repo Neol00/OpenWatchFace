@@ -31,6 +31,14 @@
  *  stays in sleep_power.h.
  * ========================================================================== */
 #pragma once
+
+#ifndef SLEEP_LOG   /* sleep_power.h may not have been included yet */
+#  if defined(OWF_SLEEP_VERBOSE)
+#    define SLEEP_LOG(...) USBSerial.printf(__VA_ARGS__)
+#  else
+#    define SLEEP_LOG(...) do {} while (0)
+#  endif
+#endif
 #if BOARD_PLATFORM_TUYA
 #include "tuya/compat/esp_sleep.h"     // maps deep sleep onto tkl_cpu_sleep_mode_set + tkl_wakeup
 #include "tuya/compat/driver/gpio.h"   // gpio_hold_* no-ops (T5 retains pads / wake via tkl_wakeup)
@@ -43,6 +51,38 @@
 #if BOARD_WAKE_USE_EXT0
 #include <driver/rtc_io.h>
 #endif
+#endif
+
+/* ---- Soft power latch (BOARD_PWR_LATCH_GPIO) -------------------------------
+ * Boards whose battery rail flows through a P-FET that only the PWR key (held)
+ * or this GPIO keeps enabled (S3-Touch-LCD-1.69: SYS_EN). Three duties:
+ *   - board_power_latch_on(): assert the keep-alive. Called FIRST THING in
+ *     setup() — before it, battery power lasts only as long as the key is held
+ *     (on USB, VBUS hides the issue). Also releases a surviving sleep hold, so
+ *     a deep-sleep wake (not a reset — holds persist) can re-own the pin.
+ *   - board_isolate_peripherals_for_sleep() below HOLDS the latch HIGH through
+ *     deep sleep — without the hold the pad floats when the CPU sleeps and the
+ *     supply collapses mid-sleep.
+ *   - board_power_latch_off(): TRUE power-off — drop the latch and hold it LOW.
+ *     On battery the supply collapses (never returns); on USB, VBUS feeds the
+ *     LDO around the latch, so the caller falls through to its deep-sleep path.
+ *     The dropped flag stops the isolation block from re-asserting the latch on
+ *     that fall-through (board_enter_sleep runs right after). */
+#ifdef BOARD_PWR_LATCH_GPIO
+static bool s_pwr_latch_dropped = false;   // set by board_power_latch_off()
+static inline void board_power_latch_on(void) {
+  gpio_hold_dis((gpio_num_t)BOARD_PWR_LATCH_GPIO);
+  pinMode(BOARD_PWR_LATCH_GPIO, OUTPUT);
+  digitalWrite(BOARD_PWR_LATCH_GPIO, HIGH);
+  s_pwr_latch_dropped = false;
+}
+static inline void board_power_latch_off(void) {
+  gpio_hold_dis((gpio_num_t)BOARD_PWR_LATCH_GPIO);
+  pinMode(BOARD_PWR_LATCH_GPIO, OUTPUT);
+  digitalWrite(BOARD_PWR_LATCH_GPIO, LOW);
+  gpio_hold_en((gpio_num_t)BOARD_PWR_LATCH_GPIO);   // keep LOW if USB carries us into deep sleep
+  s_pwr_latch_dropped = true;
+}
 #endif
 
 /* Pre-sleep peripheral isolation. Two per-board blocks:
@@ -66,6 +106,13 @@
  * is revived only by the hardware RST button (a cold boot that re-inits the
  * panel), holding the controllers in reset while asleep is correct. */
 static inline void board_isolate_peripherals_for_sleep(void) {
+#if BOARD_DISPLAY_EPD_GDEQ031T10
+  /* T-Deck Pro: latch every peripheral enable LOW through deep sleep. Digital
+   * (non-RTC) pads float once the CPU sleeps; a floating modem-boost EN drifts
+   * high and powers the A7682E mid-sleep — red STATUS LED on, battery drain on
+   * a "sleeping" watch. board_tdeck_rails_off() at boot releases these holds. */
+  board_tdeck_rails_hold_for_sleep();
+#endif
 #if BOARD_TOUCH_FT3168 && BOARD_HAS_PMU_AXP2101
   /* S3-2.06: the FT3168 lives on ALDO1 — the ONE rail that can never be cut in
    * sleep (it also feeds the RTC + I2C pull-ups) — so unlike every other
@@ -167,6 +214,40 @@ static inline void board_isolate_peripherals_for_sleep(void) {
   gpio_deep_sleep_hold_en();   // older SoCs: one global switch arms all holds
 #endif
 #endif
+
+#ifdef BOARD_PWR_LATCH_GPIO
+  /* Keep the battery keep-alive (SYS_EN) asserted through deep sleep — a
+   * released pad floats and the latch NPN turns off, collapsing the supply
+   * mid-sleep on battery. Skipped when a power-off just dropped the latch on
+   * purpose (its own LOW hold is already in place). Non-RTC pad, so it rides
+   * the global deep-sleep hold switch. */
+  if (!s_pwr_latch_dropped) {
+    gpio_hold_dis((gpio_num_t)BOARD_PWR_LATCH_GPIO);
+    pinMode(BOARD_PWR_LATCH_GPIO, OUTPUT);
+    digitalWrite(BOARD_PWR_LATCH_GPIO, HIGH);
+    gpio_hold_en((gpio_num_t)BOARD_PWR_LATCH_GPIO);
+  }
+#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
+  gpio_deep_sleep_hold_en();
+#endif
+#endif
+
+#if BOARD_HAS_CAMERA && defined(CAM_PIN_PWDN) && (CAM_PIN_PWDN >= 0)
+  /* Camera boards (S3-Touch-LCD-2): the OV5640 module hangs off the always-on
+   * 3V3 rail — there is no PMU and no load switch, so the ONLY off-switch it
+   * has is its PWDN pin (active HIGH = hardware power-down, ~µA). The esp_camera
+   * driver only manages that pin while it is initialised; outside the Camera
+   * app the GPIO floats, and a floating PWDN leaves the sensor's regulators
+   * energised — measured as the S3-LCD-2's fast sleep/off drain. Drive it HIGH
+   * and LATCH it through deep sleep, every sleep, camera used this boot or not. */
+  gpio_hold_dis((gpio_num_t)CAM_PIN_PWDN);
+  pinMode(CAM_PIN_PWDN, OUTPUT);
+  digitalWrite(CAM_PIN_PWDN, HIGH);
+  gpio_hold_en((gpio_num_t)CAM_PIN_PWDN);
+#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
+  gpio_deep_sleep_hold_en();
+#endif
+#endif
 }
 
 /* Boot counterpart: release the holds placed above so the panel/touch init can
@@ -204,6 +285,16 @@ static inline void board_release_sleep_isolation(void) {
   gpio_hold_dis((gpio_num_t)TP_RESET);
 #endif
 #endif
+#if BOARD_HAS_CAMERA && defined(CAM_PIN_PWDN) && (CAM_PIN_PWDN >= 0)
+  /* Release the sleep hold but KEEP DRIVING PWDN HIGH: the sensor stays in
+   * hardware power-down the whole time the watch runs — this is also what
+   * parks it on a plain cold boot, where nothing else touches the pin. The
+   * Camera app's esp_camera_init() takes the pin over (and powers the sensor
+   * up) when — and only when — the app actually opens. */
+  gpio_hold_dis((gpio_num_t)CAM_PIN_PWDN);
+  pinMode(CAM_PIN_PWDN, OUTPUT);
+  digitalWrite(CAM_PIN_PWDN, HIGH);
+#endif
 }
 
 /* Boot: release the pull-hold placed on BOOT_BTN_GPIO before sleeping (EXT0
@@ -220,6 +311,18 @@ static void board_wake_release_button(void) {
  * it relies on the hardware RST button (a reset = cold boot from deep sleep). */
 static void board_wake_arm_button(void) {
 #if BOARD_WAKE_USE_EXT0
+  /* WAIT FOR THE BUTTON TO BE RELEASED before arming. The double-tap-to-sleep
+   * gesture triggers on the PRESS edge of the second tap, so on a fast sleep
+   * path (T-Deck Pro: no PMU rails, no radios to tear down) we reach
+   * esp_deep_sleep_start() with BOOT still held LOW — and EXT0 is a LEVEL wake,
+   * so the sleep "completes" and wakes in the same instant, which the user sees
+   * as sleep = instant full reboot. Bounded so a stuck/shorted pin can't hang
+   * the sleep path forever; the trailing delay outlasts release bounce. */
+  {
+    uint32_t t0 = millis();
+    while (digitalRead(BOOT_BTN_GPIO) == LOW && (uint32_t)(millis() - t0) < 3000) delay(10);
+    delay(50);
+  }
   rtc_gpio_init((gpio_num_t)BOOT_BTN_GPIO);
   rtc_gpio_set_direction((gpio_num_t)BOOT_BTN_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
   rtc_gpio_pullup_en((gpio_num_t)BOOT_BTN_GPIO);              // idle HIGH
@@ -235,7 +338,7 @@ static void board_wake_arm_button(void) {
   gpio_pulldown_dis((gpio_num_t)BOARD_WAKE_GPIO);
   esp_err_t e = esp_deep_sleep_enable_gpio_wakeup(1ULL << BOARD_WAKE_GPIO,
                                                   ESP_GPIO_WAKEUP_GPIO_LOW);
-  USBSerial.printf("[wake] C6 GPIO%d deep-sleep wake arm -> %s\n", BOARD_WAKE_GPIO,
+  SLEEP_LOG("[wake] C6 GPIO%d deep-sleep wake arm -> %s\n", BOARD_WAKE_GPIO,
                    e == ESP_OK ? "OK" : esp_err_to_name(e));
 #endif
   // (No-op on a C6 without BOARD_WAKE_GPIO: relies on the hardware RST button.)
@@ -246,7 +349,12 @@ static void board_wake_arm_button(void) {
  * cause), so there is no "button wake" cause to report — return false and let the
  * normal cold-boot path run (which is what an RST press is). */
 static bool board_woke_from_button(void) {
-#if BOARD_WAKE_USE_EXT0
+#if BOARD_PLATFORM_TUYA
+  // T5: the deep-sleep wake is a plain reboot (no hardware wake cause survives it); the
+  // entry leaves a kv marker instead, read by owf_tuya_deep_sleep_boot_check() in setup().
+  // Only a PWR press can wake that sleep, so marker == button wake.
+  return owf_tuya_woke_from_deep_sleep();
+#elif BOARD_WAKE_USE_EXT0
   return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
 #elif defined(BOARD_WAKE_GPIO)
   return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;   // C6 GPIO7 hardware-mod wake

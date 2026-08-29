@@ -39,7 +39,20 @@
  * ========================================================================== */
 #pragma once
 
-#define BOARD_NAME "ESP32-S3 Super Mini (GC9A01 round)"
+#define BOARD_NAME   "ESP32-S3 Super Mini"
+#define BOARD_VENDOR "Generic"
+
+/* ---- Over-the-air update identity ----------------------------------------
+ * The key this board looks for in ota/latest.json, and the name its firmware
+ * is published under in a GitHub release:
+ *
+ *     owf-s3-supermini-<version>.bin
+ *
+ * It lives HERE, next to the rest of the board's identity, rather than in a
+ * per-board ladder inside the updater — adding a board should mean editing one
+ * file. It must match the key in the manifest exactly; a mismatch is reported
+ * by the update check as "No build for s3-supermini", which names the fix. */
+#define BOARD_OTA_KEY "s3-supermini"
 
 /* ---- Feature flags -------------------------------------------------------- */
 #define BOARD_DISPLAY_CO5300_QSPI 0

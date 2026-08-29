@@ -29,13 +29,49 @@ touch controller, GPIOs, clocks and regulators of this watch. "Port the drivers,
 lose the kernel."
 
 **Fleet note:** the Gen 4 is the first of several Fossil targets on hand (a
-Gen 6 — AsteroidOS "hoki", Snapdragon Wear 4100+, 64-bit Cortex-A53 — and
-Fossil Q models). The layout anticipates them: `baremetal/platform/` is the
+Gen 6 — AsteroidOS "hoki", Snapdragon Wear 4100+, SDA429W — and Fossil Q
+models). The layout anticipates them: `baremetal/platform/` is the
 shared runtime + driver API, `baremetal/boards/<device>.h` holds per-device
 addresses, and each watch gets its own `board_fossil_<device>.h` +
-`BOARD_ID_FOSSIL_<DEVICE>` in the firmware's board layer. The Gen 6 will need
-an AArch64 startup variant; many MSM driver ports (BLSP I2C, SDHCI, SPMI,
-UARTDM) should carry across with new base addresses.
+`BOARD_ID_FOSSIL_<DEVICE>` in the firmware's board layer. Many MSM driver ports
+(BLSP I2C, SDHCI, SPMI, UARTDM) should carry across with new base addresses.
+
+> ## STATUS 2026-08-28: the Gen 4 boots the real firmware
+>
+> `sh build-owf-image-gen4.sh` + `tools/mk-bootimg.sh` + `fastboot boot`
+> produces a Gen 4 running OpenWatchFace with its UI on the glass. Two things
+> made the difference, both of them lessons the Gen 6 had already paid for:
+> **do not touch the UART** (`PLAT_UART_DISABLED`) and **do not initialise
+> DSI** — inherit aboot's MDP3 DMA_P splash engine and reprogram only that one
+> block (`platform/fb_mdp3.c`). Build instructions, flags, the watchdog
+> staircase and the per-subsystem status table live in
+> [`BUILD-GEN4.md`](BUILD-GEN4.md).
+>
+> Still stubbed here: storage/NVS, the USB log console, brightness, the crown,
+> power management, BLE. Touch is ported and clock-fenced but unconfirmed.
+
+> ## The Gen 6 (hoki) was the primary bring-up target
+>
+> **Build it with `./build.sh gen6`; test with `tools/mk-bootimg-gen6.sh` +
+> `fastboot flash boot`** — `fastboot boot` does NOT work on this device (see
+> BUILD-GEN6.md "Booting, flashing and recovery"). The Gen 6 exposes a full
+> 4-pin USB connection on its
+> charger pads, so it needs **no soldering** — unlike the Gen 4, whose hand-wired
+> rig has already torn off once and can short the board, making its results both
+> painful to get and hard to trust. New work should target the Gen 6.
+> Details: [`HARDWARE-GEN6.md`](HARDWARE-GEN6.md).
+>
+> Its display path deliberately does **not** port DSI: aboot leaves the panel lit
+> and scanning the continuous-splash buffer, so `platform/fb_splash.c` renders
+> straight into it and programs no display hardware at all. That avoids
+> repeating the Gen 4's core mistake — a large, entirely unobservable
+> DSI+MDP+panel stack whose every failure looks like "the code never ran".
+
+> **Gen 6 correction (2026-08-01): it does NOT need an AArch64 startup variant.**
+> Its quad A53 boots a **32-bit ARM kernel** — the vendor device tree lives in
+> `arch/arm/boot/dts/`, and AsteroidOS tunes it `armv7vehf-neon`, identical to
+> the Gen 4. The ARMv7 startup/MMU/GIC/FreeRTOS-CA9 runtime carries over as-is.
+> Verified facts + a checked-in decompiled DTB: [`HARDWARE-GEN6.md`](HARDWARE-GEN6.md).
 
 Why FreeRTOS and not a scratch scheduler: the firmware already talks FreeRTOS
 (tasks, semaphores, queues) on the ESP32 targets, and FreeRTOS ships a Cortex-A
@@ -49,8 +85,10 @@ model works unchanged — no pthread shim like the Maix Linux port needed.
   Build/acquire this first — it is the only dev link.
 - **Unlock:** `fastboot oem unlock` (wipes Wear OS; that's fine).
 - **Never flash `aboot`/`sbl1`/`tz`/`rpm`.** Only the `boot` partition is ours.
-  During development, don't even flash: `fastboot boot owf.img` runs a build once
-  from RAM — a failed image is cured by rebooting. That is the iteration loop.
+  **There is no RAM-boot on the Gen 6** — `fastboot boot` transfers a partial
+  image and never runs it, so every test cycle is a real `fastboot flash boot`.
+  That is safe: holding crown + lower button ~10-15 s forces fastboot, and
+  holding power powers the watch off, regardless of what the image does.
 - **Recovery ladder:** reboot → fastboot (hold buttons) → EDL (9008) via QFIL as
   the last-resort unbrick. Dump every partition before first flash.
 - **Debug output:** no UART is exposed. Plan A is the display itself (aboot leaves
@@ -66,7 +104,11 @@ model works unchanged — no pthread shim like the Maix Linux port needed.
 ## Roadmap
 
 - [~] **Phase 0 — access:** DIY pogo-USB cable; unlock; full partition backup;
-      confirm `fastboot boot` of a stock boot.img works. *(done without device:
+      confirm `fastboot boot` of a stock boot.img works. **(Gen 4 only —
+      `fastboot boot` DOES work there. It does NOT on the Gen 6; see
+      BUILD-GEN6.md. The two devices differ here, possibly because the Gen 4
+      needs a soldered USB tap while the Gen 6 exposes all 4 USB pins on its
+      charger pads.)** *(done without device:
       boot.img parameters recovered from AsteroidOS img_info → HARDWARE.md +
       tools/mk-bootimg.sh; remaining items need the watch.)*
 - [~] **Phase 1 — sign of life:** `baremetal/` runtime BUILT AND PROVEN in QEMU:
@@ -95,7 +137,12 @@ model works unchanged — no pthread shim like the Maix Linux port needed.
       *(Board target `BOARD_ID_FOSSIL_GEN4` + `board_fossil_gen4.h` registered
       in the firmware's board layer, all features stubbed. Still open: the
       Arduino compat layer port — next.)*
-- [~] **Phase 3 — display:** DSI half ported, UNTESTED (no device yet).
+- [x] **Phase 3 — display: DONE (2026-08-28).** NOT by the DSI route below —
+      by inheriting aboot's MDP3 DMA_P splash engine and reprogramming only
+      that block (`platform/fb_mdp3.c`). The DSI/PHY/panel work described
+      next is still in the tree, still unexecuted, and now only reachable
+      behind `-DGEN4_DSI_INIT` as a fallback for a dark handoff. Its historical
+      description follows:
       `platform/msm_dsi_regs.h` (controller + 28nm PHY register map),
       `platform/msm_dsi.c` (PHY regulator/config + host init + DMA command TX,
       ported from `msm_mdss_io_8974.c` / `mdss_dsi_host.c`), and

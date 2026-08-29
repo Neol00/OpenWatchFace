@@ -17,9 +17,12 @@
 
 #define DEVICE_NAME    "OpenWatchFace"        // full product name
 #define DEVICE_SHORT   "WatchFace"            // short form
-#define DEVICE_VERSION "1.3.2"                // firmware version
+#define DEVICE_VERSION "1.4.0"                // firmware version
 #define DEVICE_AUTHOR  "Noel Ejemyr"          // project author
-#define DEVICE_VENDOR  "Waveshare"            // hardware vendor
+#ifndef BOARD_VENDOR
+#define BOARD_VENDOR   "Unknown"              // boards should define this next to BOARD_NAME
+#endif
+#define DEVICE_VENDOR  BOARD_VENDOR           // hardware vendor — follows the selected board (board.h)
 #define DEVICE_BOARD   BOARD_NAME             // board model — follows the selected board (board.h)
 
 /* Phone-friendly radio name: "WatchFace-AB12" with a per-unit suffix, so multiple

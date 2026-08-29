@@ -21,8 +21,24 @@ uint32_t timer_ms(void)
     return (uint32_t)(timer_ticks() / (timer_freq_hz() / 1000u));
 }
 
+/* Free-running microseconds, wrapping at 2^32 (~71 min). Deltas are what the
+ * census counters use, and those are always far shorter than the wrap. */
+uint32_t timer_us32(void)
+{
+    uint32_t per_us = timer_freq_hz() / 1000000u;
+    return per_us ? (uint32_t)(timer_ticks() / per_us) : 0u;
+}
+
 void timer_delay_ms(uint32_t ms)
 {
     uint64_t end = timer_ticks() + (uint64_t)ms * (timer_freq_hz() / 1000u);
-    while (timer_ticks() < end) { __asm__ volatile("yield"); }
+    /* WFI, not a spin (the 100%-duty bug — see irq.c): once the 1 kHz tick is
+     * live an interrupt arrives within 1 ms, so sleeping here costs at most
+     * one tick of overshoot on a millisecond-granularity delay. Before the
+     * tick is armed (early boot, IRQs masked) WFI could sleep forever — spin
+     * with yield exactly as before. */
+    while (timer_ticks() < end) {
+        if (g_tick_armed) __asm__ volatile("wfi");
+        else              __asm__ volatile("yield");
+    }
 }

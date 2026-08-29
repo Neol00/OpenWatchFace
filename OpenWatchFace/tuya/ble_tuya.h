@@ -807,7 +807,7 @@ static void ble_ui_tick(void) {
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 16);
     lv_obj_t *k = lv_label_create(s_ble_key_box);
 #if BOARD_SCREEN_NARROW
-    lv_obj_set_style_text_font(k, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(k, &UI_FONT(28), 0);
 #else
     lv_obj_set_style_text_font(k, &FONT_LABEL, 0);
 #endif

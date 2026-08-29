@@ -22,7 +22,7 @@
  * msm8909-mdss.dtsi and qcom,mdss-dsi-panel-timings from the panel DTSI.
  */
 #include "platform.h"
-#if defined(PLAT_BOARD_FOSSIL_GEN4)
+#if defined(PLAT_SOC_MSM8909)
 
 #include "msm_dsi_regs.h"
 #include <string.h>
@@ -50,10 +50,13 @@ static const uint8_t phy_lanecfg[DSIPHY_NUM_LANES * DSIPHY_LANE_NREGS] = {
     0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x01, 0x97,
     0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xbb,
 };
-/* qcom,mdss-dsi-panel-timings from the panel DTSI (AUO 400p cmd template;
- * replace from the stock DTB once dumped — HARDWARE.md open question #1). */
+/* qcom,mdss-dsi-panel-timings — REAL values from the stock DTB (2026-07-28),
+ * node "AUO h139 AMOLED command mode dsi panel" (phandle 0x9b):
+ *   qcom,mdss-dsi-panel-timings = <0x4e0e0800 0x2e300e12 0x0a030400>;
+ * unpacked big-endian into the 12 PHY timing-control registers. This replaces
+ * the AUO-400p template and closes HARDWARE.md open question #1 (timing half). */
 static const uint8_t phy_timing[12] = {
-    0x5F, 0x12, 0x0A, 0x00, 0x32, 0x34, 0x10, 0x16, 0x0F, 0x03, 0x04, 0x00
+    0x4E, 0x0E, 0x08, 0x00, 0x2E, 0x30, 0x0E, 0x12, 0x0A, 0x03, 0x04, 0x00
 };
 
 /* qcom,regulator-ldo-mode is present in the DT for this controller. */
@@ -187,46 +190,105 @@ static void cache_clean(const void *addr, uint32_t len)
     dsi_wmb();
 }
 
+/* Returns 0 = sent, -1 = timed out busy, -2 = NEVER STARTED.
+ *
+ * The -2 case is why this function was rewritten (2026-08-28). It used to wait
+ * only for CMD_MODE_DMA_BUSY to CLEAR — and a transfer that never started has
+ * BUSY clear too, so the loop fell straight through and reported success.
+ * Every brightness write "succeeded" while nothing reached the panel, which is
+ * indistinguishable from a panel that ignores the command and sends you
+ * looking in entirely the wrong place.
+ *
+ * The DMA-done LATCH in DSI_INTL_CTRL is the positive evidence: the hardware
+ * sets it when a command DMA actually completes. Wait for that, not for the
+ * absence of busy. */
 static int dsi_wait_dma_done(uint32_t timeout_ms)
 {
     uint32_t t0 = timer_ms();
-    /* CMD_MODE_DMA_BUSY in DSI_STATUS clears when the transfer completes. */
-    while (DSI_R(DSI_STATUS) & DSI_STATUS_CMD_MODE_DMA_BUSY) {
-        if ((uint32_t)(timer_ms() - t0) > timeout_ms) return -1;
+    for (;;) {
+        uint32_t intl = DSI_R(DSI_INTL_CTRL);
+        if (intl & DSI_INTR_CMD_DMA_DONE) {
+            /* Ack the latch so the next transfer starts clean (W1C). */
+            DSI_W(DSI_INTL_CTRL, intl | DSI_INTR_CMD_DMA_DONE);
+            return 0;
+        }
+        if ((uint32_t)(timer_ms() - t0) > timeout_ms)
+            return (DSI_R(DSI_STATUS) & DSI_STATUS_CMD_MODE_DMA_BUSY) ? -1 : -2;
     }
-    /* Ack the DMA-done latch so the next transfer starts clean. */
-    DSI_W(DSI_INTL_CTRL, DSI_R(DSI_INTL_CTRL) | DSI_INTR_CMD_DMA_DONE);
-    return 0;
 }
 
-/* Build a MIPI DSI packet into s_cmd_buf and fire it via the DMA engine.
- * Short packets: 4 bytes (dtype, data0, data1, ecc-placeholder).
- * Long packets:  4-byte header + payload + 2-byte checksum placeholder.
- * The controller computes ECC/checksum itself, so those bytes are padding. */
+/* Build an MSM DSI HOST packet into s_cmd_buf and fire it via the DMA engine.
+ *
+ * THE PACKET FORMAT IS NOT A RAW MIPI PACKET (corrected 2026-08-28, after the
+ * brightness command reached the panel and was ignored). This controller takes
+ * a 32-bit HOST HEADER WORD whose layout is its own, from mdss_dsi_cmd.h:
+ *
+ *     BIT(31) LAST        BIT(30) LONG_PKT     BIT(29) BTA
+ *     bits 23:22 VC       bits 21:16 DTYPE
+ *     bits 15:8  DATA2    bits 7:0   DATA1
+ *
+ * The old code wrote the bytes { dtype, data0, data1, 0 } in that order, which
+ * on a little-endian core puts the DATA TYPE in the DATA1 field, the first
+ * parameter in DATA2, the second parameter where DTYPE belongs, and never sets
+ * LAST. The DMA engine transferred that word perfectly happily — which is why
+ * the transfer completed and the panel simply discarded the result.
+ *
+ * Short packets (mdss_dsi_generic_write / _dcs_swrite): header word only.
+ * Long packets  (mdss_dsi_generic_lwrite): header word with LONG_PKT set and
+ * the payload byte count in WC (bits 15:0), followed by the payload padded to
+ * a multiple of 4 with 0xFF. The controller appends ECC and checksum itself.
+ */
+#define DSI_HDR_LAST      (1u << 31)
+#define DSI_HDR_LONG_PKT  (1u << 30)
+#define DSI_HDR_BTA       (1u << 29)
+#define DSI_HDR_VC(vc)    (((uint32_t)(vc) & 0x03u) << 22)
+#define DSI_HDR_DTYPE(dt) (((uint32_t)(dt) & 0x3Fu) << 16)
+#define DSI_HDR_DATA2(d)  (((uint32_t)(d) & 0xFFu) << 8)
+#define DSI_HDR_DATA1(d)  ((uint32_t)(d) & 0xFFu)
+#define DSI_HDR_WC(wc)    ((uint32_t)(wc) & 0xFFFFu)
+
 static int dsi_cmd_tx(uint8_t dtype, const uint8_t *payload, uint32_t len)
 {
-    uint32_t n = 0;
+    uint32_t hdr, n;
 
-    if (len <= 2) {                       /* short packet */
-        s_cmd_buf[0] = dtype;
-        s_cmd_buf[1] = len > 0 ? payload[0] : 0;
-        s_cmd_buf[2] = len > 1 ? payload[1] : 0;
-        s_cmd_buf[3] = 0;                 /* ECC filled by HW */
+    if (len <= 2) {                       /* short packet: header word only */
+        hdr  = DSI_HDR_LAST | DSI_HDR_VC(0) | DSI_HDR_DTYPE(dtype);
+        hdr |= DSI_HDR_DATA1(len > 0 ? payload[0] : 0);
+        hdr |= DSI_HDR_DATA2(len > 1 ? payload[1] : 0);
         n = 4;
-    } else {                              /* long packet */
-        if (len + 6 > sizeof s_cmd_buf) return -1;
-        s_cmd_buf[0] = dtype;
-        s_cmd_buf[1] = (uint8_t)(len & 0xff);
-        s_cmd_buf[2] = (uint8_t)((len >> 8) & 0xff);
-        s_cmd_buf[3] = 0;                 /* ECC filled by HW */
+    } else {                              /* long packet: header + payload */
+        if (len + 4u + 4u > sizeof s_cmd_buf) return -1;
+        hdr  = DSI_HDR_LAST | DSI_HDR_LONG_PKT | DSI_HDR_VC(0);
+        hdr |= DSI_HDR_DTYPE(dtype) | DSI_HDR_WC(len);
         memcpy(&s_cmd_buf[4], payload, len);
-        n = 4 + len;
-        s_cmd_buf[n++] = 0;               /* checksum filled by HW */
-        s_cmd_buf[n++] = 0;
+        n = 4u + len;
+        /* pad to a multiple of 4 with 0xFF, exactly as the kernel does */
+        while (n & 3u) s_cmd_buf[n++] = 0xFF;
     }
-    while (n & 3) s_cmd_buf[n++] = 0;     /* word-align the length */
+
+    s_cmd_buf[0] = (uint8_t)(hdr & 0xFFu);
+    s_cmd_buf[1] = (uint8_t)((hdr >> 8) & 0xFFu);
+    s_cmd_buf[2] = (uint8_t)((hdr >> 16) & 0xFFu);
+    s_cmd_buf[3] = (uint8_t)((hdr >> 24) & 0xFFu);
 
     cache_clean(s_cmd_buf, n);
+
+    /* The SW trigger we are about to write only does anything if TRIG_CTRL's
+     * dma_trigger field selects it. dsi_host_init() sets that, but the normal
+     * Gen 4 display path never runs dsi_host_init — it inherits whatever aboot
+     * configured. Read-modify-write ONLY the 3-bit dma_trigger field so te_sel
+     * (bit 31) and mdp_trigger are untouched. */
+    {
+        uint32_t trig = DSI_R(DSI_TRIG_CTRL);
+        if ((trig & 0x7u) != 0x4u) {
+            DSI_W(DSI_TRIG_CTRL, (trig & ~0x7u) | 0x4u);
+            dsi_wmb();
+        }
+    }
+
+    /* Clear any stale DMA-done latch so the wait measures THIS transfer. */
+    DSI_W(DSI_INTL_CTRL, DSI_R(DSI_INTL_CTRL) | DSI_INTR_CMD_DMA_DONE);
+    dsi_wmb();
 
     DSI_W(DSI_DMA_CMD_OFFSET, (uint32_t)(uintptr_t)s_cmd_buf);
     DSI_W(DSI_DMA_CMD_LENGTH, n);
@@ -275,4 +337,4 @@ void dsi_init(void)
     con_puts("dsi: host up, ctrl="); con_puthex(DSI_R(DSI_CTRL)); con_puts("\n");
 }
 
-#endif /* PLAT_BOARD_FOSSIL_GEN4 */
+#endif /* PLAT_SOC_MSM8909 */

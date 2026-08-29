@@ -379,7 +379,11 @@ static lv_obj_t *fm_row(lv_obj_t *list, const char *symbol, uint32_t icon_rgb,
   }
 
   lv_obj_t *ic = lv_label_create(row);
-  lv_obj_set_style_text_font(ic, mdi ? &icons22 : &lv_font_montserrat_20, 0);
+  // One GROUP: some rows draw an MDI glyph, some a built-in symbol — both faces
+  // must be the same size or the list looks broken (icon-group snap, ui_fonts.h).
+  // Callers only pass mdi=true when the snapped cut IS the full-range icons22
+  // (see fm_mdi_ok) — the smaller cuts don't contain the mini-disk/SD glyphs.
+  lv_obj_set_style_text_font(ic, mdi ? &UI_ICON_MDI(22) : &UI_ICON_SYM(22), 0);
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(icon_rgb)), 0);
   lv_label_set_text(ic, symbol);
 #if BOARD_SCREEN_NARROW
@@ -394,7 +398,7 @@ static lv_obj_t *fm_row(lv_obj_t *list, const char *symbol, uint32_t icon_rgb,
   lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
   lv_label_set_text(nm, name);
-  lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+  ui_label_single_line(nm);
   // File rows (size != null) carry a MOVE + DELETE button on the right (each UI_PX(32)
   // at RIGHT_MID 0 and -40), so the name is narrower and the size sits LEFT of both
   // buttons (RIGHT_MID -UI_PX(84)) instead of under them. Rows without a size (the
@@ -455,7 +459,7 @@ static void fm_add_delete_x(lv_obj_t *row, int idx) {
   lv_obj_set_style_radius(x, UI_PX(12), 0);
   lv_obj_add_event_cb(x, fm_del_request_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
   lv_obj_t *xl = lv_label_create(x);
-  lv_obj_set_style_text_font(xl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(xl, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(xl, lv_color_hex(0xFF8888), 0);
   lv_label_set_text(xl, LV_SYMBOL_TRASH);
   lv_obj_center(xl);
@@ -480,7 +484,7 @@ static void fm_add_move_btn(lv_obj_t *row, int idx) {
   lv_obj_set_style_radius(m, UI_PX(12), 0);
   lv_obj_add_event_cb(m, fm_move_request_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
   lv_obj_t *ml = lv_label_create(m);
-  lv_obj_set_style_text_font(ml, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(ml, &UI_FONT(20), 0);
   lv_obj_set_style_text_color(ml, lv_color_hex(0x88C0FF), 0);
   lv_label_set_text(ml, LV_SYMBOL_UPLOAD);   // "move/export" affordance
   lv_obj_center(ml);
@@ -614,7 +618,7 @@ static void app_open_file_view(void) {
   lv_obj_set_style_text_font(name, &FONT_LABEL, 0);
   lv_obj_set_style_text_color(name, lv_color_hex(ui_accent_soft_hex()), 0);
   lv_obj_set_width(name, LV_PCT(100));
-  lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+  ui_label_single_line(name);
   lv_label_set_text(name, base);
 
   // A read-only TEXTAREA (not a plain label): it's built for large, scrollable
@@ -734,7 +738,7 @@ static int fm_add_move_banner(lv_obj_t *parent) {
   lv_obj_set_style_text_font(lbl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(lbl, lv_color_hex(0x88C0FF), 0);
   lv_obj_set_width(lbl, LV_PCT(100));
-  lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+  ui_label_single_line(lbl);
   lv_label_set_text_fmt(lbl, LV_SYMBOL_UPLOAD "  Moving: %s", s_fm_move_base);
   lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -847,25 +851,40 @@ static void app_open_files(void) {
   // ---- ROOT: the volume chooser (Flash when present; SD when mounted) ----
   if (s_fm_vol < 0) {
     char uf[5], us[5];   // MDI glyph buffers (mini-disk / mini-sd)
+    // The mini-disk / mini-SD MDI glyphs exist ONLY in the full-range icons22 cut.
+    // On boards where the icon group snaps below 22 (the 240-wide panels land on
+    // the icons14 cut, which carries just coffee+moon), draw the volume rows with
+    // BUILT-IN symbols instead — same snapped size as every other row icon, and
+    // never a lone oversized (or tofu) glyph. Uniform group > fancier glyph.
+    const bool mdi_ok = (&UI_ICON_MDI(22) == &icons22);
 #if BOARD_HAS_FFAT
     // Flash (FFat) volume — only on boards that actually have an on-flash FAT partition.
     // The T5 has none (BOARD_HAS_FFAT=0), so this row is hidden there (it would just fail
     // to mount). SD is the only browsable volume on that board.
-    fm_row(list, mdi_utf8(MDI_MINI_DISK, uf), 0xFF9F0A, "Flash (FFat)", nullptr,
-           fm_pick_vol_cb, (void *)(intptr_t)0, true);
+    fm_row(list, mdi_ok ? mdi_utf8(MDI_MINI_DISK, uf) : LV_SYMBOL_SAVE,
+           0xFF9F0A, "Flash (FFat)", nullptr,
+           fm_pick_vol_cb, (void *)(intptr_t)0, mdi_ok);
 #else
     (void)uf;
 #endif
+#if BOARD_HAS_SD_MMC || BOARD_HAS_SD_SPI || BOARD_HAS_SD_TUYA
     if (sd_mount())
-      fm_row(list, mdi_utf8(MDI_MINI_SD, us), 0x33A0FF, "SD Card", nullptr,
-             fm_pick_vol_cb, (void *)(intptr_t)1, true);
+      fm_row(list, mdi_ok ? mdi_utf8(MDI_MINI_SD, us) : LV_SYMBOL_SD_CARD,
+             0x33A0FF, "SD Card", nullptr,
+             fm_pick_vol_cb, (void *)(intptr_t)1, mdi_ok);
     else
       // Greyed "no card" row IS tappable: it opens the format prompt, so a card
       // Windows wrote in a layout the ESP32 can't mount can be reformatted on-
       // device (destructive, confirmed). If truly no card is inserted, the format
       // simply fails (no card responds) and we return to this list.
-      fm_row(list, mdi_utf8(MDI_MINI_SD, us), 0x555555, "SD Card (tap to format)",
-             nullptr, fm_sd_format_request_cb, nullptr, true);
+      fm_row(list, mdi_ok ? mdi_utf8(MDI_MINI_SD, us) : LV_SYMBOL_SD_CARD,
+             0x555555, "SD Card (tap to format)",
+             nullptr, fm_sd_format_request_cb, nullptr, mdi_ok);
+#else
+    // No SD slot on this board (sealed watches: fossil gen4/gen6) — no SD row
+    // at all, not even the greyed format prompt (2026-08-04).
+    (void)us;
+#endif
     return;
   }
 

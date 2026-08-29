@@ -31,7 +31,17 @@
 /* The MaixCam-Pro has the same AXP2101 PMU, reached via MaixCDK (board_* bridge),
  * so the PMU-only UI (battery graph/voltage/charging/gauge-avg draw) applies there
  * too — even though BOARD_HAS_PMU_AXP2101 (the XPowersLib path) is 0. */
-#define PM_HAS_PMU  (BOARD_HAS_PMU_AXP2101 || BOARD_PLATFORM_MAIX)
+/* Fossil Gen 6 (2026-08-07): the PM660 FG-GEN3 fuel gauge is validated and
+ * live (board_power.h) — a real coulomb-counting gauge, so the gauge-derived
+ * UI (battery graph, voltage, charging, REAL-avg draw) applies there too. */
+#define PM_HAS_PMU  (BOARD_HAS_PMU_AXP2101 || BOARD_PLATFORM_MAIX || BOARD_PLATFORM_FOSSIL)
+
+#if BOARD_PLATFORM_FOSSIL
+/* fossil-port pwr_diag.c — real SoC readings (linkage spec must be at file
+ * scope, so they live here rather than in the CORE & CLOCK block). */
+extern "C" int pwr_cpu_mhz(void);
+extern "C" int pwr_soc_temp_dc(void);
+#endif
 
 #define PM_CARD_BG     0x141414   // graph-card / row background
 #define PM_CARD_BORDER 0x262626   // graph-card / row border
@@ -46,6 +56,10 @@
 #define PM_TEXT_MS      5000      // text refresh period (ms)
 #define PM_GRAPH_EVERY  2         // push a graph point every Nth text tick
 #define PM_GRAPH_POINTS 30        // points per chart (~5 min at 10 s/point)
+
+#if BOARD_SOC_MSM8909
+extern "C" int cpu_volt_mv(void);   /* live VDD_APC in mV (cpu_volt_a7.c) */
+#endif
 
 static lv_obj_t *pm_freq_btns[8];   // up to 8 freq buttons (we use CPU_FREQ_COUNT)
 
@@ -270,6 +284,11 @@ static void pm_update_graphs(void) {
   // Draw is a MODEL (CPU/screen/WiFi), independent of the PMU — plot it on every
   // board, including the PMU-less C6.
   uint16_t ma = power_estimate_ma();
+#if BOARD_PLATFORM_FOSSIL
+  // Fossil: plot the FG's MEASURED current when discharging (see the labels
+  // block for why charging falls back to the model).
+  { int iba = fg_batt_ma(); if (iba != -32768 && iba > 0) ma = (uint16_t)iba; }
+#endif
   if (pm_g_draw.ser) {
     lv_chart_set_next_value(pm_g_draw.chart, pm_g_draw.ser, ma);
     lv_label_set_text_fmt(pm_g_draw.val, "%u", ma);
@@ -360,6 +379,20 @@ static void pm_update_labels(void) {
   // it (x1.00 until then) — "Draw: 64 mA (model x0.87)" means the raw constants
   // overestimate by ~15% and the shown value is already corrected.
   int m;
+#if BOARD_PLATFORM_FOSSIL
+  /* The PM660 FG has a REAL current ADC — show the measured draw instead of
+   * the model whenever the cell is discharging (ib > 0). While charging the
+   * battery current is the charger's, not the load's, so fall back to the
+   * model there (same reason the AXP boards always model). */
+  int fossil_ib = fg_batt_ma();
+  if (fossil_ib != -32768 && fossil_ib > 0) {
+    uint32_t fmw = (uint32_t)vbat * (uint32_t)fossil_ib / 1000u;
+    m = snprintf(pb, sizeof(pb),
+        "Draw:    %d mA  (measured)\n"
+        "Power:   %u.%02u W  (measured)",
+        fossil_ib, (unsigned)(fmw / 1000), (unsigned)((fmw % 1000) / 10));
+  } else
+#endif
   if (calib_get_k_samples() > 0) {
     float ks = calib_awake_scale();
     m = snprintf(pb, sizeof(pb),
@@ -439,6 +472,48 @@ static void pm_update_labels(void) {
                     cmv, owf_tuya_core_vsel());
     if (k > 0 && k < (int)sizeof(cb))
       snprintf(cb + k, sizeof(cb) - k, "\nTemp:    n/a  (no public sensor)");
+  }
+#elif BOARD_PLATFORM_FOSSIL
+  // Gen 6 (sdm429w): every value below is REAL, read from the SoC by the
+  // bare-metal runtime and validated against the on-cable PWR census:
+  //   Clock = live APCS RCG + HF PLL decode (pwr_cpu_mhz)
+  //   SoC   = hottest of the 11 TSENS die channels, QFPROM-calibrated
+  //   Batt  = the FG's battery thermistor (charge-path heat proxy)
+  // Core rail voltage is SPMI/CPR corner-managed and not validated for reads
+  // yet — shown as n/a rather than faked. Clock CONTROL is LIVE: the CPU
+  // SPEED buttons drive cpu_clk_set_mhz (park on GPLL0 -> reprogram HF PLL ->
+  // switch), all steps within the boot voltage corner (<= 1305.6 MHz).
+  {
+    int mhz = pwr_cpu_mhz();
+    int sdc = pwr_soc_temp_dc();
+    int bdc = fg_batt_temp_dc();
+    int k;
+    if (mhz > 0) k = snprintf(cb, sizeof(cb), "Clock:   %d MHz", mhz);
+    else         k = snprintf(cb, sizeof(cb), "Clock:   n/a");
+    if (k > 0 && k < (int)sizeof(cb)) {
+#if BOARD_SOC_MSM8909
+      /* Gen 4: the CPU rail IS readable — it is PM8916 SMPS2 behind the SPM
+       * regulator, and platform/cpu_volt_a7.c drives it down to the fused
+       * per-die voltage for whatever frequency is selected. Showing it makes
+       * the undervolt visible instead of a claim. */
+      int cmv = cpu_volt_mv();
+      if (cmv > 0) k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %d mV", cmv);
+      else         k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    n/a");
+#else
+      k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    n/a  (SPMI rail)");
+#endif
+    }
+    if (k > 0 && k < (int)sizeof(cb)) {
+      if (sdc > -9999 && bdc > -9999)
+        snprintf(cb + k, sizeof(cb) - k, "\nTemp:    SoC %d.%dC  Batt %d.%dC",
+                 sdc / 10, (sdc < 0 ? -sdc : sdc) % 10,
+                 bdc / 10, (bdc < 0 ? -bdc : bdc) % 10);
+      else if (sdc > -9999)
+        snprintf(cb + k, sizeof(cb) - k, "\nTemp:    SoC %d.%dC",
+                 sdc / 10, (sdc < 0 ? -sdc : sdc) % 10);
+      else
+        snprintf(cb + k, sizeof(cb) - k, "\nTemp:    n/a");
+    }
   }
 #elif BOARD_PLATFORM_MAIX
   // No MCU core-voltage/clock-tree/die-sensor here — show the real CPU temp + load.
@@ -672,8 +747,22 @@ static void pm_oc_btn_cb(lv_event_t *e) {
 }
 #endif
 
-/* ----- Power-off button + its confirm dialog ----- */
+/* ----- Power-off / Fastboot buttons + their shared confirm dialog ----- */
 static lv_obj_t *pm_off_box = nullptr;   // confirm overlay (one at a time)
+
+/* Which action the open dialog will perform. The two share one overlay
+ * because they are the same interaction — a heavy, easy-to-mis-tap action
+ * behind a tap-through — and differ only in wording and what the confirm
+ * button calls. */
+enum { PM_CONFIRM_POWER_OFF = 0, PM_CONFIRM_FASTBOOT = 1 };
+static int pm_confirm_kind = PM_CONFIRM_POWER_OFF;
+
+#if BOARD_PLATFORM_FOSSIL
+/* fossil-port/baremetal/platform/reboot_msm.c. Configures the PMIC for a warm
+ * reset, stores the bootloader restart reason in both the PMIC's SOFT_RB_SPARE
+ * and the IMEM cookie, then drops PS_HOLD. Does not return. */
+extern "C" void reboot_to_bootloader(void);
+#endif
 
 static void pm_off_dismiss_cb(lv_event_t *e) {
   (void)e;
@@ -682,6 +771,16 @@ static void pm_off_dismiss_cb(lv_event_t *e) {
 
 static void pm_off_confirm_cb(lv_event_t *e) {
   (void)e;
+#if BOARD_PLATFORM_FOSSIL
+  if (pm_confirm_kind == PM_CONFIRM_FASTBOOT) {
+    // THE PERMANENT WAY INTO FASTBOOT on these watches. Their buttons do not
+    // reach the bootloader, so without a route from inside the firmware a
+    // flashed build could never be replaced. This one is deliberately part of
+    // the shipping UI, not a build-flag diagnostic. Does not return.
+    reboot_to_bootloader();
+    return;
+  }
+#endif
   // Board-neutral full power-off: S3 (AXP2101) cuts the system rail entirely
   // (revived by PWR/USB); C6 enters deep sleep with NO timer wake (revived by RST).
   // Same path the low-battery cutoff uses. Does not return.
@@ -690,7 +789,7 @@ static void pm_off_confirm_cb(lv_event_t *e) {
 
 /* Modal confirm — full power-off is heavy and easy to mis-tap, so require a tap-through. */
 static void pm_off_btn_cb(lv_event_t *e) {
-  (void)e;
+  pm_confirm_kind = (int)(intptr_t)lv_event_get_user_data(e);
   if (pm_off_box) return;                 // already open
   pm_off_box = lv_obj_create(lv_layer_top());
   lv_obj_set_size(pm_off_box, LV_PCT(100), LV_PCT(100));
@@ -716,8 +815,17 @@ static void pm_off_btn_cb(lv_event_t *e) {
   lv_obj_set_width(q, LV_PCT(88));
   lv_obj_set_style_text_align(q, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_long_mode(q, LV_LABEL_LONG_WRAP);
-#if BOARD_HAS_PMU_AXP2101
+#if BOARD_PLATFORM_FOSSIL
+  if (pm_confirm_kind == PM_CONFIRM_FASTBOOT)
+    lv_label_set_text(q, "Reboot to fastboot?\nThe watch restarts into the bootloader and waits for USB.");
+  else
+    lv_label_set_text(q, "Power off?\nPress PWR to turn back on.");
+#elif BOARD_HAS_PMU_AXP2101
   lv_label_set_text(q, "Power off?\nPress PWR or plug in USB to turn back on.");
+#elif defined(BOARD_PWR_LATCH_GPIO)
+  // Soft-latch boards (S3-1.69): power-off drops the SYS_EN keep-alive, and the PWR
+  // key's hardware path (forcing the battery FET while held) is what re-powers it.
+  lv_label_set_text(q, "Power off?\nPress PWR to turn back on.");
 #else
   lv_label_set_text(q, "Power off?\nPress RST to turn back on.");
 #endif
@@ -734,13 +842,18 @@ static void pm_off_btn_cb(lv_event_t *e) {
   lv_obj_center(cl);
 
   lv_obj_t *off = lv_btn_create(card);
-  lv_obj_set_style_bg_color(off, lv_color_hex(0x802020), 0);
+  bool fb_kind = false;
+#if BOARD_PLATFORM_FOSSIL
+  fb_kind = (pm_confirm_kind == PM_CONFIRM_FASTBOOT);
+#endif
+  lv_obj_set_style_bg_color(off, lv_color_hex(fb_kind ? 0x1F4470 : 0x802020), 0);
   lv_obj_set_style_radius(off, UI_PX(12), 0);
   lv_obj_add_event_cb(off, pm_off_confirm_cb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t *ol = lv_label_create(off);
   lv_obj_set_style_text_font(ol, &FONT_SMALL, 0);   // "Power off" was too wide for the button in FONT_LABEL
-  lv_obj_set_style_text_color(ol, lv_color_hex(0xFFB0B0), 0);
-  lv_label_set_text(ol, LV_SYMBOL_POWER "  Power off");
+  lv_obj_set_style_text_color(ol, lv_color_hex(fb_kind ? 0xAECBFF : 0xFFB0B0), 0);
+  lv_label_set_text(ol, fb_kind ? LV_SYMBOL_REFRESH "  Fastboot"
+                                : LV_SYMBOL_POWER   "  Power off");
   lv_obj_center(ol);
 
 #if BOARD_SCREEN_NARROW
@@ -775,10 +888,11 @@ static void app_open_power(void) {
   // bottom, so the last item stayed clipped no matter how it scrolled.
   // Derive the height from the real screen instead (same 84 px top offset, same
   // 10 px bottom margin the 2.06 effectively had: 502-84-408 = 10).
-  lv_obj_set_width(col, 374);
-  lv_obj_set_height(col, (int)screenHeight - 84 - 10);
-  lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 84);
-  lv_obj_set_style_pad_all(col, 6, 0);
+  // Width/height/offsets live in ui_app_column_layout() (ui_scale.h): the four
+  // raw-pixel lines that used to sit here were authored on the 410x502 reference
+  // and are wider than the glass on a 360 px round face. Shared so Power, Weather
+  // and Appearance cannot drift apart again.
+  ui_app_column_layout(col, 374);
 #endif
   lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(col, 0, 0);
@@ -1015,6 +1129,11 @@ static void app_open_power(void) {
   // ---- CPU SPEED ----
   // The SG2002 doesn't expose CPU frequency scaling (no cpufreq governor), so the
   // speed buttons have nothing to drive — hidden on the Maix port.
+  //
+  // The Fossil Gen 4 DOES have this (corrected 2026-08-28 — an earlier note
+  // here claimed its clocks were RPM-owned and hid the row). Its A7 clock is a
+  // plain RCG mux the CPU writes; only the VOLTAGE is RPM-owned, which is why
+  // its ladder stops at 800 MHz. See platform/cpu_clk_a7.c.
 #if !BOARD_PLATFORM_MAIX
   pm_header(col, "CPU SPEED  (MHz)");
 
@@ -1033,12 +1152,28 @@ static void app_open_power(void) {
   // too, so it never hit a wrap boundary. FIX: give rowc an EXPLICIT pixel width (the
   // column's content width) so the wrap boundary is real, and content-height so it grows
   // down as rows are added.
-#if BOARD_PLATFORM_TUYA
+#if BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
+  // (Fossil Gen 6 shares this: 5 freq steps, and four-digit labels ("1306")
+  //  need the fixed 80px buttons — the wrap row fits them 4+1.)
   // col is 374 wide with pad_all 6 -> ~362 content. Hard-set rowc to 360 and use 80px
   // buttons: 4*80 + 3*8 gaps = 344 < 360 fit a row; any extra wrap to the next line. The
   // EXPLICIT pixel width (not LV_PCT on a content-height flex child) is what makes the
   // wrap boundary real — that was the bug. Works for any button count without clipping.
-  lv_obj_set_width(rowc, 360);
+  // WIDTH MUST BE REAL PIXELS AND MUST MATCH THE PARENT — this row is the one place
+  // where getting it wrong turns into a horizontal scroll instead of a wrap.
+  //
+  // It used to be UI_COL_W(360), which resolves to the literal 360 on any panel not
+  // caught by BOARD_SCREEN_SUBREF (width < 340). That was correct while the column
+  // itself was 374 px wide. It is NOT correct on a 360 px round face, where the
+  // column is now LV_PCT(86) = 310 px with UI_PX(6) padding, i.e. 300 px of content:
+  // a 360 px rowc inside a 300 px box overflows by 60 px, and because the wrap
+  // boundary sits at 360 the buttons never wrap — they just run off to the right and
+  // the card becomes side-scrollable. That is the reported symptom exactly.
+  //
+  // Derive it from the column instead of restating a literal, so the two cannot
+  // disagree again. At 300 px content with 80 px buttons and UI_PX(8) = 7 px gaps,
+  // three fit per row (3*80 + 2*7 = 254) and the ladder wraps onto a second line.
+  lv_obj_set_width(rowc, ui_app_column_content_w());
   lv_obj_set_height(rowc, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(rowc, LV_FLEX_FLOW_ROW_WRAP);
   const int pm_freq_btn_w = 80;
@@ -1108,12 +1243,50 @@ static void app_open_power(void) {
   lv_obj_set_size(offb, UI_PX(220), UI_PX(52));
   lv_obj_set_style_bg_color(offb, lv_color_hex(0x3A1414), 0);
   lv_obj_set_style_radius(offb, UI_PX(12), 0);
-  lv_obj_add_event_cb(offb, pm_off_btn_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(offb, pm_off_btn_cb, LV_EVENT_CLICKED,
+                      (void *)(intptr_t)PM_CONFIRM_POWER_OFF);
   lv_obj_t *offl = lv_label_create(offb);
   lv_obj_set_style_text_font(offl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(offl, lv_color_hex(0xFF8888), 0);
   lv_label_set_text(offl, LV_SYMBOL_POWER "  Power off");
   lv_obj_center(offl);
+
+#if BOARD_PLATFORM_FOSSIL
+  // ---- FASTBOOT ----  (Fossil watches only, and PERMANENT — not a flag.)
+  //
+  // Neither Fossil watch has a button route into the bootloader: the hardware
+  // buttons select things in menus but do not act as a fastboot shortcut, and
+  // there is no button force-reset. That makes this button the firmware's own
+  // guaranteed way back. Without it, a flashed build that boots and runs is a
+  // build that can never be replaced.
+  //
+  // It is deliberately NOT behind a build flag, unlike the boot-time recovery
+  // gate (fossil-port/baremetal/platform/recovery_gate.c, -DRECOVERY_GATE):
+  // that gate is a bring-up convenience, this is the escape hatch, and an
+  // escape hatch you can forget to compile in is not one.
+  lv_obj_t *fbrow = lv_obj_create(col);
+  lv_obj_set_width(fbrow, LV_PCT(100));
+  lv_obj_set_height(fbrow, UI_PX(60));
+  lv_obj_set_style_bg_opa(fbrow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(fbrow, 0, 0);
+  lv_obj_set_style_pad_all(fbrow, 0, 0);
+  lv_obj_clear_flag(fbrow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(fbrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(fbrow, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *fbb = lv_btn_create(fbrow);
+  lv_obj_set_size(fbb, UI_PX(220), UI_PX(52));
+  lv_obj_set_style_bg_color(fbb, lv_color_hex(0x14243A), 0);
+  lv_obj_set_style_radius(fbb, UI_PX(12), 0);
+  lv_obj_add_event_cb(fbb, pm_off_btn_cb, LV_EVENT_CLICKED,
+                      (void *)(intptr_t)PM_CONFIRM_FASTBOOT);
+  lv_obj_t *fbl = lv_label_create(fbb);
+  lv_obj_set_style_text_font(fbl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(fbl, lv_color_hex(0x88BBFF), 0);
+  lv_label_set_text(fbl, LV_SYMBOL_REFRESH "  Fastboot");
+  lv_obj_center(fbl);
+#endif
 
   // Text refreshes every PM_TEXT_MS; graphs update on the slower cadence inside
   // the callback. Auto-torn-down on screen delete.
