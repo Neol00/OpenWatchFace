@@ -225,7 +225,7 @@ static bool na_append(uint64_t id, const char *title, const char *body,
   if (!na_available()) return false;
 
   File f = na_fs().open(NA_PATH, FILE_APPEND);      // creates the file if missing
-  if (!f) return false;
+  if (!f) { USBSerial.println("[notif] archive append: open FAILED"); return false; }
   // Format: id,read,cat,title,body  (read=0 new; cat = NotifCat). Backward-compatible
   // with older id,read,title,body and legacy id,title,body lines — see na_parse_line.
   char hdr[40];
@@ -475,12 +475,53 @@ static void na_clear(void) {
 
 /* Seed s_na_total / s_na_unread from the archive on disk (call once at full boot
  * so the bell count is right before the app is ever opened). */
+static void na_backfill_from_cache(void);   // defined below (needs na_mark_read)
 static void na_seed_total(void) {
   if (na_available()) { uint32_t u = 0; s_na_total = na_count_records_ex(&u); s_na_unread = u; }
+  na_backfill_from_cache();
+}
+
+/* BACKFILL (2026-09-03, Fossil bug): the archive is the source of truth the
+ * app/bell read whenever it is AVAILABLE — and on the Fossil watches "available"
+ * flips lazily (ffat_mount() runs on first use, often from the WiFi path, well
+ * after an ANCS backlog has already been stored into the NVS cache only). The
+ * moment the mount succeeded the list switched to the empty archive and the
+ * user saw every notification vanish. So: the first time the archive is seen
+ * EMPTY while the cache holds items, copy the cache into it, oldest first (the
+ * cache is newest-first at index 0), read flags preserved. Once per boot; a
+ * deliberate clear-all wipes both stores together, so an empty archive next to
+ * a full cache can only be this timing hole. Call under store_lock(). */
+static bool s_na_backfilled = false;
+static void na_backfill_from_cache(void) {
+  if (s_na_backfilled || !na_available() || s_notif_count == 0) return;
+  s_na_backfilled = true;
+  uint32_t u = 0, total = na_count_records_ex(&u);
+  if (total != 0) { s_na_total = total; s_na_unread = u; return; }
+  uint16_t n = 0;
+  for (int i = (int)s_notif_count - 1; i >= 0; i--) {
+    if (!na_append(s_notifs[i].id, s_notifs[i].title, s_notifs[i].body, s_notifs[i].cat)) continue;
+    n++;
+    if (s_notifs[i].read) na_mark_read(s_notifs[i].id);
+  }
+  // Re-count FROM THE FILE: s_na_total was bumped per append, but if the writes did
+  // not stick (filesystem trouble) the view would load empty while the count said
+  // otherwise. The truth on disk decides; a mismatch is printed so it is visible.
+  u = 0; total = na_count_records_ex(&u);
+  USBSerial.printf("[notif] archive was empty: backfilled %u cached notification(s), file now holds %lu\n",
+                   (unsigned)n, (unsigned long)total);
+  s_na_total = total; s_na_unread = u;
+}
+
+/* Use the archive as the list/bell source ONLY when it actually holds records
+ * (or the cache is empty too). An archive that reads back empty while the NVS
+ * cache has items is a storage fault, not "no notifications" — and a watch must
+ * NEVER appear to delete notifications by itself. */
+static inline bool na_is_source(void) {
+  return na_available() && (s_na_total > 0 || s_notif_count == 0);
 }
 
 /* Unread notification count for the bell badge: the SD archive when a card is
  * present (the real history), else the flash store. */
 static uint32_t notif_unread(void) {
-  return na_available() ? s_na_unread : notif_store_unread_count();
+  return na_is_source() ? s_na_unread : notif_store_unread_count();
 }

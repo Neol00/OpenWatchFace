@@ -54,6 +54,8 @@ static void wb_cleanup_cb(lv_event_t *e);
  * pointer is cleared in wb_cleanup_cb when LVGL frees the screen. */
 static char s_ota_line[96] = "";
 static lv_obj_t *s_ota_lbl = nullptr;
+static lv_obj_t *s_ota_ibtn = nullptr;      /* "Install" — shown only when newer */
+static OtaManifest s_ota_m;                 /* the last successful check       */
 
 
 static void ble_sw_cb(lv_event_t *e) {
@@ -310,7 +312,7 @@ static void wifi_forget_prompt_cb(lv_event_t *e) {
  *     there is no way to enter a password on those devices.
  * Gated off the platforms whose WiFi shim has no scan API (Tuya's compat WiFi
  * class, Maix, Fossil). */
-#define WIFI_SCAN_SUPPORTED (!BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_FOSSIL)
+#define WIFI_SCAN_SUPPORTED (!BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_MAIX)   /* Fossil: scan backed by the WCNSS stack since 2026-09-03 */
 
 #if WIFI_SCAN_SUPPORTED
 /* Raised when the user just saved a network from the scan list. The net task
@@ -565,6 +567,7 @@ static void wb_cleanup_cb(lv_event_t *e) {
   /* LVGL frees the label with the screen; drop our copy of the pointer so a
    * later callback cannot write through it. The TEXT survives in s_ota_line. */
   s_ota_lbl = nullptr;
+  s_ota_ibtn = nullptr;
   if (s_wb_timer) { lv_timer_del(s_wb_timer); s_wb_timer = nullptr; }
 #if WIFI_SCAN_SUPPORTED
   // Stop polling the scan; if one is in flight it finishes inside the driver and
@@ -720,32 +723,76 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
 #endif
 }
 
-/* ---- Software update check -----------------------------------------------
- * The check ONLY (ota_check.h): fetch the manifest, compare versions, report.
- * Nothing is downloaded or installed. It lives here rather than behind its own
- * menu tile because until an installer exists, "check for updates" is really a
- * network diagnostic — and this is the network screen.
+/* ---- Software update ------------------------------------------------------
+ * Two steps, two buttons. "Check" (ota_check.h) fetches the manifest, compares
+ * versions and reports; it never downloads anything. When it finds a newer
+ * build the "Install" button appears and (ota_install.h) streams the image
+ * into the idle OTA slot, verifies size + SHA-256, and reboots into it. The
+ * running firmware is untouched until that verification passes.
  *
- * Blocking, on the UI task: the fetch takes a second or two and the button is
- * user-initiated, so the label is set to "Checking..." and the screen forced to
- * redraw before the call, rather than pretending it is async. */
+ * Both are blocking, on the UI task: they are user-initiated, the label is
+ * set and the screen forced to redraw before each blocking call, and the
+ * download repaints its progress from a callback. Nothing else moves. */
+static void ota_show_install(bool show) {
+  if (!s_ota_ibtn) return;
+  if (show) lv_obj_clear_flag(s_ota_ibtn, LV_OBJ_FLAG_HIDDEN);
+  else      lv_obj_add_flag(s_ota_ibtn, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void ota_check_cb(lv_event_t *e) {
   (void)e;
   if (s_ota_lbl) {
     lv_label_set_text(s_ota_lbl, "Checking...");
     lv_refr_now(nullptr);            /* paint it before we block */
   }
-  OtaManifest m;
-  ota_check(&m);
-  if (!m.ok) {
-    snprintf(s_ota_line, sizeof s_ota_line, "Check failed: %s", m.err);
-  } else if (m.newer) {
+  ota_show_install(false);
+  ota_check(&s_ota_m);
+  if (!s_ota_m.ok) {
+    snprintf(s_ota_line, sizeof s_ota_line, "Check failed: %s", s_ota_m.err);
+  } else if (s_ota_m.newer) {
     snprintf(s_ota_line, sizeof s_ota_line, "Update available: %s (%u KB)\n%s",
-             m.version, (unsigned)(m.size / 1024), m.notes);
+             s_ota_m.version, (unsigned)(s_ota_m.size / 1024), s_ota_m.notes);
+    ota_show_install(true);
   } else {
     snprintf(s_ota_line, sizeof s_ota_line, "Up to date (%s)", DEVICE_VERSION);
   }
   if (s_ota_lbl) lv_label_set_text(s_ota_lbl, s_ota_line);
+}
+
+static void ota_progress_ui(uint32_t done, uint32_t total, void *arg) {
+  (void)arg;
+  if (!s_ota_lbl) return;
+  snprintf(s_ota_line, sizeof s_ota_line, "Downloading %u%%  (%u / %u KB)",
+           (unsigned)((uint64_t)done * 100 / (total ? total : 1)),
+           (unsigned)(done / 1024), (unsigned)(total / 1024));
+  lv_label_set_text(s_ota_lbl, s_ota_line);
+  lv_refr_now(nullptr);
+}
+
+static void ota_install_cb(lv_event_t *e) {
+  (void)e;
+  if (!s_ota_m.ok || !s_ota_m.newer) return;
+  ota_show_install(false);               /* one press; no double install */
+  if (s_ota_lbl) {
+    lv_label_set_text(s_ota_lbl, "Connecting...");
+    lv_refr_now(nullptr);
+  }
+  char err[64];
+  bool ok = ota_install(&s_ota_m, err, sizeof err, ota_progress_ui, nullptr);
+  if (!ok) {
+    snprintf(s_ota_line, sizeof s_ota_line, "Install failed: %s", err);
+    if (s_ota_lbl) lv_label_set_text(s_ota_lbl, s_ota_line);
+    ota_show_install(true);              /* let the user retry */
+    return;
+  }
+  snprintf(s_ota_line, sizeof s_ota_line, "Installed %s. Rebooting...", s_ota_m.version);
+  if (s_ota_lbl) lv_label_set_text(s_ota_lbl, s_ota_line);
+  lv_refr_now(nullptr);
+  s_ota_line[0] = '\0';                  /* the next boot starts clean */
+  delay(1200);
+#if OTA_INSTALL_SUPPORTED
+  ESP.restart();                         /* on the Fossil port: reboot_now() */
+#endif
 }
 
 static void app_open_wifi_ble(void) {
@@ -810,11 +857,15 @@ static void app_open_wifi_ble(void) {
   settings_toggle_row(list, LV_SYMBOL_BLUETOOTH, "BLE", settings_get_ble_enabled(),
                       ble_sw_cb);
 
+#if !BOARD_PLATFORM_FOSSIL
   // Radio range (TX power): tap to cycle Min..Max. Lower = less power, less range.
+  // Not on the Wear 2100 watches: the WCN3620 has no TX-power knob wired up, so
+  // the rows would be decoration.
   s_wtxp_val = radio_txp_row(list, LV_SYMBOL_WIFI,      "WiFi TX", wtxp_cycle_cb);
   wtxp_label_refresh();
   s_btxp_val = radio_txp_row(list, LV_SYMBOL_BLUETOOTH, "BLE TX",  btxp_cycle_cb);
   btxp_label_refresh();
+#endif
 
 #if WIFI_SCAN_SUPPORTED
   // ---- Available networks (scan) ----
@@ -910,6 +961,25 @@ static void app_open_wifi_ble(void) {
     lv_label_set_long_mode(s_ota_lbl, LV_LABEL_LONG_WRAP);
     lv_label_set_text(s_ota_lbl, s_ota_line[0] ? s_ota_line
                                                : "Running " DEVICE_VERSION);
+
+    /* Install button: created hidden, revealed by a check that found a newer
+     * build. Same geometry as the check button so the column does not jump. */
+    s_ota_ibtn = lv_btn_create(list);
+#if BOARD_SCREEN_NARROW
+    lv_obj_set_size(s_ota_ibtn, LV_PCT(88), UI_PX(80));
+#else
+    lv_obj_set_size(s_ota_ibtn, UI_PX(320), UI_PX(48));
+#endif
+    lv_obj_set_style_bg_color(s_ota_ibtn, lv_color_hex(ui_accent_hex()), 0);
+    lv_obj_set_style_radius(s_ota_ibtn, UI_PX(12), 0);
+    lv_obj_set_style_shadow_width(s_ota_ibtn, 0, 0);
+    lv_obj_add_event_cb(s_ota_ibtn, ota_install_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ibl = lv_label_create(s_ota_ibtn);
+    lv_obj_set_style_text_font(ibl, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(ibl, lv_color_hex(0x000000), 0);
+    lv_label_set_text(ibl, LV_SYMBOL_OK "  Install update");
+    lv_obj_center(ibl);
+    ota_show_install(s_ota_m.ok && s_ota_m.newer);
   }
 
   // Section header for the saved networks. The cap depends on the backing store:

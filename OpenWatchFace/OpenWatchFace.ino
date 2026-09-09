@@ -1,12 +1,5 @@
 /* ============================================================================
- *  OpenWatchFace.ino — Digital watch OS for multiple boards. Currently:
- *  Waveshare ESP32-S3-Touch-AMOLED-2.06
- *  Waveshare ESP32-S3-Touch-LCD-1.47
- *  Waveshare ESP32-C6-Touch-LCD-1.47
- *  Waveshare Tuya T5-E1-Touch-AMOLED-1.75
- *  Waveshare ESP32-S3-Touch-AMOLED-1.8
- *  Waveshare ESP32-S3-Touch-AMOLED-1.64
- *  Waveshare ESP32-S3-Touch-LCD-2
+ *  OpenWatchFace.ino — Digital watch OS for multiple boards.
  *
  *  REQUIREMENTS:
  *    - esp32 (Espressif Systems) = v3.3.11
@@ -36,7 +29,7 @@
 #include "tuya/owf_tuya_lvgl_own.h"  // OUR OWN LVGL v9.5 (replaces the SDK vendor v8) - display+indev+flush
 #endif
 #if BOARD_PLATFORM_FOSSIL
-#include "owf_fossil_lvgl.h"         // fossil-port LVGL v9.5 on the continuous-splash framebuffer
+#include "owf_fossil_lvgl.h"         // snapdragon-port LVGL v9.5 on the continuous-splash framebuffer
 #endif
 #if !BOARD_PLATFORM_MAIX && !BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_FOSSIL
 #include "Arduino_GFX_Library.h"   // Arduino_GFX panel driver — not used when an external framework owns the display
@@ -116,6 +109,15 @@
  * graph) can be tested without sleeping for real. Set back to 0 and flash to resume real
  * logging. WARNING: while it's 1, any real recorded sleep data is wiped each boot. */
 #define SLEEP_TEST_DATA 0
+
+/* DEV: synthetic heart-rate history. Set to 1 (or build with -DHR_TEST_DATA=1) and the
+ * Heart app's History and Trends screens show 100 generated readings so the UI can be
+ * checked without taking measurements. Unlike SLEEP_TEST_DATA this touches NO file: the
+ * rows are made in RAM by hr_store_load(), so real /hr.csv data is never overwritten and
+ * it works on a read-only (RAM-boot) storage layer too. Real measurements still save. */
+#ifndef HR_TEST_DATA
+#define HR_TEST_DATA 0
+#endif
 
 /* ===================== NTP time sync config ==============================
  * NTP returns UTC; NTP_TZ converts it to LOCAL wall-clock time (and handles DST
@@ -287,7 +289,7 @@ static inline void board_display_set_brightness(uint8_t b) {
   board_tdeck_kbd_backlight(b);
 #elif BOARD_PLATFORM_FOSSIL
   // AUO AMOLED is bl_ctrl_dcs: brightness IS panel command 0x51, sent over
-  // our own DSI host (fossil-port dsi_dcs.c). Same command family as CO5300.
+  // our own DSI host (snapdragon-port dsi_dcs.c). Same command family as CO5300.
   dsi_dcs_set_brightness(b);
 #endif
 }
@@ -397,6 +399,7 @@ static volatile bool s_boot_activity = false;
 
 /* ---- Step counter: QMI8658 hardware pedometer (both boards) -------------- */
 #include "imu_steps.h"
+#include "hr_sensor.h"       // optical heart-rate sensor layer (board-neutral; Heart app)
 
 /* ---- PMU / battery: board-neutral wrapper (AXP2101 on the S3-2.06 board) -- */
 #include "board_power.h"
@@ -689,9 +692,10 @@ static uint8_t      rails_cut_count(void);
  *     they use the shell and define their own app_open_*.
  *   - app_settings.h LAST of the settings group: it dispatches to
  *     app_open_power / _wifi_ble, so those must be defined first. */
-/* Software-update CHECK (no installer yet). Before the app screens because
+/* Software update: the CHECK and the INSTALLER. Before the app screens because
  * app_wifi_ble.h hosts its button; self-contained, so order is free. */
 #include "ota_check.h"
+#include "ota_install.h"
 #include "screen_cache.h"       // PSRAM pre-render cache: blit a static screen instantly on open, then render live over it
 #include "app_menu.h"
 #include "app_power.h"
@@ -717,6 +721,9 @@ static uint8_t      rails_cut_count(void);
                                 // compiles to nothing elsewhere, and its tile is gated too)
 #include "app_fitness.h"        // Fitness: step counter (uses imu_steps + i2c_lock)
 #include "app_sleep.h"          // Sleep: sleep-quality tracking + DND (uses sleep_track)
+#include "hr_algo.h"            // PPG beat detector -> bpm / RMSSD / SDNN
+#include "hr_store.h"           // /hr.csv measurement history
+#include "app_heart.h"          // Heart: on-demand heart-rate + HRV measurement
 #include "app_weather.h"        // Weather: current + forecast + graph (reads weather_store;
                                 // weather_request_fetch forward-declared in watch_base.h)
 
@@ -828,6 +835,7 @@ static void notif_dismiss(void) {
 #include "notif_net.h"
 #if BOARD_HAS_BLE
 #include "ble_ancs.h"           // ANCS client: iPhone notifications over BLE -> the same store.
+#include "ble_cts.h"            // CTS client: the iPhone's clock over BLE -> the RTC (no WiFi needed).
 #include "ble_player_ams.h"     // AMS client: iPhone media (now-playing + controls) -> the Player.
                                 // Included here (after notif_store/archive/net) because it feeds
                                 // notif_store_add / na_append / s_pop_* and is called by ble_provision.h.
@@ -1984,7 +1992,7 @@ void setup() {
 #elif BOARD_PLATFORM_MAIX
   s_display_ready = true;     // MaixCDK lvgl_init already brought up the panel
 #elif BOARD_PLATFORM_FOSSIL
-  /* fossil-port owns LVGL on the continuous-splash framebuffer (owf_fossil_lvgl.h),
+  /* snapdragon-port owns LVGL on the continuous-splash framebuffer (owf_fossil_lvgl.h),
    * the same "bring up here, adopt as default below" flow as the Tuya path. */
 #if defined(STOP_SETUP3)
   /* Recovery 3 s bisect, point 5: ALL of setup() before display init done.
@@ -2210,8 +2218,10 @@ void setup() {
   i2c_lock();   // hold the shared bus across IMU bring-up so touch ISR reads can't interleave
   bool imu_ok = imu_steps_begin();
   i2c_unlock();
-  if (imu_ok) USBSerial.println("[imu] QMI8658 pedometer ready");
-  else        USBSerial.println("[imu] QMI8658 not found - step counting disabled");
+  if (imu_ok) USBSerial.println("[imu] pedometer ready");
+  else        USBSerial.println("[imu] IMU not found - step counting disabled");
+  if (hr_sensor_begin()) USBSerial.println("[hr] heart-rate sensor ready");
+  else                   USBSerial.println("[hr] no heart-rate sensor - Heart app disabled");
 
   // Restore the persisted step total from NVS. RTC memory survives a deep-sleep TIMER wake,
   // but a full power-off (and on the C6, the RST-button wake) wipes it — NVS is the durable
@@ -2825,8 +2835,17 @@ void loop() {
         // suspend sleep and returns when a User/PWR press wakes it (the UI resumes as-is,
         // so the menu the first tap opened is still there — same screen it slept on).
         bootLastTap = 0;
-        enter_deep_sleep();               // ESP/Maix: does not return. T5: blocks, returns on wake.
-#if BOARD_PLATFORM_TUYA
+        USBSerial.printf("[power] sleep reason: BOOT double-tap (ms=%lu)\n", (unsigned long)ms);
+        enter_deep_sleep();               // ESP/Maix: does not return. T5/Fossil: blocks, returns on wake.
+#if BOARD_PLATFORM_FOSSIL
+        // Resume-in-place: the press that woke us is still held and must not count
+        // as a tap (a quick second press would read as a double tap = sleep again:
+        // the C2 "flashes on, then off" 2026-09-09). Same swallow as a cold boot.
+        s_woke_from_boot = true;
+        bootLastTap = 0;
+        bootDown = true;
+#endif
+#if BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
         lastActivityMs = millis();        // woke: fresh stamp (millis, not stale ms) = fresh idle period
         dirty = true;
         if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
@@ -3166,6 +3185,13 @@ void loop() {
     }
   }
 
+  // CTS (iPhone-over-BLE clock). cts_poll() kicks/retries the Current Time discovery
+  // once ANCS/AMS are done and re-reads periodically; when a reading actually steps
+  // the RTC, force a watchface redraw instead of waiting for the next minute tick.
+  // This is the ONLY time source on a watch without WiFi (e.g. the Fossil Gen 6).
+  cts_poll();
+  if (cts_take_dirty()) dirty = true;
+
   // ANCS (iPhone-over-BLE) pushed a notification into the store from the NimBLE task.
   // Pop its card + refresh the bell here on the loop/LVGL side, mirroring the fetch
   // result path above. s_pop_* was filled under store_lock by the ANCS parser.
@@ -3410,8 +3436,15 @@ void loop() {
   if (s_caffeine) {                      // caffeine = stay awake, don't even count toward sleep
     lastActivityMs = ms;
   } else if (!usb_connected && ms - lastActivityMs > IDLE_SLEEP_MS) {
-    enter_deep_sleep();  // ESP/Maix: does not return. T5: blocks in suspend, returns on button wake.
-#if BOARD_PLATFORM_TUYA
+    USBSerial.printf("[power] sleep reason: idle (ms=%lu lastActivity=%lu idle_ms=%lu millis=%lu)\n",
+                     (unsigned long)ms, (unsigned long)lastActivityMs, (unsigned long)IDLE_SLEEP_MS, (unsigned long)millis());
+    enter_deep_sleep();  // ESP/Maix: does not return. T5/Fossil: blocks in suspend, returns on button wake.
+#if BOARD_PLATFORM_FOSSIL
+    s_woke_from_boot = true;   // swallow the still-held wake press (see the double-tap path)
+    bootLastTap = 0;
+    bootDown = true;
+#endif
+#if BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
     lastActivityMs = millis(); // woke: fresh stamp (the block lasted the whole sleep) = fresh idle period
     if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
       notif_show(s_pop_id, s_pop_title, s_pop_body);
@@ -3500,5 +3533,13 @@ void loop() {
 #if OWF_LOOP_TRACE
   s_lt_first = false;   // trace the first pass only; silent from here on
 #endif
-  delay(fast_pace ? 1 : 5);
+  /* Idle cadence is per board: BOARD_LOOP_IDLE_MS (default 5). The bare-metal
+   * Wear 2100 watches use 10 — halving the fixed per-pass cost (button poll,
+   * USB pump, watchdog pets, log flushes) with no visible effect: touch is
+   * read on LVGL's own ~30 ms indev timer, and the first dirty frame switches
+   * back to the 1 ms cadence. */
+#ifndef BOARD_LOOP_IDLE_MS
+#define BOARD_LOOP_IDLE_MS 5
+#endif
+  delay(fast_pace ? 1 : BOARD_LOOP_IDLE_MS);
 }

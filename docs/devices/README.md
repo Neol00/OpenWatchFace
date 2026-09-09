@@ -19,6 +19,7 @@ the hardware you actually own.
 | Fossil Gen 6 (hoki) | Snapdragon Wear 4100 (SDA429W) | 416×416 AMOLED (MSM DSI) | [Install guide](fossil-gen6.md) |
 | Fossil Gen 4 (firefish/ray) | Snapdragon Wear 2100 (APQ8009W) | 454×454 AMOLED (MSM DSI) | [Install guide](fossil-gen4.md) |
 | Mobvoi TicWatch C2 / C2+ (skipjack) | Snapdragon Wear 2100 (APQ8009W) | 360×360 round AMOLED (MSM DSI) | [Install guide](ticwatch-c2.md) |
+| Mobvoi TicWatch S2 / E2 (tunny) | Snapdragon Wear 2100 (APQ8009W) | 400×400 round AMOLED (MSM DSI) | [Install guide](ticwatch-s2.md) |
 
 ## Which toolchain does my device use?
 
@@ -32,11 +33,14 @@ in before you start:
   different board package (installed via a boards-manager URL), a prebuilt
   `libtuyaos.a` swap, and the `tyutool` flasher instead of the ESP32 toolchain.
 - **MaixCDK** the MaixCam-Pro. A native Linux application, not firmware.
-- **Bare-metal** Fossil Gen 6, Fossil Gen 4 and TicWatch C2. A custom FreeRTOS
-  runtime built by a shell script and run with `fastboot` as an Android boot
-  image, no Arduino IDE involved. All three have full install guides. The two
-  Wear 2100 watches (Gen 4, C2) also support `fastboot boot`, so the firmware can
-  be **RAM-booted without overwriting Wear OS**; the Gen 6 has to be flashed.
+- **Bare-metal** Fossil Gen 6, Fossil Gen 4, TicWatch C2 and TicWatch S2. A
+  custom FreeRTOS runtime built by a shell script and run with `fastboot` as an
+  Android boot image, no Arduino IDE involved. All four have full install
+  guides. The three Wear 2100 watches (Gen 4, C2, S2) also support
+  `fastboot boot`, so the firmware can be **RAM-booted without overwriting
+  Wear OS**; the Gen 6 has to be flashed. On the Wear 2100 watches deep sleep
+  is a real cluster power collapse with RPM XO shutdown (about 6 mA measured on
+  the C2, on par with stock) and the firmware runs dual core.
 
 ## Shared reference
 

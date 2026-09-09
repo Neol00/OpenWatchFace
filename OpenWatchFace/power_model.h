@@ -198,7 +198,7 @@ static float power_estimate_mw_raw(void) {
   float vc  = core_voltage_v();
   float cpu = BOARD_PWR_CPU_K * (float)s_cpu_mhz * vc * vc * cpu_load_frac();
   float radio = s_ble_active ? (float)BOARD_PWR_RADIO_MW : 0.0f;
-#if BOARD_HAS_IMU_QMI8658
+#if BOARD_HAS_IMU
   float imu = imu_steps_running() ? (float)BOARD_PWR_IMU_MW : 0.0f;
 #else
   float imu = 0.0f;

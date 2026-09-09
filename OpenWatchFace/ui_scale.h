@@ -104,9 +104,16 @@ static inline int ui_px(int ref_px) {
  * exactly that case and carries a long comment saying so.
  *
  * Keep this in lockstep with ui_app_column_layout(); it is the same arithmetic. */
+/* Small round face (C2, 360 px): the scroll column's width as a percentage of
+ * the glass. 86 left ~30 px of black either side of every card, which read as
+ * "enormous side bars" on a 360 px circle; 93 fills the middle of the circle.
+ * The rows at the very top and bottom of the column sit on the narrowing arcs
+ * and lose a few corner pixels there, as every round watch's lists do. */
+#define UI_ROUND_SMALL_COL_PCT 93u
+
 static inline int ui_app_column_content_w(void) {
 #if BOARD_SCREEN_ROUND_SMALL
-  return (int)((screenWidth * 86u) / 100u) - 2 * UI_PX(6);
+  return (int)((screenWidth * UI_ROUND_SMALL_COL_PCT) / 100u) - 2 * UI_PX(6);
 #else
   return 374 - 2 * 6;
 #endif
@@ -142,7 +149,7 @@ static inline int ui_app_column_content_w(void) {
  * changed blind on an accepted board. */
 static inline void ui_app_column_layout(lv_obj_t *col, int ref_w) {
 #if BOARD_SCREEN_ROUND_SMALL
-  lv_obj_set_width(col, LV_PCT(86));
+  lv_obj_set_width(col, LV_PCT(UI_ROUND_SMALL_COL_PCT));
   lv_obj_set_height(col, (int)screenHeight - UI_PX(84) - UI_PX(36));
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(84));
   lv_obj_set_style_pad_all(col, UI_PX(6), 0);
@@ -153,6 +160,10 @@ static inline void ui_app_column_layout(lv_obj_t *col, int ref_w) {
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 84);
   lv_obj_set_style_pad_all(col, 6, 0);
 #endif
+  /* These columns only ever scroll vertically. Without this, any child laid
+   * out wider than the column (a fixed-pixel row on a smaller panel) turned
+   * the WHOLE screen side-scrollable instead of just clipping. */
+  lv_obj_set_scroll_dir(col, LV_DIR_VER);
 }
 
 /* ---- narrow-panel scrollbar nudge ----------------------------------------

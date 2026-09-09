@@ -62,9 +62,10 @@
 #define BOARD_ID_FOSSIL_GEN6 12 /* Fossil Gen 6 hoki (Wear 4100+ / SDA429W, bare-metal A53/AArch32) */
 #define BOARD_ID_TDECK_PRO 13   /* LilyGo T-Deck Pro (e-paper, QWERTY, LoRa, GNSS) */
 #define BOARD_ID_TICWATCH_C2 14 /* Mobvoi TicWatch C2 skipjack (Wear 2100, bare-metal A7) */
+#define BOARD_ID_TICWATCH_S2 15 /* Mobvoi TicWatch S2/E2 tunny (Wear 2100, bare-metal A7) */
 
 #ifndef BOARD_SELECT
-#define BOARD_SELECT  BOARD_ID_FOSSIL_GEN6         /* <-- change this line to pick the board */
+#define BOARD_SELECT  BOARD_ID_S3_206         /* <-- change this line to pick the board */
 #endif
 
 #if   BOARD_SELECT == BOARD_ID_S3_206
@@ -95,6 +96,9 @@
 #define BOARD_LILYGO_TDECK_PRO 1
 #elif BOARD_SELECT == BOARD_ID_TICWATCH_C2
 #define BOARD_TICWATCH_C2 1
+#elif BOARD_SELECT == BOARD_ID_TICWATCH_S2
+#define BOARD_TICWATCH_S2 1
+#define BOARD_TICWATCH_C2 1   /* the S2 is a C2 with a 400x400 panel; C2 gates apply */
 #else
 #error "board.h: BOARD_SELECT is not a known BOARD_ID_* value"
 #endif
@@ -125,6 +129,8 @@
 #include "board_fossil_gen6.h"
 #elif defined(BOARD_LILYGO_TDECK_PRO)
 #include "board_lilygo_tdeck_pro.h"
+#elif defined(BOARD_TICWATCH_S2)
+#include "board_ticwatch_s2.h"
 #elif defined(BOARD_TICWATCH_C2)
 #include "board_ticwatch_c2.h"
 #else
@@ -140,10 +146,10 @@
  * Before this existed, those places tested `BOARD_SELECT == BOARD_ID_FOSSIL_GEN4`
  * and the C2 silently fell through to the Gen 6 branch — which offered a
  * Wear 4100 frequency ladder (up to 1306 MHz) on a part that cannot reach it.
- * Mirrors PLAT_SOC_MSM8909 in fossil-port/baremetal/platform/platform.h; keep
+ * Mirrors PLAT_SOC_MSM8909 in snapdragon-port/baremetal/platform/platform.h; keep
  * the two in step when a third Wear 2100 watch arrives (the TicWatch S2/E2,
  * codename tunny, is the likely next one). */
-#if BOARD_SELECT == BOARD_ID_FOSSIL_GEN4 || BOARD_SELECT == BOARD_ID_TICWATCH_C2
+#if BOARD_SELECT == BOARD_ID_FOSSIL_GEN4 || BOARD_SELECT == BOARD_ID_TICWATCH_C2 || BOARD_SELECT == BOARD_ID_TICWATCH_S2
 #define BOARD_SOC_MSM8909 1
 #else
 #define BOARD_SOC_MSM8909 0
@@ -165,7 +171,7 @@
 #define BOARD_PLATFORM_TUYA 0        /* Tuya T5-E1 (TuyaOpen, tdl display layer) */
 #endif
 #ifndef BOARD_PLATFORM_FOSSIL
-#define BOARD_PLATFORM_FOSSIL 0      /* Fossil watches, bare-metal (fossil-port runtime) */
+#define BOARD_PLATFORM_FOSSIL 0      /* Fossil watches, bare-metal (snapdragon-port runtime) */
 #endif
 
 /* -- display (exactly one =1; checked below) -------------------------------- */
@@ -193,7 +199,7 @@
 #define BOARD_DISPLAY_TUYA 0
 #endif
 #ifndef BOARD_DISPLAY_MSM_DSI
-#define BOARD_DISPLAY_MSM_DSI 0      /* Qualcomm MDP3/DSI cmd-mode (fossil-port) */
+#define BOARD_DISPLAY_MSM_DSI 0      /* Qualcomm MDP3/DSI cmd-mode (snapdragon-port) */
 #endif
 #ifndef BOARD_DISPLAY_EPD_GDEQ031T10
 #define BOARD_DISPLAY_EPD_GDEQ031T10 0  /* GDEQ031T10 320x240 e-paper via GxEPD2 (T-Deck Pro).
@@ -228,7 +234,7 @@
 #define BOARD_TOUCH_TUYA 0
 #endif
 #ifndef BOARD_TOUCH_RAYDIUM
-#define BOARD_TOUCH_RAYDIUM 0        /* Raydium RM_TS I2C (fossil-port) */
+#define BOARD_TOUCH_RAYDIUM 0        /* Raydium RM_TS I2C (snapdragon-port) */
 #endif
 
 /* -- SoC / memory ------------------------------------------------------------ */
@@ -292,6 +298,14 @@
 #ifndef BOARD_HAS_IMU_QMI8658
 #define BOARD_HAS_IMU_QMI8658 0      /* QMI8658 accel (steps + sleep tracking) */
 #endif
+#ifndef BOARD_HAS_IMU_LSM6DS3
+#define BOARD_HAS_IMU_LSM6DS3 0      /* LSM6DS3 hardware pedometer (msm8909w watches) */
+#endif
+#define BOARD_HAS_IMU (BOARD_HAS_IMU_QMI8658 || BOARD_HAS_IMU_LSM6DS3)
+#ifndef BOARD_HAS_HR_PAH8011
+#define BOARD_HAS_HR_PAH8011 0       /* PixArt PAH8011 optical heart-rate sensor (hr_sensor.h) */
+#endif
+#define BOARD_HAS_HR (BOARD_HAS_HR_PAH8011)   /* any heart-rate sensor -> Heart app tile */
 #ifndef BOARD_HAS_ULP_STEPS
 #define BOARD_HAS_ULP_STEPS 0        /* deep-sleep steps on the S3 RISC-V ULP */
 #endif
@@ -491,6 +505,14 @@
  * automatically — nothing here is keyed to a board id. */
 #define BOARD_SCREEN_ROUND_SMALL (BOARD_SCREEN_ROUND && ((LCD_HEIGHT) <= 380))
 
+/*   BOARD_SCREEN_ROUND_COMPACT — the launcher's version of the same question with
+ * a looser bar. The 3x3 tile page needs its whole bottom band (dots + "< BOOT")
+ * reserved on anything under ~420 px tall: the TicWatch S2 (400) sits above the
+ * ROUND_SMALL bar, keeps the reference watch face and text tiers, and still had
+ * its bottom tile row drawn over the page dots. Everything ROUND_SMALL selects
+ * is COMPACT too; the S2 is the only board that is COMPACT without being SMALL. */
+#define BOARD_SCREEN_ROUND_COMPACT (BOARD_SCREEN_ROUND && ((LCD_HEIGHT) <= 400))
+
 /* ---- Sanity checks -------------------------------------------------------- */
 #if (BOARD_DISPLAY_CO5300_QSPI + BOARD_DISPLAY_SH8601_QSPI + BOARD_DISPLAY_JD9853_SPI + BOARD_DISPLAY_GC9A01_SPI + BOARD_DISPLAY_ST7789_SPI + BOARD_DISPLAY_MAIX + BOARD_DISPLAY_TUYA + BOARD_DISPLAY_MSM_DSI + BOARD_DISPLAY_EPD_GDEQ031T10) != 1
 #error "board config: exactly one BOARD_DISPLAY_* must be 1"
@@ -634,7 +656,7 @@
 /* ---- OWF_STAGE: boot-progress marker for bare-metal bring-up --------------
  * On the Fossil port the ONLY working debug channel is when the watchdog
  * reboots the watch, so setup() marks its progress and a stopwatch reads it
- * back (see fossil-port/baremetal/platform/msm_wdog.c). Compiles to nothing
+ * back (see snapdragon-port/baremetal/platform/msm_wdog.c). Compiles to nothing
  * everywhere else, and on the Fossil unless -DWDOG_TRACE is set. */
 #ifndef OWF_STAGE
 #define OWF_STAGE(n) ((void)0)

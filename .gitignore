@@ -19,8 +19,11 @@
 # ---- bare-metal port: build output -----------------------------------------
 # build-owf-image*.sh writes here (owf.elf/.bin, the LVGL archive, every .o);
 # tools/mk-bootimg*.sh writes the packed boot images. All reproducible.
-fossil-port/baremetal/build/
-fossil-port/build/
+snapdragon-port/baremetal/build/
+snapdragon-port/dumps/
+snapdragon-port/firmware/
+snapdragon-port/build/
+snapdragon-port/notes/
 *.img
 *.elf
 *.bin
@@ -42,16 +45,6 @@ fossil-port/dumps/*
 
 # (The .dtb build inputs at fossil-port/ root — firefish-stock.dtb,
 # sda429-hoki.dtb — are not matched by anything above and stay tracked.)
-
-# ---- vendor SDKs and reference trees ---------------------------------------
-# Upstream trees kept locally for reference. They are someone else's source,
-# they are tens of GB together, and they are all obtainable from their own
-# upstreams — nothing here is authored by this project.
-tuya_open/
-maixcam-port/
-Tuya-waveshare-provided-T5-E1/
-ESP32-waveshare-provided-*/
-ESP32-lilygo-provided-*/
 
 # ---- Arduino / ESP-IDF build output ----------------------------------------
 build/

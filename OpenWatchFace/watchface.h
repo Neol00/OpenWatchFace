@@ -53,9 +53,25 @@ static lv_obj_t *wx_temp_lbl  = nullptr;   // temperature text
 /* Vertical positions (LV_ALIGN_CENTER y-offset, pre-UI_PX). The weekday/date row
  * normally sits at _DEFAULT; when the weather widget is shown it drops to _WX so the
  * widget (at WF_WEATHER_Y) has room between the clock and the date. */
+#if BOARD_SCREEN_ROUND_COMPACT
+/* COMPACT ROUND (C2 360 / S2 400): the reference offsets put the weather widget
+ * at the same height as the default date, and the date-with-weather row at
+ * UI_PX(150) — on a 400 px circle that is y ~346 with the date ending at ~395,
+ * where the chord is a few dozen px wide: the reported "date clips the bottom".
+ * The dial is shorter here (102/88 px cuts, bottom at ~237 on the S2, ~211 on
+ * the C2), so pack the three rows right under it instead:
+ *     S2 (UI_PX = 0.976)  weather centre y 260 (6 px under the dial)
+ *                         weekday y 305, date ends ~352, chord there 260 px wide
+ *     C2 (UI_PX = 0.878)  weather y 234, weekday y 275, date ends ~322 (chord 220)
+ * Without the weather the weekday moves up to +78 so the face stays balanced. */
+#define WF_WEEKDAY_Y_DEFAULT  78
+#define WF_WEEKDAY_Y_WX       108
+#define WF_WEATHER_Y          62
+#else
 #define WF_WEEKDAY_Y_DEFAULT  95
 #define WF_WEEKDAY_Y_WX       150
 #define WF_WEATHER_Y          98
+#endif
 
 /* Container handles, kept so the deep-dim "minimal face" (watchface_set_minimal)
  * can hide everything except the center clock in one shot. The three stat columns
@@ -156,6 +172,11 @@ static void watchface_create(void) {
   // 7 px INTO the dial even after the font drop to 88 — which is why the smaller
   // dial alone did not fix this.)
   const int TOP_Y = UI_PX(94);
+#elif BOARD_SCREEN_ROUND && (LCD_HEIGHT) <= 400
+  // MID ROUND (S2, 400x400): the 102 px dial spans ~200 +/- 37 = y 163..237, and
+  // UI_PX(112) = 109 put the stat row's bottom at ~168, 5 px into it. UI_PX(100)
+  // = 98 ends it at ~157.
+  const int TOP_Y = UI_PX(100);
 #elif BOARD_SCREEN_ROUND
   const int TOP_Y = UI_PX(112);  // stat row higher -> clears the clock below
 #else

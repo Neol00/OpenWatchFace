@@ -213,7 +213,10 @@ static volatile uint32_t s_incoming_uid    = 0;                // its live ANCS 
 static char              s_incoming_who[NOTIF_TITLE_MAX] = ""; // caller (title), for the live UI
 static volatile bool     s_incoming_dirty  = false;            // loop should refresh call UI
 
+static void cts_reset(void);                         // defined in ble_cts.h
+
 static void ancs_reset(void) {
+  cts_reset();                     // CTS handles are per-connection too
   s_ancs_conn      = BLE_HS_CONN_HANDLE_NONE;
   s_ancs_svc_start = 0; s_ancs_svc_end = 0;
   s_ancs_ns_val = 0; s_ancs_ns_cccd = 0;
@@ -332,7 +335,7 @@ static void ancs_parse_and_store(void) {
   // gating it here is what stops the archive accumulating a duplicate line for every
   // backlog replay after each sleep/wake.
   bool added = notif_store_add(id, title, body, cat);
-  if (added && na_available()) na_append(id, title, body, cat);   // full history (SD or FFat)
+  if (added && na_available()) { na_backfill_from_cache(); na_append(id, title, body, cat); }   // full history (SD or FFat)
   if (added) {
     notif_store_save();
     // Stash newest for the popup card, same as the HTTP path does.
@@ -482,7 +485,13 @@ static void ancs_notif_source_rx(const uint8_t *data, uint16_t len) {
       s_incoming_active = false; s_incoming_uid = 0; s_incoming_dirty = true;
       USBSerial.println("[ancs] incoming call ended (removed)");
     }
-    ancs_remove_uid(uid);
+    // ONE-WAY MIRROR (2026-09-03, user rule): the watch controls the phone, never
+    // the other way round. A notification cleared on the phone stays on the watch
+    // until the user dismisses it there. (ancs_remove_uid is kept for the call
+    // path above and for a future opt-in.) The UID map entry is left in place so
+    // a later watch-side dismiss still finds the live UID; iOS just answers it
+    // with an error for a notification it no longer has.
+    (void)ancs_remove_uid;
     return;
   }
 
@@ -632,10 +641,18 @@ static int ancs_svc_cb(uint16_t conn, const struct ble_gatt_error *err,
 /* Called from onAuthenticationComplete once the link is ENCRYPTED. Kicks the
  * discover -> subscribe chain. iOS replays the pending-notification backlog as soon
  * as Notification Source is subscribed, so no explicit "fetch backlog" call needed. */
+static void cts_on_encrypted(uint16_t conn_handle);   // defined in ble_cts.h
+static void cts_poll(void);
+
 static void ancs_on_encrypted(uint16_t conn_handle) {
   if (s_ancs_ns_subbed && conn_handle == s_ancs_conn) return;  // already running this conn
   ancs_reset();
   s_ancs_conn = conn_handle;
+  // ARM the Current Time client (ble_cts.h): the iPhone serves the standard CTS on
+  // this same bonded link, and on a watch with no WiFi that is the only clock source.
+  // It only arms a timer here — cts_poll() starts its GATT chain a couple of seconds
+  // later, so it never collides with the ANCS/AMS discovery bursts about to run.
+  cts_on_encrypted(conn_handle);
   USBSerial.printf("[ancs] link encrypted (conn=0x%04X) — discovering ANCS...\n", conn_handle);
   int rc = ble_gattc_disc_svc_by_uuid(conn_handle, &ANCS_SVC_UUID.u, ancs_svc_cb, NULL);
   if (rc != 0) USBSerial.printf("[ancs] disc_svc_by_uuid rc=%d\n", rc);
@@ -775,6 +792,7 @@ static bool ancs_background_check(uint32_t budget_ms) {
         break;                                                 // decided: nothing pending
       }
     }
+    cts_poll();                                                // sync the clock off the phone too
     delay(50);                                                 // let the NimBLE task run
   }
 
@@ -811,6 +829,9 @@ static bool ancs_background_check(uint32_t budget_ms) {
  * (included later). Forward-declared so the one GAP handler can route to both. */
 static bool ams_handle_notify_rx(uint16_t conn_handle, uint16_t attr_handle,
                                  const struct os_mbuf *om);
+/* ...and CTS (clock pushes from the phone) shares it too; see ble_cts.h. */
+static bool cts_handle_notify_rx(uint16_t conn_handle, uint16_t attr_handle,
+                                 const struct os_mbuf *om);
 
 static int ancs_gap_event(struct ble_gap_event *event, void *param) {
   (void)param;
@@ -824,6 +845,8 @@ static int ancs_gap_event(struct ble_gap_event *event, void *param) {
   // AMS (media) shares the same connection + notify path as ANCS. Give the AMS
   // router first refusal; if it consumed the notification, we're done.
   if (ams_handle_notify_rx(conn, attr, om)) return 0;
+  // CTS (Current Time) pushes arrive on this connection as well.
+  if (cts_handle_notify_rx(conn, attr, om)) return 0;
 
   if (conn != s_ancs_conn) return 0;
   if (attr != s_ancs_ns_val && attr != s_ancs_ds_val) return 0;

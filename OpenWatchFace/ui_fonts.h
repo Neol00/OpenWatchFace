@@ -132,6 +132,14 @@ LV_FONT_DECLARE(montserrat_clock_88);
 #define FONT_TIME  montserrat_clock_88      // large HH:MM (custom: digits+colon only)
 #define FONT_TIME_IS_CUSTOM 1
 /* Text roles via UI_FONT: reference sizes (360 wide is above the 280 anchor). */
+#elif BOARD_SCREEN_ROUND && (LCD_HEIGHT) <= 400
+/* MID ROUND face (TicWatch S2/E2, 400x400): above the ROUND_SMALL bar, so it keeps
+ * the reference layout, but 110 px digits are ~297 px on a 400 px chord (74%) and
+ * clip the stat row. 102 lands "12:34" at ~275 px (69%), between the C2's 66%
+ * and the Gen 4's 65%. The stat row moves up too (watchface.h). */
+LV_FONT_DECLARE(montserrat_clock_102);
+#define FONT_TIME  montserrat_clock_102     // large HH:MM (custom: digits+colon only)
+#define FONT_TIME_IS_CUSTOM 1
 #elif !BOARD_SCREEN_NARROW
 /* S3-2.06 (large panel): the original clock glyph. */
 LV_FONT_DECLARE(montserrat_clock_110);
@@ -373,6 +381,7 @@ LV_FONT_DECLARE(icons88);   // big current-conditions weather icon (Weather app)
 #define MDI_WATCH           0xF0897   // smartwatch — Timer/Stopwatch/Alarm app tile.
 #define MDI_RUN_FAST        0xF111F   // running figure — Fitness app tile
 #define MDI_SLEEP           0xF0594   // moon (sleep) — Sleep app tile + face DND badge
+#define MDI_HEART_PULSE     0xF05F6   // heart-pulse — Heart (heart-rate) app tile (icons34)
 
 /* ---- Weather glyphs (in icons22 + icons34; see weather_store.h / app_weather.h) ----
  * The Weather app draws these in a single tint each. The MAIN-DIAL "partly cloudy"

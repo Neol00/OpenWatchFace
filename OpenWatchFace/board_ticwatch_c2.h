@@ -4,13 +4,13 @@
  *
  *  Not an MCU board and not a Linux port: this runs bare-metal on core 0 of the
  *  watch's Snapdragon Wear 2100 (APQ8009W / msm8909w) on top of the
- *  fossil-port/baremetal runtime — the SAME SoC as the Fossil Gen 4, which is
+ *  snapdragon-port/baremetal runtime — the SAME SoC as the Fossil Gen 4, which is
  *  why this port is mostly inheritance rather than new work. SoC-level detail
- *  lives in fossil-port/baremetal/boards/ticwatch_c2.h; this header describes
+ *  lives in snapdragon-port/baremetal/boards/ticwatch_c2.h; this header describes
  *  only what the FIRMWARE needs to know.
  *
  *  Every hardware fact below was read out of the watch's own merged device
- *  tree, reconstructed in fossil-port/dumps/c2-skipjack-fromsource/. The C2 is
+ *  tree, reconstructed in snapdragon-port/dumps/c2-skipjack-fromsource/. The C2 is
  *  an appended-DTB device with no dtbo partition, so the tree lives inside the
  *  stock boot image rather than in a partition that can be pulled; it was
  *  rebuilt from the skipjack kernel source instead, and the watch's own
@@ -26,7 +26,7 @@
 
 /* ---- Platform flag: bare-metal Qualcomm MSM (no Arduino/ESP runtime) ------
  * Same gate the two Fossil watches use; display/touch/tick come from the
- * fossil-port runtime. */
+ * snapdragon-port runtime. */
 #define BOARD_PLATFORM_FOSSIL 1
 
 /* ---- Display / touch ------------------------------------------------------
@@ -44,7 +44,7 @@
  * C2's DTB gives qcom,vib-vtg-level-mV = 3100, identical to the Gen 4, so
  * pmic_vib.c needs no change at all. */
 #define BOARD_HAS_PSRAM           0   /* plain malloc into DDR (512 MB) */
-#define BOARD_DUAL_CORE           0   /* cores 1-3 parked */
+#define BOARD_DUAL_CORE           1   /* CPU1 booted by smp_8909.c (2026-09-04), parked in WFI with idle accounting; cores 2-3 off */
 #define BOARD_HAS_PMU_AXP2101     0   /* PMIC is PM8916 over SPMI */
 #define BOARD_HAS_ADC_BATTERY     0   /* PM8916 VM-BMS; pmic_fg.c, ported */
 #define BOARD_HAS_RTC_PCF85063    0   /* PM8916 RTC over SPMI */
@@ -54,11 +54,13 @@
 #define BOARD_HAS_SD_MMC          0   /* eMMC via sdhci-msm (7824900.sdhci) */
 #define BOARD_HAS_SD_SPI          0
 #define BOARD_HAS_IMU_QMI8658     0
+#define BOARD_HAS_IMU_LSM6DS3     1   /* ST LSM6DS3 on bit-banged SPI gpio8-11 (imu_lsm6ds3.c) */
+#define BOARD_HAS_HR_PAH8011      1   /* PixArt PAH8011 PPG at I2C 0x15 on gpio6/7 (hr_pah8011.c) */
 #define BOARD_HAS_BACKLIGHT_PWM   0   /* AMOLED: brightness by DCS command */
 #define BOARD_HAS_LP_STEPS        0
 #define BOARD_WAKE_USE_EXT0       0
-#define BOARD_HAS_BLE             0
-#define BOARD_HAS_FFAT            0
+#define BOARD_HAS_BLE             1   /* NimBLE host over HCI-on-SMD (WCNSS BT core) */
+#define BOARD_HAS_FFAT            1   /* eMMC userdata FFAT region (2026-09-03) */
 
 /* BLE TX-power ladder placeholder (same contract as the other bare-metal
  * ports: referenced unconditionally by settings_store.h, never applied). */
@@ -104,7 +106,7 @@ extern "C" void fb_trace(uint32_t xrgb);
 #define OWF_VTRACE(c) fb_trace(c)
 #endif
 
-/* ---- Panel brightness: DCS 0x51 over the fossil-port DSI host --------------
+/* ---- Panel brightness: DCS 0x51 over the snapdragon-port DSI host --------------
  * The panel is "bl_ctrl_dcs" with min level 1 and max 255 — the same scheme as
  * the Gen 4's AUO h139, so dsi_dcs_set_brightness() and the whole auto-dim
  * path apply unchanged. One of the larger pieces of Gen 4 bring-up that this
@@ -141,3 +143,6 @@ extern "C" int dsi_dcs_set_brightness(unsigned char level);
 #define BOOT_BTN_GPIO    201
 #define BOARD_WAKE_GPIO  0
 #define BOARD_LCD_BUS_HZ 0
+/* Idle loop pass every 10 ms instead of 5 (2026-09-04 idle-load work; see the
+ * loop() tail in OpenWatchFace.ino). */
+#define BOARD_LOOP_IDLE_MS 10

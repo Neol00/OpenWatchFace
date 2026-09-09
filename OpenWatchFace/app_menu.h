@@ -85,8 +85,8 @@ static bool      menu_open  = false;
 #define MENU_TILE_GAP       6
 #define MENU_TILE_ICON_FONT lv_font_montserrat_34
 #define MENU_HINT_FONT      UI_FONT(20)
-#elif BOARD_SCREEN_ROUND_SMALL
-/* SMALL ROUND face (C2/S2, 360x360): keeps the reference 3x3 grid — the panel is
+#elif BOARD_SCREEN_ROUND_COMPACT
+/* COMPACT ROUND face (C2 360, S2 400): keeps the reference 3x3 grid — the panel is
  * wide enough — but the whole page has to fit in 360 px of HEIGHT rather than the
  * reference 502, with a bottom band for the page dots and the "< BOOT" hint that
  * the round bezel also pushes inward. Two knobs do the work:
@@ -312,25 +312,35 @@ static lv_obj_t *settings_toggle_row(lv_obj_t *parent, const char *symbol,
   lv_obj_align(ic, LV_ALIGN_LEFT_MID, 20, 0);
 
   lv_obj_t *nm = lv_label_create(row);
+  /* THE NAME WRAPS (2026-09-06). It used to have no width at all on the wide
+   * tier, so a long caption ("Monochrome", "Voltage reading") ran straight
+   * under the switch; the mid-width tier dot-truncated instead. Both now get a
+   * width that stops short of the switch and wrap onto a second line, and the
+   * row grows to fit (below) so the two lines stay inside the card. */
 #if BOARD_SCREEN_SUBREF
-  /* Mid-width panels (S3-LCD-2 240, S3-1.64 280): these fixed offsets were
-   * authored for the 410 px reference, where FONT_LABEL at x=60 has ~250 px of
-   * clear run before the switch. Here it has ~70, so "Auto-dim" ran INTO the
-   * switch, and the x=60 start left a dead gutter after the icon (which ends
-   * around x=40). Shrink the TEXT only — the icon at 20 px reads right and the
-   * user confirmed it — pull it in to x=46, and dot-truncate at a width that
-   * stops short of the switch so a longer future caption degrades to "…"
-   * instead of clipping under it. */
+  /* Mid-width panels (S3-LCD-2 240, S3-1.64 280): the icon at 20 px reads
+   * right (user-confirmed), text pulled in to x=46 to close the gutter. */
   lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);   // 12 on this tier (label is 16)
-  ui_label_single_line(nm);
   lv_obj_set_width(nm, LV_PCT(44));
   lv_obj_align(nm, LV_ALIGN_LEFT_MID, 46, 0);
 #else
+  /* Reference and round tiers: from x=60 to just before the switch (~76 px
+   * incl. its 16 px margin). 54% of the row clears the switch on the 300 px
+   * C2 column and the 362 px reference column alike. */
   lv_obj_set_style_text_font(nm, &FONT_LABEL, 0);
+  lv_obj_set_width(nm, LV_PCT(54));
   lv_obj_align(nm, LV_ALIGN_LEFT_MID, 60, 0);
 #endif
+  lv_label_set_long_mode(nm, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
   lv_label_set_text(nm, name);
+  /* Grow the card if the caption took more than one line, keeping the icon
+   * and the switch centred on the taller row. */
+  lv_obj_update_layout(nm);
+  {
+    int32_t th = lv_obj_get_height(nm);
+    if (th + 20 > 60) lv_obj_set_height(row, th + 20);
+  }
 
   lv_obj_t *sw = lv_switch_create(row);
   lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -16, 0);
@@ -380,6 +390,7 @@ static void app_gallery_on_close(void);  // frees the decoded thumbs/frames
 static void app_open_fitness(void);
 static void app_open_weather(void);
 static void app_open_sleep(void);
+static void app_open_heart(void);
 static void app_open_sleep_data(void);
 static void app_open_sleep_trends(void);
 static void app_open_sleep_night(void);
@@ -469,12 +480,15 @@ static const MenuItem MENU_ITEMS[] = {
   { "Gallery",       LV_SYMBOL_IMAGE,        0xFF6B2D, app_open_gallery },
 #endif
   { "About",         LV_SYMBOL_LIST,         0xFFFF80, app_open_about },
-#if BOARD_HAS_IMU_QMI8658
+#if BOARD_HAS_IMU
   /* Both are IMU-driven: Fitness is the hardware step counter, Sleep tracks
    * overnight movement. A board without a QMI8658 (e.g. the S3-1.47) would only
    * ever show 0 steps / never detect sleep, so omit the tiles entirely there. */
   { "Fitness",       LV_SYMBOL_LOOP,         0x32D74B, app_open_fitness, MDI_RUN_FAST },
   { "Sleep",         LV_SYMBOL_POWER,        0x9B8CFF, app_open_sleep, MDI_SLEEP },
+#endif
+#if BOARD_HAS_HR
+  { "Heart",         LV_SYMBOL_CHARGE,       0xFF453A, app_open_heart, MDI_HEART_PULSE },
 #endif
 };
 static const int MENU_ITEM_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
@@ -667,7 +681,7 @@ static void app_menu_init(void) {
   lv_obj_clear_flag(menu_scr, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *title = lv_label_create(menu_scr);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // SMALL ROUND face: the requested "move Apps up so the tiles don't have to
   // shrink so much". Two things buy that height back:
   //   - a 22 px title instead of the 28 px FONT_LABEL (~27 px line instead of ~34)
@@ -698,7 +712,7 @@ static void app_menu_init(void) {
   // Reserve a fixed strip at the very bottom for the page dots, and give the pager
   // the rest. The dots live in that strip — BELOW the pager — so they can never
   // overlap a tile, and the tiles get the full remaining height (no shrinking).
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // SMALL ROUND face: the reported bug was the bottom tile row sitting ON the page
   // dots and covering half the "< BOOT" hint. The old strip was 22 RAW px, which
   // reserved room for the dots ALONE and left the hint to overlap whatever was
@@ -725,7 +739,7 @@ static void app_menu_init(void) {
 #else
   const int qs_dots_strip = 22;                 // bottom strip height for the page dots
 #endif
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // Title is now ~27 px tall at y=UI_PX(4)=3, so it ends at ~30. Start the pager
   // just below it rather than at the generic UI_PX(40)=35 — on this panel the old
   // value both overlapped the 34 px title AND wasted the height the tiles need.
@@ -792,7 +806,7 @@ static void app_menu_init(void) {
   int tile_sz = (fit_w < fit_h) ? fit_w : fit_h;   // square side = the limiting axis
   if (tile_sz < 32) tile_sz = 32;
 
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // SMALL ROUND face: 96 is still the PREFERRED size (same look as the other round
   // boards), but cap it to what actually fits on BOTH axes. The generic round line
   // below caps to fit_w only, which is wrong here: on the 360 C2 fit_w is ~102 and
@@ -963,7 +977,7 @@ static void app_menu_init(void) {
   // Align AFTER the dots are added: the row is LV_SIZE_CONTENT, so its size is only
   // known once it has children. Aligning before (size 0) put it in the wrong place.
   // Anchor 8px BELOW the bottom edge, in the strip reserved below the pager.
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // Small round face: sit the dots in the reserved 44 px band, clear of BOTH the
   // last tile row above and the "< BOOT" hint below (see the band arithmetic at
   // qs_dots_strip). UI_PX(-46) = -40 on the C2 -> the 8 px row occupies y 312..320.
@@ -981,7 +995,7 @@ static void app_menu_init(void) {
   lv_obj_set_style_text_font(hint, &MENU_HINT_FONT, 0);
   lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
   lv_label_set_text(hint, LV_SYMBOL_LEFT " BOOT");
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // Small round face: the dots now own the band from UI_PX(-46) upward, so the hint
   // drops to UI_PX(-12) (= -10 on the C2, y 325..350). It still clears the bezel:
   // at y=340 the inscribed circle is ~164 px wide and "< BOOT" at 20 px is ~60 px.

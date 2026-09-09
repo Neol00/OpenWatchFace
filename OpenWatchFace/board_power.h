@@ -540,7 +540,7 @@ static bool     board_usb_powered(void)          { return board_vbus_in(); }
 static float    board_pmu_temp_c(void)           { return -273.0f; }
 #elif BOARD_PLATFORM_FOSSIL
 /* Fossil: the PMIC fuel gauge / charger, read over SPMI by the bare-metal
- * runtime (fossil-port pmic_fg.c — real on the Gen 6's PM660 FG-GEN3, honest
+ * runtime (snapdragon-port pmic_fg.c — real on the Gen 6's PM660 FG-GEN3, honest
  * -1 stubs on the Gen 4). The gauge runs autonomously with the profile the
  * stock OS programmed, so there is no begin()/config step: power_ok is simply
  * "does a SoC read answer sanely". No I2C involved — no bus lock needed. */
@@ -552,7 +552,7 @@ extern "C" int chg_usb_present(void);
 extern "C" int chg_charging(void);
 /* FG/CHARGER RE-ENABLED (2026-08-07) — VALIDATED ON HARDWARE. The 2026-08-03
  * disable ("plausible junk" + suspected TZ/XPU reset) predated the SPMI
- * arbiter v2 APID-table fix (fossil-port spmi_arb.c): reads through channel 0
+ * arbiter v2 APID-table fix (snapdragon-port spmi_arb.c): reads through channel 0
  * hit whatever peripheral was first in the arb table, which is exactly where
  * the junk came from. The pwr1 census re-test through the fixed arbiter read
  * soc=87 vb=4190 ib=-3 chg=0x45 usb=0x10 tbat=433 — every value plausible and
@@ -586,7 +586,13 @@ static uint16_t board_batt_voltage_mv(void)
 }
 static bool     board_vbus_in(void)
 {
-    return chg_usb_present() != 0;                   /* fail-safe: err = present */
+    /* WAS `!= 0`, which is true for the -1 ERROR return as well as for 1.
+     * chg_usb_present() returns -1 when every source failed (notably when the
+     * USB controller is not running, so OTGSC.BSV cannot be read), and the
+     * indicator therefore latched to "connected" on any read failure — the
+     * "it does not know when it is connected" report (C2, 2026-09-06).
+     * Unknown is not the same as present: report only a positive sense. */
+    return chg_usb_present() == 1;
 }
 static bool     board_usb_powered(void)          { return board_vbus_in(); }
 static uint16_t board_vbus_voltage_mv(void)
@@ -684,8 +690,13 @@ static bool     board_power_acks(void)           { return false; }
  * bare-metal msm8909 reset (platform/reboot_msm.c); it does not return.
  * Returns true because it DID issue the shutdown — the caller must NOT then
  * fall through to a deep-sleep path. */
-extern "C" void reboot_now(void);
-static bool     board_power_off(void)            { reboot_now(); return true; }
+/* UPDATE 2026-09-04: the PMIC PON block is driven directly now (platform/
+ * reboot_msm.c pon_reset_config), so "Power off" is a real PMIC SHUTDOWN
+ * (PON_POWER_OFF_SHUTDOWN 0x04, the kernel's do_msm_poweroff sequence): all
+ * rails off, wake by the power key or USB insertion, straight into aboot.
+ * Returns true because it DID issue the shutdown; it does not return. */
+extern "C" void poweroff_now(void);
+static bool     board_power_off(void)            { poweroff_now(); return true; }
 #else
 static bool     board_power_off(void)            { return false; }
 #endif

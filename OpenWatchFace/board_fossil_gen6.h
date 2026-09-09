@@ -2,10 +2,10 @@
  *  board_fossil_gen6.h — Fossil Gen 6 (hoki), BARE-METAL on one Cortex-A53 (AArch32)
  *
  *  Snapdragon Wear 4100+ (SDA429W / sdm429w), quad A53 booted as 32-bit ARM.
- *  Runs bare-metal on core 0 atop the fossil-port/baremetal runtime (FreeRTOS
+ *  Runs bare-metal on core 0 atop the snapdragon-port/baremetal runtime (FreeRTOS
  *  Cortex-A port + ported MSM drivers). This header describes only what the
  *  FIRMWARE needs to know about the Gen 6; SoC addresses live in
- *  fossil-port/baremetal/boards/fossil_gen6.h. See fossil-port/HARDWARE-GEN6.md.
+ *  snapdragon-port/baremetal/boards/fossil_gen6.h. See snapdragon-port/HARDWARE-GEN6.md.
  *
  *  Like the Gen 4 header (and the Maix port before it): every capability starts
  *  OFF so its module compiles to stubs, and each switches ON only when its
@@ -32,10 +32,10 @@
 
 /* ---- Platform flag: bare-metal Qualcomm MSM (no Arduino/ESP runtime) ------
  * Gates out ESP-only bring-up in the .ino exactly like BOARD_PLATFORM_MAIX /
- * _TUYA do; display/touch/tick come from the fossil-port runtime. */
+ * _TUYA do; display/touch/tick come from the snapdragon-port runtime. */
 #define BOARD_PLATFORM_FOSSIL 1
 
-/* ---- Display / touch: served by the fossil-port bare-metal drivers ---------
+/* ---- Display / touch: served by the snapdragon-port bare-metal drivers ---------
  * The Gen 6 display path is the continuous-splash framebuffer (fb_splash.c) for
  * now, not a from-scratch DSI driver — but from the FIRMWARE's side the panel is
  * still "an MSM display the runtime owns", so the same BOARD_DISPLAY_MSM_DSI gate
@@ -61,7 +61,13 @@
 #define BOARD_HAS_BACKLIGHT_PWM   0   /* AMOLED: brightness by panel command */
 #define BOARD_HAS_LP_STEPS        0
 #define BOARD_WAKE_USE_EXT0       0   /* wake = PMIC PON / RTC alarm (Phase 6) */
-#define BOARD_HAS_BLE             0   /* Phase 7: NimBLE host over HCI-on-SMD (WCNSS) */
+/* BLE is NOT on the WCNSS core on this watch (that assumption is what kept this
+ * at 0): the controller is a separate QCA WCN3990 on blsp2_uart2, so none of
+ * the WCNSS/TrustZone blockage applies. Powering it, downloading its firmware
+ * and the NimBLE H4 transport are all in place (platform/bt_wcn3990.c,
+ * platform/uart_bt.c, nimble_port/nimble_transport_uart.c), and BLEDevice::init
+ * brings the controller up on this board. 2026-09-06. */
+#define BOARD_HAS_BLE             1   /* NimBLE host over H4 UART (WCN3990) */
 #define BOARD_HAS_FFAT            1   /* eMMC userdata FFAT region (2026-08-04) */
 
 /* BLE TX-power ladder placeholder (same contract as the Gen 4 / Maix ports:
@@ -91,7 +97,7 @@
 /* ---- Boot-progress markers (bring-up only) --------------------------------
  * setup() is a long function and the watch has no console, so each marker sets
  * a distinct watchdog timeout; the time until the watch reboots names the last
- * marker reached. See fossil-port/baremetal/platform/msm_wdog.c for the table. */
+ * marker reached. See snapdragon-port/baremetal/platform/msm_wdog.c for the table. */
 #if defined(WDOG_TRACE)
 extern "C" void wdog_stage(unsigned stage);
 #define OWF_STAGE(n) wdog_stage(n)
@@ -105,9 +111,9 @@ extern "C" void fb_trace(uint32_t xrgb);
 #define OWF_VTRACE(c) fb_trace(c)
 #endif
 
-/* ---- Panel brightness: DCS 0x51 over the fossil-port DSI host --------------
+/* ---- Panel brightness: DCS 0x51 over the snapdragon-port DSI host --------------
  * The AUO AMOLED is qcom "bl_ctrl_dcs" — no PWM backlight exists. Implemented
- * in fossil-port/baremetal/platform/dsi_dcs.c; board_display_set_brightness()
+ * in snapdragon-port/baremetal/platform/dsi_dcs.c; board_display_set_brightness()
  * in the .ino routes here under BOARD_PLATFORM_FOSSIL. */
 extern "C" int dsi_dcs_set_brightness(unsigned char level);
 

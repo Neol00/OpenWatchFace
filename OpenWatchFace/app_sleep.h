@@ -245,8 +245,14 @@ static void slp_chart_add_yaxis(lv_obj_t *chart, long vmin, long vmax,
   }
 }
 
+/* Set by the swipe handler when a press on a row was a swipe (or a tap that only
+ * shut an open row): LVGL still sends CLICKED afterwards, and without this the
+ * night's detail screen would open every time you swiped. Cleared on the next press. */
+static bool slp_swipe_ate_click = false;
+
 /* A night row was tapped -> remember its start epoch + open the detail graph. */
 static void slp_night_row_cb(lv_event_t *e) {
+  if (slp_swipe_ate_click) { slp_swipe_ate_click = false; return; }
   slp_sel_start = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
   nav_open(app_open_sleep_night);
 }
@@ -275,6 +281,76 @@ static void slp_load_cancel(void) {
   if (slp_load_active) { sleep_rev_end(&slp_rev); slp_load_active = false; }
 }
 
+/* ---- Night rows: swipe left to reveal a delete button ----------------------
+ * A night is a SLOT holding two children: the red delete button pinned to the
+ * slot's right edge, and the opaque row card on top of it. Dragging the card left
+ * uncovers the button (nothing is drawn over a night until you swipe), and it
+ * snaps open or shut on release. The card only starts following the finger once
+ * the drag is clearly horizontal, so a vertical drag still scrolls the list.
+ * Same shape as the Heart history list (app_heart.h). */
+#define SLP_SWIPE_W    UI_PX(56)     // how far a card slides = delete button width
+#define SLP_SWIPE_MIN  UI_PX(8)      // movement before a drag commits to an axis
+#define SLP_ROW_H      UI_PX(56)
+
+static lv_obj_t  *slp_swipe_open = nullptr;   // the one row currently swiped open
+static lv_obj_t  *slp_drag_card  = nullptr;   // row tracking this press (null once it's the list's)
+static bool       slp_drag_horiz = false;
+static lv_point_t slp_drag_p0;
+static int32_t    slp_drag_x0    = 0;
+
+static void slp_swipe_close(lv_obj_t *card) {
+  if (!card) return;
+  lv_obj_set_x(card, 0);
+  if (slp_swipe_open == card) slp_swipe_open = nullptr;
+}
+
+static void slp_swipe_cb(lv_event_t *e) {
+  lv_obj_t *card = (lv_obj_t *)lv_event_get_target(e);
+  lv_event_code_t code = lv_event_get_code(e);
+  lv_indev_t *indev = lv_indev_active();
+  if (!indev) return;
+  lv_point_t p; lv_indev_get_point(indev, &p);
+
+  if (code == LV_EVENT_PRESSED) {
+    slp_drag_card = card; slp_drag_horiz = false; slp_swipe_ate_click = false;
+    slp_drag_p0 = p; slp_drag_x0 = lv_obj_get_x(card);
+  } else if (code == LV_EVENT_PRESSING) {
+    if (slp_drag_card != card) return;
+    int32_t dx = p.x - slp_drag_p0.x, dy = p.y - slp_drag_p0.y;
+    if (!slp_drag_horiz) {
+      if (LV_ABS(dy) > SLP_SWIPE_MIN && LV_ABS(dy) >= LV_ABS(dx)) { slp_drag_card = nullptr; return; }  // a scroll
+      if (LV_ABS(dx) < SLP_SWIPE_MIN) return;
+      slp_drag_horiz = true;
+      slp_swipe_ate_click = true;                 // this press is a swipe, not a tap
+      if (slp_swipe_open && slp_swipe_open != card) slp_swipe_close(slp_swipe_open);   // one open at a time
+    }
+    int32_t x = slp_drag_x0 + dx;
+    if (x > 0) x = 0;
+    if (x < -SLP_SWIPE_W) x = -SLP_SWIPE_W;
+    lv_obj_set_x(card, x);
+  } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    if (slp_drag_card != card) return;
+    slp_drag_card = nullptr;
+    if (!slp_drag_horiz) {
+      // A plain tap: on an OPEN row it just shuts it (and must not open the night).
+      if (slp_swipe_open == card) { slp_swipe_ate_click = true; slp_swipe_close(card); }
+      return;
+    }
+    slp_drag_horiz = false;
+    if (lv_obj_get_x(card) < -SLP_SWIPE_W / 2) { lv_obj_set_x(card, -SLP_SWIPE_W); slp_swipe_open = card; }
+    else                                        slp_swipe_close(card);
+  }
+}
+
+/* The revealed button: drop the whole night and rebuild the list in place (the
+ * same in-place rebuild the page arrows do — no extra step on the back stack). */
+static void slp_delete_night_cb(lv_event_t *e) {
+  uint32_t start = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+  slp_load_cancel();                    // the async loader holds the CSV open — close it first
+  sleep_delete_night(start);
+  app_open_sleep_data();
+}
+
 /* Build one list row for a night summary and append it to slp_list. */
 static void slp_add_night_row(const sleep_night_t *n) {
   if (slp_empty_lbl) { lv_obj_del(slp_empty_lbl); slp_empty_lbl = nullptr; }
@@ -285,10 +361,28 @@ static void slp_add_night_row(const sleep_night_t *n) {
   slp_fmt_date(n->end_epoch, dbuf, sizeof(dbuf));
   slp_fmt_dur(mins, durbuf, sizeof(durbuf));
 
-  lv_obj_t *row = lv_btn_create(slp_list);
-  lv_obj_set_width(row, LV_PCT(100));
-  lv_obj_set_height(row, LV_SIZE_CONTENT);
-  lv_obj_set_style_min_height(row, UI_PX(56), 0);
+  lv_obj_t *slot = lv_obj_create(slp_list);
+  lv_obj_remove_style_all(slot);
+  lv_obj_set_size(slot, LV_PCT(100), SLP_ROW_H);
+  lv_obj_clear_flag(slot, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+
+  lv_obj_t *del = lv_btn_create(slot);
+  lv_obj_set_size(del, SLP_SWIPE_W, LV_PCT(100));
+  lv_obj_align(del, LV_ALIGN_RIGHT_MID, 0, 0);
+  lv_obj_set_style_radius(del, UI_PX(12), 0);
+  lv_obj_set_style_shadow_width(del, 0, 0);
+  lv_obj_set_style_bg_color(del, lv_color_hex(0x3A2020), 0);
+  lv_obj_add_event_cb(del, slp_delete_night_cb, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)n->start_epoch);
+  lv_obj_t *dell = lv_label_create(del);
+  lv_obj_set_style_text_font(dell, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(dell, lv_color_hex(0xFF8888), 0);
+  lv_label_set_text(dell, LV_SYMBOL_TRASH);
+  lv_obj_center(dell);
+
+  lv_obj_t *row = lv_btn_create(slot);          // the card that slides
+  lv_obj_set_size(row, LV_PCT(100), SLP_ROW_H);
+  lv_obj_align(row, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_set_style_radius(row, UI_PX(12), 0);
   lv_obj_set_style_shadow_width(row, 0, 0);
   lv_obj_set_style_bg_color(row, lv_color_hex(0x1A1A1A), 0);
@@ -296,6 +390,7 @@ static void slp_add_night_row(const sleep_night_t *n) {
   lv_obj_set_style_pad_ver(row, UI_PX(8), 0);
   lv_obj_add_event_cb(row, slp_night_row_cb, LV_EVENT_CLICKED,
                       (void *)(uintptr_t)n->start_epoch);
+  lv_obj_add_event_cb(row, slp_swipe_cb, LV_EVENT_ALL, nullptr);
 
   // Left: date (top) + duration (below, dim).
   lv_obj_t *date = lv_label_create(row);
@@ -408,6 +503,8 @@ static void slp_data_cleanup_cb(lv_event_t *e) {
   (void)e;
   slp_load_cancel();              // tear down the timer + open file if we leave mid-load
   slp_list = slp_empty_lbl = slp_pnum_lbl = slp_next_btn = nullptr;
+  slp_swipe_open = slp_drag_card = nullptr;   // the cards go with the screen
+  slp_drag_horiz = slp_swipe_ate_click = false;
 }
 
 /* ---- the full, paged history list (all nights, newest first) ----
@@ -417,6 +514,8 @@ static void app_open_sleep_data(void) {
   slp_load_cancel();             // cancel any prior in-flight load (e.g. page flip)
   app_screen_begin("Sleep data");
   slp_empty_lbl = slp_pnum_lbl = slp_next_btn = nullptr;
+  slp_swipe_open = slp_drag_card = nullptr;
+  slp_drag_horiz = slp_swipe_ate_click = false;
 
   int top = BOARD_SCREEN_NARROW ? UI_PX(96) : UI_PX(76);
 

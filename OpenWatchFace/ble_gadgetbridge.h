@@ -124,7 +124,7 @@ static void gb_handle_notify(const String &js) {
 
   store_lock();
   bool added = notif_store_add(id, title.c_str(), body.c_str(), cat);
-  if (added && na_available()) na_append(id, title.c_str(), body.c_str(), cat);
+  if (added && na_available()) { na_backfill_from_cache(); na_append(id, title.c_str(), body.c_str(), cat); }
   if (added) {
     notif_store_save();
     s_pop_id = id;

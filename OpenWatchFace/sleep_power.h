@@ -585,6 +585,9 @@ static void enter_deep_sleep(void) {
     bool     timer_due_wake = timer_is_active() && !timer_is_paused();
     uint32_t almc_in        = almclk_seconds_until();   // 0 = no alarm clock armed
     uint64_t check_s = s_checks_enabled ? (uint64_t)s_check_interval_min * 60ULL : UINT64_MAX;
+    // A sleep-tracking session needs its dark wakes even with checks off / a long interval:
+    // each one logs a movement row, so cap the span at 10 minutes while tracking.
+    if (sleep_track_active() && check_s > 600ULL) check_s = 600ULL;
     uint64_t timer_s = timer_due_wake   ? (uint64_t)timer_remaining_s()          : UINT64_MAX;
     uint64_t almc_s  = almc_in          ? (uint64_t)almc_in                      : UINT64_MAX;
     uint64_t soonest = check_s;
@@ -646,6 +649,62 @@ static void enter_deep_sleep(void) {
   // it itself or BLE stays down until manually toggled (bonded iPhone can't reconnect,
   // paired list reads empty). WiFi reconnects lazily on demand as everywhere else.
   ble_apply_enabled();
+  USBSerial.println("[power] resume complete -> back to loop");
+  USBSerial.flush();
+  return;
+#elif BOARD_PLATFORM_FOSSIL
+  // Fossil bare-metal: SUSPEND semantics like the T5 (blocked in place, resumes on a
+  // button, never reboots). Periodic checks are DARK (2026-09-03): a timer wake returns
+  // with the panel still off, the check runs, and only a NEW notification (or a due
+  // alarm / countdown, or a button) turns into a full wake. Same on a charger: a forced
+  // sleep stays dark through its checks. BLE is down for the whole span, so ANCS items
+  // are not fetched by dark checks — server notifications only.
+  ble_end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  for (;;) {
+    bool     timer_due_wake = timer_is_active() && !timer_is_paused();
+    uint32_t almc_in        = almclk_seconds_until();
+    uint64_t check_s = s_checks_enabled ? (uint64_t)s_check_interval_min * 60ULL : UINT64_MAX;
+    uint64_t timer_s = timer_due_wake   ? (uint64_t)timer_remaining_s()          : UINT64_MAX;
+    uint64_t almc_s  = almc_in          ? (uint64_t)almc_in                      : UINT64_MAX;
+    uint64_t soonest = check_s;
+    if (timer_s < soonest) soonest = timer_s;
+    if (almc_s  < soonest) soonest = almc_s;
+    uint32_t wake_s = 0;
+    if (soonest != UINT64_MAX) wake_s = (soonest < 1) ? 1 : (uint32_t)soonest;
+    USBSerial.printf("[sleep] suspend, %s wake in %lus\n", wake_s ? "timer" : "button-only", (unsigned long)wake_s);
+    USBSerial.flush();
+
+    if (owf_fossil_suspend_sleep(wake_s)) break;        // button press -> full wake
+    if (soonest == UINT64_MAX) continue;                // spurious: no deadline was armed
+    if (timer_s == soonest || almc_s == soonest) break; // alarm / countdown -> full wake
+
+    // Background notification check with the screen off.
+    if (sleep_track_active()) sleep_track_log_wake((uint32_t)rtc_now_epoch());
+    String title, body; uint64_t maxId = 0;
+    int count = notif_fetch_raw(title, body, maxId);    // connects WiFi itself
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    bool fresh = (count > 0 && maxId > rtc_last_notif_id);
+    if (fresh) rtc_last_notif_id = maxId;
+    if (fresh && !sleep_track_active()) {
+      pending_notif = true;                             // newest stashed in s_pop_* by the fetch
+      break;                                            // -> full wake + pop the card in loop()
+    }
+    USBSerial.println("[check] nothing to show; re-suspending");
+  }
+  USBSerial.println("[power] suspend wake -> relight");
+  USBSerial.flush();
+  // Wake on the DIAL, like the ESP32 boards. Theirs is a cold boot into setup();
+  // this resume-in-place path would otherwise relight whatever screen was open
+  // when the watch went to sleep. Close it before the panel comes back so the
+  // clock face is the first thing drawn (2026-09-06, user request).
+  app_menu_close();
+  owf_fossil_display_wake();
+  settings_apply_brightness(s_brightness);
+  ble_apply_enabled();                    // resume-in-place: bring BLE back ourselves
   USBSerial.println("[power] resume complete -> back to loop");
   USBSerial.flush();
   return;

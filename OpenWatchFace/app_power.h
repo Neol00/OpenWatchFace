@@ -37,7 +37,7 @@
 #define PM_HAS_PMU  (BOARD_HAS_PMU_AXP2101 || BOARD_PLATFORM_MAIX || BOARD_PLATFORM_FOSSIL)
 
 #if BOARD_PLATFORM_FOSSIL
-/* fossil-port pwr_diag.c — real SoC readings (linkage spec must be at file
+/* snapdragon-port pwr_diag.c — real SoC readings (linkage spec must be at file
  * scope, so they live here rather than in the CORE & CLOCK block). */
 extern "C" int pwr_cpu_mhz(void);
 extern "C" int pwr_soc_temp_dc(void);
@@ -287,7 +287,9 @@ static void pm_update_graphs(void) {
 #if BOARD_PLATFORM_FOSSIL
   // Fossil: plot the FG's MEASURED current when discharging (see the labels
   // block for why charging falls back to the model).
-  { int iba = fg_batt_ma(); if (iba != -32768 && iba > 0) ma = (uint16_t)iba; }
+  { int iba = fg_batt_ma();
+    if (iba != -32768) ma = (uint16_t)(iba > 0 ? iba : -iba);   /* C2: STC3117 cell current, sign folded */
+  }
 #endif
   if (pm_g_draw.ser) {
     lv_chart_set_next_value(pm_g_draw.chart, pm_g_draw.ser, ma);
@@ -391,6 +393,14 @@ static void pm_update_labels(void) {
         "Draw:    %d mA  (measured)\n"
         "Power:   %u.%02u W  (measured)",
         fossil_ib, (unsigned)(fmw / 1000), (unsigned)((fmw % 1000) / 10));
+  } else if (fossil_ib != -32768) {
+    /* On a cable the gauge sees the NET cell current (charger minus load), so
+     * the load itself cannot be measured; show the real charge current and the
+     * modelled draw side by side instead of hiding the measurement. */
+    m = snprintf(pb, sizeof(pb),
+        "Charge:  %d mA  (measured, into cell)\n"
+        "Draw:    %u mA  (model, on cable)",
+        -fossil_ib, ma);
   } else
 #endif
   if (calib_get_k_samples() > 0) {
@@ -758,7 +768,7 @@ enum { PM_CONFIRM_POWER_OFF = 0, PM_CONFIRM_FASTBOOT = 1 };
 static int pm_confirm_kind = PM_CONFIRM_POWER_OFF;
 
 #if BOARD_PLATFORM_FOSSIL
-/* fossil-port/baremetal/platform/reboot_msm.c. Configures the PMIC for a warm
+/* snapdragon-port/baremetal/platform/reboot_msm.c. Configures the PMIC for a warm
  * reset, stores the bootloader restart reason in both the PMIC's SOFT_RB_SPARE
  * and the IMEM cookie, then drops PS_HOLD. Does not return. */
 extern "C" void reboot_to_bootloader(void);
@@ -801,6 +811,8 @@ static void pm_off_btn_cb(lv_event_t *e) {
   lv_obj_t *card = lv_obj_create(pm_off_box);
 #if BOARD_SCREEN_NARROW
   lv_obj_set_size(card, LV_PCT(90), UI_PX(360));
+#elif BOARD_SCREEN_ROUND_SMALL
+  lv_obj_set_size(card, LV_PCT(90), UI_PX(300));   // UI_PX(360) was wider than the 360 px glass
 #else
   lv_obj_set_size(card, UI_PX(360), UI_PX(300));   // taller so the wrapped prompt clears the buttons
 #endif
@@ -934,7 +946,11 @@ static void app_open_power(void) {
 
   // ---- POWER (draw is a model — shown on every board) ----
   pm_header(col, "POWER");
+#if defined(BOARD_TICWATCH_C2)
+  pm_make_graph(col, "Draw  (measured mA)", 0, 400, &pm_g_draw);   /* STC3117 coulomb counter on QUP4 */
+#else
   pm_make_graph(col, "Draw  (model mA)", 0, 400, &pm_g_draw);
+#endif
   pm_power_lbl = pm_line(col, &FONT_SMALL, PM_VAL, "");
 
   // ---- CPU (per-core usage) ----
@@ -1261,7 +1277,7 @@ static void app_open_power(void) {
   // build that can never be replaced.
   //
   // It is deliberately NOT behind a build flag, unlike the boot-time recovery
-  // gate (fossil-port/baremetal/platform/recovery_gate.c, -DRECOVERY_GATE):
+  // gate (snapdragon-port/baremetal/platform/recovery_gate.c, -DRECOVERY_GATE):
   // that gate is a bring-up convenience, this is the escape hatch, and an
   // escape hatch you can forget to compile in is not one.
   lv_obj_t *fbrow = lv_obj_create(col);

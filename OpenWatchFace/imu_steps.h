@@ -778,6 +778,126 @@ static inline uint32_t imu_sleep_events(void)  { return 0; }
 static inline uint32_t imu_sleep_samples(void) { return 0; }
 #endif
 
+#elif BOARD_HAS_IMU_LSM6DS3
+#include <math.h>
+/* ---- ST LSM6DS3 (Fossil Gen 4 / TicWatch C2, msm8909w) -----------------------------
+ * Same API on top of the platform driver (snapdragon-port/baremetal/platform/imu_lsm6ds3.c,
+ * bit-banged SPI on gpio8-11). The chip's OWN pedometer does the detection, so there is no
+ * software detector, no sample loop and no I2C lock: imu_steps_tick() just folds the 16-bit
+ * hardware counter into the 32-bit total once a second. The counter keeps running while the
+ * AP is suspended, so steps taken during deep sleep are picked up at the next fold. Sleep
+ * tracking (movement sessions) is not implemented on this part: the sleep_* calls are stubs. */
+extern "C" {
+int      lsm6ds3_init(void);
+int      lsm6ds3_present(void);
+void     lsm6ds3_steps_start(void);
+void     lsm6ds3_accel_on(void);
+void     lsm6ds3_stop(void);
+uint32_t lsm6ds3_steps_poll(void);
+uint32_t lsm6ds3_steps_total(void);
+void     lsm6ds3_steps_set_total(uint32_t t);
+int      lsm6ds3_accel_read(int16_t xyz[3]);
+}
+static bool     s_imu_ok = false, s_imu_running = false, s_sleep_running = false;
+static uint32_t s_nvs_last_saved = 0, s_nvs_last_save_ms = 0;
+#define STEP_NVS_MIN_SAVE_MS  60000UL
+
+static inline bool imu_steps_begin(void) {
+  if (s_imu_ok) return true;
+  s_imu_ok = lsm6ds3_init() != 0;
+  return s_imu_ok;
+}
+static inline bool     imu_steps_available(void)  { return s_imu_ok; }
+static inline bool     imu_steps_running(void)    { return s_imu_running; }
+static inline bool     imu_sleep_running(void)    { return s_sleep_running; }
+static inline uint32_t imu_steps_count(void)      { return lsm6ds3_steps_total(); }
+static inline void     imu_steps_reset(void)      { lsm6ds3_steps_set_total(0); }
+static inline bool imu_steps_start(void) {
+  if (!s_imu_ok) return false;
+  lsm6ds3_steps_start();
+  s_imu_running = true;
+  USBSerial.println("[imu] step start: LSM6DS3 pedometer ON");
+  return true;
+}
+static inline void imu_steps_stop(void) {
+  if (!s_imu_ok) return;
+  lsm6ds3_steps_poll();                  // fold the last steps before the counter is dropped
+  lsm6ds3_stop();
+  s_imu_running = false;
+  USBSerial.println("[imu] step stop: LSM6DS3 pedometer OFF");
+}
+static inline void imu_steps_full_reset(void) {
+  if (!s_imu_ok) return;
+  lsm6ds3_steps_set_total(0);
+  if (s_imu_running) lsm6ds3_steps_start();   // also zeroes the hardware register
+}
+/* Sleep-tracking session: accel only. Movement is measured by a short burst read on every
+ * dark periodic wake (sleep_track_log_wake's fallback path via imu_read_accel_dev); the chip
+ * stays powered through the suspend so the burst sees live data immediately. */
+static inline bool imu_sleep_start(void) {
+  if (!s_imu_ok) return false;
+  lsm6ds3_accel_on();
+  s_sleep_running = true;
+  USBSerial.println("[imu] sleep start: LSM6DS3 accel ON");
+  return true;
+}
+static inline void imu_sleep_stop(void) {
+  if (!s_imu_ok) return;
+  lsm6ds3_stop();
+  s_sleep_running = false;
+  USBSerial.println("[imu] sleep stop: LSM6DS3 accel OFF");
+}
+static inline int      imu_steps_sample(void)     { return 0; }
+static inline int imu_read_accel_dev(void) {
+  int16_t a[3];
+  if (!s_imu_ok || lsm6ds3_accel_read(a) != 0) return 0;
+  static float s_grav = 16384.0f;      // slow-tracked gravity, 1 g = 16384 LSB at 2 g
+  float mag = sqrtf((float)a[0]*a[0] + (float)a[1]*a[1] + (float)a[2]*a[2]);
+  s_grav += (mag - s_grav) * 0.05f;
+  return (int)fabsf(mag - s_grav);
+}
+static inline void imu_steps_tick(uint32_t now_ms) {
+  static uint32_t s_last = 0;
+  if (!s_imu_ok || !s_imu_running) return;
+  if (now_ms - s_last < 1000) return;
+  s_last = now_ms;
+  lsm6ds3_steps_poll();
+}
+static inline void imu_steps_set_total(uint32_t nvs_val) {
+  if (nvs_val > lsm6ds3_steps_total()) lsm6ds3_steps_set_total(nvs_val);
+  s_nvs_last_saved = lsm6ds3_steps_total();
+}
+static inline void imu_steps_restore_running(bool was_running) {
+  if (s_imu_ok && was_running && !s_imu_running) {
+    imu_steps_start();
+    USBSerial.println("[imu] step counting RESUMED from NVS state after boot");
+  }
+}
+static inline void imu_sleep_restore_running(bool was_running) {
+  if (s_imu_ok && was_running && !s_sleep_running) imu_sleep_start();
+}
+static inline bool imu_steps_save_due(uint32_t now_ms) {
+  if (lsm6ds3_steps_total() == s_nvs_last_saved) return false;
+  return now_ms - s_nvs_last_save_ms >= STEP_NVS_MIN_SAVE_MS;
+}
+static inline void imu_steps_mark_saved(uint32_t now_ms) {
+  s_nvs_last_saved = lsm6ds3_steps_total(); s_nvs_last_save_ms = now_ms;
+}
+static inline bool     imu_steps_ulp_wanted(void) { return false; }
+static inline bool     imu_sleep_ulp_wanted(void) { return false; }
+static inline bool     imu_steps_ulp_arm(void)    { return false; }
+static inline bool     imu_sleep_ulp_arm(void)    { return false; }
+/* On every wake fold in what the chip counted while the AP slept. */
+static inline void     imu_steps_ulp_collect(void){ if (s_imu_ok && s_imu_running) lsm6ds3_steps_poll(); }
+static inline void     imu_sleep_ulp_collect(void){}
+/* Before suspend: a running pedometer or sleep session stays ON (it counts through the sleep); otherwise
+ * make sure the accel is powered down. */
+static inline void     imu_ensure_off_for_sleep(void) { if (s_imu_ok && !s_imu_running && !s_sleep_running) lsm6ds3_stop(); }
+static inline uint32_t imu_sleep_accum(void)   { return 0; }
+static inline uint32_t imu_sleep_peak(void)    { return 0; }
+static inline uint32_t imu_sleep_events(void)  { return 0; }
+static inline uint32_t imu_sleep_samples(void) { return 0; }
+
 #else  /* no IMU on this board — harmless stubs */
 
 static inline bool     imu_steps_begin(void)      { return false; }

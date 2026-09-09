@@ -303,7 +303,8 @@ static void app_open_notifications(void) {
   // 32). Without a card we read the flash store (always a single page). na_load_view
   // touches the card, so do it under the lock that serializes with the core-0 appender.
   store_lock();
-  s_notif_src = na_available() ? NSRC_SD : NSRC_FLASH;
+  na_backfill_from_cache();            // archive mounted late (Fossil): carry the cache over first
+  s_notif_src = na_is_source() ? NSRC_SD : NSRC_FLASH;
   uint16_t pages = 1;
   if (s_notif_src == NSRC_SD) {
     na_load_view(s_notif_page);          // sets s_na_total/s_na_unread; loads this page

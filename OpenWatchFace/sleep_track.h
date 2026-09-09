@@ -518,6 +518,50 @@ static bool sleep_night_summary(uint32_t start_epoch, sleep_night_t *out) {
   return in;
 }
 
+/* Delete ONE night — every row of the night that begins exactly at `start_epoch`,
+ * using the same "in the night until a gap > SLEEP_NIGHT_GAP_S" rule as the readers
+ * above. Streams the canonical CSV into a temp file, drops that night's rows and
+ * swaps the files, so the history never has to fit in RAM. Rows are re-emitted
+ * byte-for-byte (sleep_parse_row doesn't write to the buffer). Returns true if the
+ * night was found. Callers rebuild their screen afterwards. */
+#define SLEEP_CSV_TMP_PATH  "/sleep.tmp"
+static bool sleep_delete_night(uint32_t start_epoch) {
+  if (!store_available() || !store_fs().exists(SLEEP_CSV_PATH)) return false;
+  File in = store_fs().open(SLEEP_CSV_PATH, FILE_READ);
+  if (!in) return false;
+  store_fs().remove(SLEEP_CSV_TMP_PATH);
+  File out = store_fs().open(SLEEP_CSV_TMP_PATH, FILE_WRITE);
+  if (!out) { in.close(); return false; }
+  bool in_night = false, done = false, removed = false;
+  uint32_t prev = 0, dropped = 0;
+  char line[96];
+  while (in.available()) {
+    int len = in.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (len <= 0) continue; line[len] = '\0';
+    uint32_t e, a, p, ev, s;
+    bool ok = sleep_parse_row(line, &e, &a, &p, &ev, &s);
+    if (ok && !done) {
+      if (!in_night) {
+        if (e == start_epoch) { in_night = removed = true; prev = e; dropped++; continue; }
+      } else if (e <= prev + SLEEP_NIGHT_GAP_S) {
+        prev = e; dropped++; continue;            // still inside the night -> drop
+      } else {
+        in_night = false; done = true;            // gap -> the night ended here
+      }
+    }
+    out.write((const uint8_t *)line, len);
+    out.write((uint8_t)'\n');
+  }
+  in.close();
+  out.close();
+  if (!removed) { store_fs().remove(SLEEP_CSV_TMP_PATH); return false; }
+  store_fs().remove(SLEEP_CSV_PATH);
+  store_fs().rename(SLEEP_CSV_TMP_PATH, SLEEP_CSV_PATH);
+  USBSerial.printf("[sleep] deleted night start=%lu (%lu rows)\n",
+                   (unsigned long)start_epoch, (unsigned long)dropped);
+  return true;
+}
+
 /* Counting callback (first pass) + bucketing callback (second pass) for the detail graph. */
 static void sleep_count_cb(uint32_t accum, void *ud) { (void)accum; (*(uint32_t *)ud)++; }
 typedef struct { uint32_t bucket, bsum, bn; } sleep_bucket_t;

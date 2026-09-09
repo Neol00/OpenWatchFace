@@ -206,8 +206,14 @@ All of these are compile-time and live in the sketch folder.
 - **Even-aligned draw areas.** The CO5300 requires them (`BOARD_LCD_EVEN_ALIGN 1`),
   handled by an LVGL rounder callback, nothing to configure.
 - **Extended NVS.** The firmware's Preferences live in the 1 MB `nvsext` partition
-  (app1's old slot there is no OTA on this watch), not the 20 KB head `nvs`, which
-  stays for WiFi PHY/cal and NimBLE bonds.
+  (between the two app slots), not the 20 KB head `nvs`, which stays for WiFi
+  PHY/cal and NimBLE bonds.
+- **Over-the-air updates.** The 32 MB table has two 4 MB app slots, so once this
+  firmware is on the watch, later versions install from **WiFi & BLE → Check for
+  updates → Install update** with no cable: the image is written to the idle
+  slot, checked against the size and SHA-256 in the manifest, and only then
+  made bootable. How releases feed that is in the
+  [README](../../README.md#software-updates-over-the-air).
 - **Cold-panel bring-up.** When the display rails are cut in deep sleep, `LCD_RESET` is
   held low across the supply ramp before the panel init runs, otherwise the AMOLED can
   power up into a bad state and stay black. Handled automatically.

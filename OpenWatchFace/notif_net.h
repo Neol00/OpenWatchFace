@@ -367,6 +367,7 @@ static int notif_fetch_raw(String &outTitle, String &outBody, uint64_t &maxId) {
       // Only if BOTH the card and FFat fail to mount do we degrade to flash-only.
       bool accepted;
       if (na_available()) {
+        na_backfill_from_cache();                                  // archive mounted late (Fossil)
         accepted = na_append(id, t.c_str(), b.c_str(), cat);       // SD or FFat: full history
         // Mirror into the NVS cache too. It de-dups by id and drops when full
         // (the newest 32), so this is a no-op past the cap — exactly the cache we want.

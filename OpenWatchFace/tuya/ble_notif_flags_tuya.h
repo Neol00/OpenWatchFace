@@ -33,6 +33,10 @@ static volatile uint32_t s_ancs_added_total = 0;       // monotonic add counter 
 /* Loop polls these once per iteration (LVGL-thread safe). */
 static bool ancs_take_ui_dirty(void) { if (!s_ancs_ui_dirty) return false; s_ancs_ui_dirty = false; return true; }
 static bool ancs_take_removed(void)  { if (!s_ancs_removed)  return false; s_ancs_removed  = false; return true; }
+/* Current Time Service client (ble_cts.h) — inert on this build (no CTS link). */
+static inline void cts_poll(void) {}
+static inline bool cts_take_dirty(void) { return false; }
+static inline bool cts_synced(void) { return false; }
 
 /* Live incoming-call accessors - inert in Phase A (no ANCS, so no live call). */
 #ifndef BLE_TUYA_HAVE_ANCS

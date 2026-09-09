@@ -187,7 +187,11 @@ static void app_open_appearance(void) {
 
   // Swatch grid: a wrapping row of circular color buttons.
   lv_obj_t *grid = lv_obj_create(col);
-  lv_obj_set_width(grid, LV_PCT(100));
+  /* EXPLICIT pixel width: a ROW_WRAP child with content height sized by LV_PCT
+   * never gets a real wrap boundary in LVGL, so on the 360 px C2 four 68 px
+   * swatches marched off the right edge and made the screen side-scroll. Same
+   * fix the Power app's CPU-speed ladder carries. */
+  lv_obj_set_width(grid, ui_app_column_content_w());
   lv_obj_set_height(grid, LV_SIZE_CONTENT);
   lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(grid, 0, 0);

@@ -2,14 +2,14 @@
 
 | | |
 |---|---|
-| SoC | Qualcomm **APQ8009W** (Snapdragon Wear 2100) single Cortex-A7, run bare-metal in AArch32 |
+| SoC | Qualcomm **APQ8009W** (Snapdragon Wear 2100) quad Cortex-A7, run bare-metal in AArch32. Cores 0 and 1 run the firmware (core 1 renders frame pushes, a big win on this 454×454 panel); cores 2 and 3 stay off. Deep sleep = full cluster power collapse + RPM XO shutdown, ~6 mA measured |
 | Display | 454×454 AUO AMOLED, MSM DSI **command mode** (MDP3 DMA_P pipe takeover) |
 | Touch | Raydium RM_TS (I²C, BLSP1 QUP5 @ `0x39`) |
 | Crown | **PixArt PAT9126 optical rotation sensor** (I²C @ `0x75`) scroll + quick-shade |
 | RTC | PM8916 PMIC RTC (battery-backed, read over SPMI) |
 | IMU | QMI8658 **not detected on this unit**, step counting disabled |
 | Power | PM8916 PMIC over SPMI (fuel gauge, charger, button, vibrator) |
-| Storage | **None yet.** Settings live for one session only |
+| Storage | **Ported from the Gen 6 (2026-08-30), untested on this watch.** eMMC via sdhci-msm, NVS (Preferences) + FFat + log file inside the `userdata` partition. First boot creates the superblock and formats a FAT32 volume there — Wear OS `/data` is overwritten from then on |
 | Toolchain | **Bare-metal + FreeRTOS** no Arduino IDE |
 | Status | **Working** display, touch, crown, vibration, USB log console |
 
@@ -109,20 +109,20 @@ and skip to [Part 2 Flashing](#part-2--flashing).
 | ARM toolchain | `arm-none-eabi-gcc` on your `PATH` (Arm GNU 14.2.Rel1 in use) |
 | Python3 | used by the image packer |
 | LVGL | this repo's `libraries/lvgl` (auto-detected), or `~/Arduino/libraries/lvgl` |
-| DTB | `fossil-port/firefish-stock.dtb` **in this repo, nothing to dump** |
+| DTB | `snapdragon-port/firefish-stock.dtb` **in this repo, nothing to dump** |
 
 #### Build
 
 Two commands, and the second one's DTB argument is **not** optional:
 
 ```sh
-cd fossil-port/baremetal
+cd snapdragon-port/baremetal
 
 # 1. compile + link
-CFLAGS_EXTRA="-DWDOG_TRACE" sh build-owf-image-gen4.sh
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN" sh build-owf-image-gen4.sh
 
 # 2. pack into an Android boot image, WITH the stock DTB appended
-sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../firefish-stock.dtb
+sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../dtbs/firefish-stock.dtb
 
 ls build/gen4/       # result: build/gen4/owf-boot.img
 ```
@@ -141,11 +141,12 @@ ls build/gen4/       # result: build/gen4/owf-boot.img
 > `wdog_pet()` into the main loop. Without it the watch warm-resets into Wear OS
 > a few seconds into every boot which looks exactly like "the image never ran".
 
-> **Unlike the Gen 6, a plain build works.** There is no known-issue flag
-> cocktail here: `-DWDOG_TRACE` is the only flag you actually need, and the
-> diagnostics are all optional.
+> **The flag set above is the release set.** `-DWDOG_TRACE` alone still boots
+> and runs, but sleeps at ~45 mA with the core merely clock-gated; the five
+> sleep flags are what turn that into the ~6 mA cluster collapse. They are
+> explained one by one under [Build flags](#build-flags).
 
-Full build reference: [`fossil-port/BUILD-GEN4.md`](../../fossil-port/BUILD-GEN4.md).
+Full build reference: [`snapdragon-port/BUILD-GEN4.md`](../../snapdragon-port/BUILD-GEN4.md).
 
 ---
 
@@ -272,14 +273,39 @@ Feel is tuned by two knobs in
 `CROWN_SCROLL_PX_PER_CNT` (pixels of scroll per sensor count) and
 `CROWN_SHADE_OPEN_CNT` (how much of a roll opens the shade). The driver-side
 facts axis and I²C address live in
-[`fossil-port/baremetal/boards/fossil_gen4.h`](../../fossil-port/baremetal/boards/fossil_gen4.h).
+[`snapdragon-port/baremetal/boards/fossil_gen4.h`](../../snapdragon-port/baremetal/boards/fossil_gen4.h).
 
 ### First run
 
 - **Set the clock** manually, or from WiFi once that exists.
-- **Settings do not persist.** Storage is stubbed on this watch, so
-  brightness, accent colour, alarms and notification history live for one
-  session only. This is the largest missing subsystem.
+- **Storage leaves Wear OS alone.** Since v87 the firmware checks `userdata`
+  before claiming it. If it still holds a Wear OS volume (ext4, f2fs, or an
+  encrypted volume with its crypto footer), storage stays **read-only for that
+  boot**: settings live in RAM only, nothing is written, and the log says
+  `storage: userdata holds ... (Wear OS) - NOT touching it`. That is what you
+  want for a RAM boot. For a real install, erase the partition once and the
+  next boot creates the firmware's own volume:
+
+  ```sh
+  fastboot erase userdata
+  ```
+- **Settings persist** once `userdata` has been erased: NVS for Preferences,
+  an FFat volume and `/owf-log.txt`, all inside `userdata`. The ramlog line
+  `storage: userdata @...` (USB console) or the Files app is the check.
+- **Deep sleep is the real thing since v199.** Pressing nothing for two
+  minutes (or a double tap on the pusher) collapses the whole CPU cluster through
+  the SoC's SAW sequence and TrustZone, the RPM applies the sleep set and enters
+  XO shutdown, and the watch wakes on the button or the PMIC RTC alarm. Measured
+  on the C2 with the STC3117 coulomb counter: **about 6 mA average** asleep
+  (4.20 V to 4.16 V over a three-hour sleep), the same range as stock Wear OS
+  idling with its screen off. The wake log prints
+  `rpm-masters[post-resume] APSS shutdowns=N xo=N` as proof the RPM took part
+  and, on the C2/S2, `sleep-gauge: soc a -> b over N s = avg X mA`. USB
+  re-enumerates after a wake; the display comes back on the button.
+- **HTTPS works (mbedTLS, SoC hardware RNG).** Weather and NTP use plain
+  HTTP/UDP; the over-the-air update path is HTTPS to GitHub and is confirmed
+  end to end since 1.5.0: check, download with resume, SHA-256 verify, write
+  to `boot`, reboot.
 
 ---
 
@@ -287,6 +313,25 @@ facts axis and I²C address live in
 
 Only relevant if you are building yourself. Everything is **silent by default**;
 failures always print.
+
+### Recommended (what the release images are built with)
+
+```
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN"
+```
+
+| Flag | What it does |
+|---|---|
+| `-DWDOG_TRACE` | Pets the APPS watchdog from the main loop. **Load-bearing**: without it the watch warm-resets a few seconds into every boot. |
+| `-DSLEEP_NO_WDOG` | Deep sleep is one uninterrupted collapse until the button or the RTC alarm, with the watchdog stopped for its duration. Without it the sleep is chopped into 15 s chunks to pet the dog, each one a full wake. |
+| `-DSYS_PC_8909` | The **system power collapse**: L2/cluster off through the SAW sequence, TrustZone warm boot, RPM sleep set. This is the whole difference between ~45 mA and ~6 mA asleep. |
+| `-DSYS_PC_STAGE=6` | The cluster level to use: 6 = the kernel's `l2-pc` (RPM handshake, sleep set applied). 7 = `l2-gdhs` (cluster off, no RPM handshake, ~37 mA) is the fallback if 6 ever misbehaves on a unit. |
+| `-DL2_SAW_AP_ENABLE` | Leaves the L2 SAW in its retention mode while awake, as the shipped kernel does between sleeps. Saves a few mA of awake-idle current. |
+| `-DSYS_PC_XO_SHUTDOWN` | Drops the crystal vote from the sleep set so the RPM can enter XO shutdown / Vdd-min. Measured on the C2: 37 mA without it, **about 6 mA** with it. |
+
+Since v199 all three Wear 2100 watches run **dual core** by default (core 1
+renders and idles in WFI; it is handed to TrustZone with the hotplug flag
+before every collapse). `-DNO_SMP_CPU1` builds the single-core variant.
 
 ### Load-bearing
 
@@ -300,10 +345,35 @@ failures always print.
 |---|---|
 | `-DDISPLAY_BISECT` | Its stage table maps stages 2–8 to "already proven, leave the watchdog alone" proven on the **Gen 6**. On the Gen 4 it silently disables exactly the part of the staircase you would need. |
 
+### Experimental / measurement flags
+
+None of these are in the release images. They exist for bring-up and for
+measuring the sleep floor.
+
+| Flag | Effect |
+|---|---|
+| `-DNO_SMP_CPU1` | Single core: core 1 is never booted. Frame pushes run synchronously. Slower UI, no power difference asleep. |
+| `-DSYS_PC_STAGE=7` | The `l2-gdhs` cluster level instead of `l2-pc`: no RPM handshake, ~37 mA asleep. Fallback only. |
+| `-DSYS_PC_XO_PARK` | Parks the CPU clock on the 19.2 MHz crystal before the collapse instead of staying at 400 MHz on GPLL0. The kernel stays at its 400 MHz safe rate; this was the old behaviour and it made TrustZone's wake time out. Keep off. |
+| `-DSLEEP_FLOOR` | The RPM active-set "ladder" (DDR/PLL/LDO/CX votes measured one by one on a cable). Costs ~50 s awake before every collapse and every one of its steps measured 0 mA, so it stays off. `-DSLEEP_FLOOR_SKIP=<mask>` skips steps. |
+| `-DSLEEP_BATT_DIAG` | On the C2/S2: suspends the charger input during sleep so the STC3117 reads the cell current with a cable attached. Measurement only. |
+| `-DSPM_NO_PMIC_DATA` | Skips programming the L2 SAW's PMIC_DATA words. The kernel writes them; the bootloader leaves them at zero and the pc/gdhs sequences then send zeros to the rail controller and the wake never returns. Bisect flag only. |
+| `-DSPM_NO_L2_VDD_INIT` | Skips the SAW voltage-control init (VCTL / PMIC_DATA_3 = the CPU rail's VSET). Same warning: this is what stock's spm-regulator does at probe and the wake needs it. |
+| `-DSMP_PARK_CPU23` | Tries to boot cores 2 and 3 into TrustZone power collapse. Resets the C2 on release. Do not pass. |
+| `-DTZ_RPM_IRQS_FORCE` | Force-enables TrustZone's two RPM interrupts in the GIC. Stock TZ never uses them during cluster sleep; no effect. |
+| `-DSYS_PC_WARM_RESET_DIAG` | Makes a PS_HOLD drop a WARM PMIC reset so DDR/IMEM breadcrumbs survive. The setting persists in the PMIC and **breaks USB enumeration on every later boot** until restored. Do not pass. |
+| `-DSLEEP_PAS_KILL_RADIO` | The old sleep path that shut Pronto down through PAS before sleeping. It leaves a ghost RPM master holding the 3.3 V PA rail; the radio now idles resident instead. Do not pass. |
+| `-DPC_TRACE` | One flash write per power-collapse breadcrumb during the first attempts of a boot. Bring-up only. |
+| `-DUSB_LOG_V2` / `-DUSB_IRQ_WAKE` | The reworked USB console (tail-first replay, host commands) and USB-as-wake-source. Both broke the live log when tried; off. |
+
 ### Diagnostics
+
+The release images carry no diagnostic flag; the log then carries errors,
+failures and one-line milestones only (plus the sleep entry/exit census).
 
 | Flag | Brings back |
 |---|---|
+| `-DLOG_VERBOSE` | the step-by-step narration: WCNSS bring-up, SMEM/SCM probing, the WPA2 handshake, scan results, the 10 s load census, SMP and power-collapse dumps, each suspend cycle, BLE traces |
 | `-DBOOT_DIAG` | MDSS clock bring-up, the DMA_P splash probe, framebuffer geometry, TLMM mux, touch probe |
 | `-DCROWN_DIAG` | crown probe, an I²C bus scan, a PAT9126 register dump, and a 2 s heartbeat with live X/Y deltas use when the crown does nothing |
 | `-DUSB_DIAG` | the 5 s USB heartbeat (`portsc`, `ccs`, `spd`, …) use when enumeration itself is broken |
@@ -322,7 +392,7 @@ failures always print.
 | Symptom | Cause / fix |
 |---|---|
 | `fastboot devices` shows nothing | The USB link. This watch has no USB connector see the warning at the top. Then clean the pads with isopropyl alcohol and re-seat. |
-| `fastboot boot` fails with *dtb not found* | You packed without the DTB argument. Re-run `mk-bootimg.sh` with `../firefish-stock.dtb`. Nothing ran, nothing was damaged. |
+| `fastboot boot` fails with *dtb not found* | You packed without the DTB argument. Re-run `mk-bootimg.sh` with `../dtbs/firefish-stock.dtb`. Nothing ran, nothing was damaged. |
 | Watch resets into Wear OS a few seconds into every boot | You built without `-DWDOG_TRACE`. |
 | Screen stays black but the watch is clearly alive | aboot handed over a dark panel. The takeover path needs the bootloader's own display state; the blind DSI bring-up exists behind `-DGEN4_DSI_INIT` as a fallback. |
 | Colours are wrong (red renders as blue) | Wrong pack order for your panel variant. Rebuild with `-DMDP3_PACK_BGR`. The default (RGB) is the hardware-proven one on this unit. |
@@ -341,6 +411,20 @@ failures always print.
   rather than initialising DSI from scratch, which is why the boot splash
   transitions seamlessly into the firmware and why the port had pixels on its
   first boot.
-- **No storage yet** eMMC, NVS, FatFs and the log file are all stubbed.
-- **No WiFi or BLE.** The WCNSS/Pronto bring-up has not been started.
-- **No always-on display.**
+- **Updates arrive over WiFi, confirmed.** WiFi & BLE → Check for updates asks
+  GitHub for the latest release (tag compared numerically against the build's
+  version) and, when it carries `owf-fossil-gen4-firefish-<version>.img`,
+  Install update downloads it (resuming with HTTP ranges if the link stalls),
+  verifies the SHA-256 from the release's `SHA256SUMS`, checks the boot header
+  and writes it into `boot`, header block last. First proven with 1.5.0 on
+  2026-09-09. The release flow is in the
+  [README](../../README.md#software-updates-over-the-air).
+- **How the sleep works on this SoC.** The bootloader hands over every SAW
+  (power-sequencer) register at zero; the firmware programs them the way the
+  shipped kernel does (config, delay, PMIC data words, and the CPU rail's
+  voltage code into the L2 SAW), hands core 1 to TrustZone with the hotplug
+  flag, votes the sleep set to the RPM (panel, touch, eMMC, USB and gauge
+  rails kept in low-power mode, crystal released), then issues TERMINATE_PC
+  with the GDHS flag from core 0. TrustZone warm-boots core 0 on the PMIC
+  interrupt. The reference for all of it was a rooted stock C2+; the notes are
+  in `snapdragon-port/notes/C2PLUS-FINDINGS.md`.

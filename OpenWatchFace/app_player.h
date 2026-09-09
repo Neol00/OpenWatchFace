@@ -115,8 +115,8 @@ static void app_open_player(void) {
 #if BOARD_SCREEN_NARROW
   lv_obj_set_height(col, (int)screenHeight - UI_PX(124) - UI_PX(8));
   lv_obj_align(col, LV_ALIGN_TOP_MID, 0, UI_PX(124));
-#elif BOARD_SCREEN_ROUND_SMALL
-  // SMALL ROUND face: this screen is a TOP-ANCHORED flex column, so the transport
+#elif BOARD_SCREEN_ROUND_COMPACT
+  // COMPACT ROUND face (C2 360, S2 400): this screen is a TOP-ANCHORED flex column, so the transport
   // row does not have a position of its own — it lands wherever the stack above it
   // ends. On the C2 that stack measured ~299 px starting at y=82, putting the row at
   // y 287..381 on a 360 px panel: the reported "play and skip buttons half off the
@@ -138,7 +138,7 @@ static void app_open_player(void) {
 #endif
   lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(col, 0, 0);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_pad_all(col, UI_PX(6), 0);
 #else
   lv_obj_set_style_pad_all(col, UI_PX(10), 0);
@@ -148,7 +148,7 @@ static void app_open_player(void) {
   ui_apply_scrollbar_nudge(col);  // narrow-panel: shift scrollbar toward the edge (no-op on S3)
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_pad_row(col, UI_PX(3), 0);
 #else
   lv_obj_set_style_pad_row(col, UI_PX(8), 0);
@@ -156,14 +156,14 @@ static void app_open_player(void) {
 
   // Big music glyph up top.
   lv_obj_t *ic = lv_label_create(col);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_text_font(ic, &UI_FONT(30), 0);
 #else
   lv_obj_set_style_text_font(ic, &UI_FONT(40), 0);
 #endif
   lv_obj_set_style_text_color(ic, lv_color_hex(ui_accent_hex()), 0);
   lv_label_set_text(ic, LV_SYMBOL_AUDIO);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_pad_top(ic, 2, 0);
 #else
   lv_obj_set_style_pad_top(ic, 8, 0);
@@ -193,7 +193,7 @@ static void app_open_player(void) {
   pl_state_lbl = lv_label_create(col);
   lv_obj_set_style_text_font(pl_state_lbl, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(pl_state_lbl, lv_color_hex(ui_accent_soft_hex()), 0);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_pad_top(pl_state_lbl, 0, 0);
 #else
   lv_obj_set_style_pad_top(pl_state_lbl, 4, 0);
@@ -204,7 +204,7 @@ static void app_open_player(void) {
   lv_obj_t *ctl = lv_obj_create(col);
   lv_obj_remove_style_all(ctl);
   lv_obj_set_width(ctl, LV_PCT(100));
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   // Headroom trimmed 24 -> 20 and the row's own top pad 16 -> 8 (below), so the
   // box still fully contains the tallest button (UI_PX(84) = 73 px) instead of
   // reserving slack this panel cannot afford: 7 + 73 = 80 <= UI_PX(104) = 90.
@@ -217,7 +217,7 @@ static void app_open_player(void) {
   lv_obj_set_flex_align(ctl, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(ctl, UI_PX(22), 0);
-#if BOARD_SCREEN_ROUND_SMALL
+#if BOARD_SCREEN_ROUND_COMPACT
   lv_obj_set_style_pad_top(ctl, UI_PX(8), 0);
 #else
   lv_obj_set_style_pad_top(ctl, UI_PX(16), 0);

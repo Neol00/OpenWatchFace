@@ -1,6 +1,9 @@
 # OpenWatchFace — a small "watch OS"
 
-A from-scratch smartwatch firmware for mostly Waveshare with other future planned touch-display boards. 
+A from-scratch smartwatch firmware for touch-display boards, from the Tuya T5, the MaixCam-Pro
+to a growing set of Qualcomm-based Wear OS watches (Fossil Gen 4 and Gen 6, TicWatch C2 and S2) run bare-metal.
+On the Wear 2100 watches that means the whole stack with no Linux underneath: WiFi and BLE on the SoC's own radio,
+over-the-air updates, dual core, and a deep sleep that power-collapses the CPU cluster.
 It is a real little OS in miniature: a watch face, an app launcher, a notification pipeline
 that pulls from an HTTPS server **and** from your phone over BLE (iOS via ANCS,
 Android via the Gadgetbridge app), deep-sleep power management with a timed
@@ -47,6 +50,7 @@ media — all in a single Arduino translation unit on top of LVGL.
   - [Path B — iPhone over BLE (ANCS)](#path-b--iphone-over-ble-ancs)
   - [Path C — Android over BLE (Gadgetbridge)](#path-c--android-over-ble-gadgetbridge)
   - [Media control over BLE (AMS)](#media-control-over-ble-ams)
+- [Software updates over the air](#software-updates-over-the-air)
 - [Storage (SD card vs flash)](#storage-sd-card-vs-flash)
 - [Experimental: overclocking & undervolting](#experimental-overclocking--undervolting)
 - [Credits & licensing](#credits--licensing)
@@ -73,13 +77,17 @@ flashing, so you only follow the steps that apply to the hardware you own.
 | Waveshare T5-E1-Touch-AMOLED-1.75 | Tuya T5-E1 | 466×466 CO5300 AMOLED | [Guide](docs/devices/tuya-t5-amoled-1.75.md) |
 | Sipeed MaixCam-Pro | SG2002 (Linux) | MaixCDK-owned panel | [Guide](docs/devices/maixcam-pro.md) |
 | Fossil Gen 6 (hoki) | Wear 4100 (SDA429W) | 416×416 AMOLED | [Guide](docs/devices/fossil-gen6.md) |
-| Fossil Gen 4 (firefish/ray) | Wear 2100 | 390×390 AMOLED | [Guide](docs/devices/fossil-gen4.md) |
+| Fossil Gen 4 (firefish/ray) | Wear 2100 (APQ8009W) | 454×454 AMOLED | [Guide](docs/devices/fossil-gen4.md) |
+| Mobvoi TicWatch C2 / C2+ (skipjack) | Wear 2100 (APQ8009W) | 360×360 round AMOLED | [Guide](docs/devices/ticwatch-c2.md) |
+| Mobvoi TicWatch S2 / E2 (tunny) | Wear 2100 (APQ8009W) | 400×400 round AMOLED | [Guide](docs/devices/ticwatch-s2.md) |
 
 Most boards build in the **Arduino IDE** against the bundled libraries in
 `libraries/` (the exact versions the firmware was built against) plus the ESP32 core
-from the Boards Manager. The MaixCam and Fossil ports use their own toolchains —
-the Fossil Gen 6 is bare-metal ARM, built with `arm-none-eabi-gcc` and flashed
-with `fastboot`.
+from the Boards Manager. The MaixCam and the Qualcomm watches use their own
+toolchains — the Fossil Gen 6, Fossil Gen 4, TicWatch C2 and TicWatch S2 are
+bare-metal ARM, built with `arm-none-eabi-gcc` and run with `fastboot` as an
+Android boot image. The three Wear 2100 watches can be RAM-booted without
+overwriting Wear OS.
 
 > **Shared reference:** the out-of-tree library patches are documented once in
 > [`patches/README.md`](patches/README.md); every Arduino device page links to it.
@@ -179,6 +187,16 @@ flags; the loop reads those flags and does all the actual UI (popups, bell refre
 This varies across different devices, this is primarily explaining the ESP32 devices and the ideal hardware conditions.
 Deep sleep represents the OpenWatchFace goal of lowest possible power consumption. The single most important thing to
 understand about this watch's power model:
+
+> **The bare-metal Qualcomm watches sleep differently.** There is no cold boot:
+> the firmware suspends in place. On the Wear 2100 watches (Gen 4, C2, S2) the
+> runtime programs the SoC's power sequencers the way the vendor kernel does,
+> hands the second core to TrustZone, collapses the whole CPU cluster and lets
+> the RPM apply its sleep set with the crystal released, then resumes exactly
+> where it left off on the pusher or the PMIC's RTC alarm. Measured with the
+> C2's coulomb counter: about 6 mA asleep. The mechanics are in
+> [`snapdragon-port/README.md`](snapdragon-port/README.md) and the per-watch
+> guides; the rest of this section describes the ESP32 boards.
 
 > **You cannot truly "turn the watch off" and still have it wake itself up.**
 > A device that is fully powered down has nothing running to decide *when* to come
@@ -388,6 +406,56 @@ exist on the play store. scan for the watch in discovery from inside the Gadgetb
 list, and pick **"Bangle.js"** as the device type (long-press the watch entry — it
 advertises under its board name, e.g. "Waveshare ESP32-S3-Touch-AMOLED-2.06" — then click
 on "Add test device" then "Select device" and select "Bangle.js" in the list, then press ok).
+
+---
+
+## Software updates over the air
+
+The watch updates itself from the project's **GitHub releases**. Nothing in the
+repo has to be edited or pushed for a release to be seen: on the watch,
+**WiFi & BLE → Check for updates** asks GitHub for the latest release and looks
+for an asset named for this board; if its version is newer, **Install update**
+appears.
+
+- **ESP32 boards** with two app slots (the S3-2.06's `partitions_s3_32mb.csv`)
+  stream the image into the slot that is not running, verify it, and only then
+  make it bootable. A failed download leaves the running firmware untouched and
+  a build that fails to boot rolls back.
+- **Fossil Gen 4, TicWatch C2 and S2** download the whole boot image into RAM
+  (resuming with HTTP range requests if the link stalls), verify it, and the
+  firmware's own eMMC driver writes it into the `boot` partition, header block
+  last. Confirmed end to end on the Gen 4 with 1.5.0. There is no second slot on these watches, so
+  everything is checked before the first block is written: size, the optional
+  SHA-256, the Android boot magic, and a board marker compiled into every image
+  so a C2 image can never be written onto an S2. This is the whole point of the
+  feature on these watches: after the one cable flash, the soldered USB link is
+  never needed again.
+
+Publishing a release the watches will pick up:
+
+1. Bump `DEVICE_VERSION` in `OpenWatchFace/device_info.h` and build.
+   ESP32: export the sketch binary (Arduino IDE: *Sketch → Export Compiled
+   Binary*), the plain app image whose first byte is `0xE9`, not the merged
+   flash image. Wear 2100 watches: the packed boot image from
+   `tools/mk-bootimg-*.sh`.
+2. Create a GitHub release whose tag is the version (`V1.4.2` or `v1.4.2` or
+   `1.4.2` all work) and attach the images named
+   `owf-<board key>-<version>.bin` for ESP32 boards and
+   `owf-<board key>-<version>.img` for the watches, for example
+   `owf-ws-s3-amoled-206-1.4.2.bin` or `owf-ticwatch-s2-tunny-1.4.2.img`. The
+   board key is `BOARD_OTA_KEY` in that board's header. Boards without an asset
+   report "No <key> in <tag>", which is the truth.
+3. Optional but recommended: attach a `SHA256SUMS` file
+   (`sha256sum owf-* > SHA256SUMS`). When it is present the installer refuses
+   an image whose hash does not match.
+
+Only a full release counts: a **pre-release** or a draft is not "latest" and
+the watches will not see it. GitHub allows 60 unauthenticated checks per hour
+per address; the watch reports a 403 as the rate limit.
+
+`python3 tools/test-ota-check.py` runs the release-JSON parser and the version
+compare natively against a fixture. The Tuya and MaixCam ports have no
+installer; the check runs there and says so.
 
 ---
 

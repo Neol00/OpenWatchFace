@@ -56,7 +56,7 @@
 #define XPOWERS_CHIP_AXP2101          /* required before XPowersLib.h */
 
 /* Extended NVS: the firmware's Preferences store lives in the 1 MB "nvsext"
- * partition (app1's old slot — no OTA on this watch), not the 20 KB head "nvs"
+ * partition (between the two OTA app slots), not the 20 KB head "nvs"
  * (which stays for the system consumers: WiFi PHY/cal, NimBLE bonds). Boards
  * without this macro keep using the default partition. */
 #define BOARD_NVS_EXT_LABEL "nvsext"

@@ -434,7 +434,7 @@ static void settings_set_ble_txp(uint8_t idx) {
  *   - S3-2.06 (ESP32-S3): 240 / 160 / 80.
  *   - C6-1.47 (ESP32-C6): max 160 MHz (no 240); 160 / 80. */
 #if BOARD_PLATFORM_FOSSIL
-extern "C" int cpu_clk_set_mhz(int mhz);   // fossil-port pwr_diag.c (file scope: block-scope extern "C" won't compile)
+extern "C" int cpu_clk_set_mhz(int mhz);   // snapdragon-port pwr_diag.c (file scope: block-scope extern "C" won't compile)
 #endif
 #if BOARD_SOC_MSM8909
 /* Gen 4 (msm8909w / APQ8009W): the REAL ladder, from this watch's own DTB
@@ -455,10 +455,12 @@ extern "C" int cpu_clk_set_mhz(int mhz);   // fossil-port pwr_diag.c (file scope
  * that cannot do what it says is worse than no button.
  *   800 = GPLL0/1   533 = GPLL0/1.5   400 = GPLL0/2   200 = GPLL0/4 */
 static const uint16_t CPU_FREQS[] = { 800, 533, 400, 200 };
-static uint16_t s_cpu_mhz = 800;          // the top of our ladder; the live rate
-                                          // is reported separately by pwr_cpu_mhz()
+static uint16_t s_cpu_mhz = 400;          // DEFAULT 400 MHz (GPLL0/2): the UI animates no
+                                          // faster above it and the kernel's own safe rate is
+                                          // 400 MHz; applied at boot, the Power app button
+                                          // starts selected here. Live rate: pwr_cpu_mhz()
 #elif BOARD_PLATFORM_FOSSIL
-/* Gen 6 (SDM429W): the RCG mux + HF PLL ladder (fossil-port pwr_diag.c
+/* Gen 6 (SDM429W): the RCG mux + HF PLL ladder (snapdragon-port pwr_diag.c
  * cpu_clk_set_mhz, kernel clk-cpu-sdm.c sequence). 800/400 run off GPLL0
  * (bootloader's parking source, PLL off); 960+ reprogram the dedicated APCS
  * HF PLL (L grid = 19.2 MHz). Everything here is DT vdd corner 1 — the SAME

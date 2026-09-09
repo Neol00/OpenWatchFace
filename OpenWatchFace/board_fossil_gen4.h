@@ -3,19 +3,19 @@
  *
  *  This is NOT an MCU board and NOT a Linux port. The firmware runs bare-metal
  *  on core 0 of the watch's Snapdragon Wear 2100 (APQ8009w / msm8909w),
- *  on top of the fossil-port/baremetal runtime (FreeRTOS Cortex-A port + ported
- *  MSM drivers). See fossil-port/README.md (plan) and fossil-port/HARDWARE.md
+ *  on top of the snapdragon-port/baremetal runtime (FreeRTOS Cortex-A port + ported
+ *  MSM drivers). See snapdragon-port/README.md (plan) and snapdragon-port/HARDWARE.md
  *  (verified addresses / peripherals).
  *
  *  Fossil-fleet note: this is the FIRST of several Fossil targets (a Gen 6 /
  *  Wear 4100+ "hoki" and Fossil Q models exist in hardware). Everything
- *  SoC-generation-specific lives in fossil-port/baremetal/boards/<device>.h;
+ *  SoC-generation-specific lives in snapdragon-port/baremetal/boards/<device>.h;
  *  this header only describes what the FIRMWARE needs to know about the Gen 4.
  *  Future watches add board_fossil_<device>.h + a BOARD_ID_FOSSIL_<DEVICE>.
  *
  *  Feature flags mirror the Maix port's philosophy: start with everything OFF
  *  (modules compile to stubs), switch subsystems ON as their bare-metal driver
- *  lands (roadmap phases in fossil-port/README.md).
+ *  lands (roadmap phases in snapdragon-port/README.md).
  * ========================================================================== */
 #pragma once
 
@@ -34,7 +34,7 @@
  * under a name that matches both is how a 40mm watch ends up installing a
  * 44mm panel geometry. The variant is chosen by the build
  * (build.sh gen4-firefish | gen4-ray) and defaults to firefish, the unit whose
- * DTB is confirmed; see fossil-port/baremetal/boards/fossil_gen4.h.
+ * DTB is confirmed; see snapdragon-port/baremetal/boards/fossil_gen4.h.
  *
  * A key with no matching entry in the manifest is reported by the update check
  * as "No build for <key>", which is the correct answer for a variant that has
@@ -47,16 +47,16 @@
 
 /* ---- Platform flag: bare-metal Qualcomm MSM (no Arduino/ESP runtime) ------
  * Gates out ESP-only bring-up in the .ino exactly like BOARD_PLATFORM_MAIX does,
- * but display/touch/tick come from the fossil-port runtime instead of MaixCDK. */
+ * but display/touch/tick come from the snapdragon-port runtime instead of MaixCDK. */
 #define BOARD_PLATFORM_FOSSIL 1
 
-/* ---- Display / touch: served by the fossil-port bare-metal drivers --------- */
+/* ---- Display / touch: served by the snapdragon-port bare-metal drivers --------- */
 #define BOARD_DISPLAY_MSM_DSI 1   /* MDP3/DSI command-mode panel (Phase 3) */
 #define BOARD_TOUCH_RAYDIUM   1   /* Raydium RM_TS on BLSP I2C (Phase 4) */
 
 /* ---- Capabilities: all OFF until their phase lands ------------------------- */
 #define BOARD_HAS_PSRAM           0   /* plain malloc into DDR (512 MB — no tiers) */
-#define BOARD_DUAL_CORE           0   /* cores 1-3 parked; single-core for now */
+#define BOARD_DUAL_CORE           1   /* CPU1 booted by smp_8909.c (2026-09-04), parked in WFI with idle accounting */
 #define BOARD_HAS_PMU_AXP2101     0   /* PMIC is PM8916-class over SPMI (own driver later) */
 #define BOARD_HAS_ADC_BATTERY     0   /* battery via SMB231/PMIC gauge (Phase 6) */
 #define BOARD_HAS_RTC_PCF85063    0   /* PMIC RTC over SPMI (Phase 5) */
@@ -66,12 +66,14 @@
                                          driven through the virtual motor pin below */
 #define BOARD_HAS_SD_MMC          0   /* eMMC via sdhci-msm (Phase 5) */
 #define BOARD_HAS_SD_SPI          0
-#define BOARD_HAS_IMU_QMI8658     0   /* Gen 4 IMU is a different part — own flag later */
+#define BOARD_HAS_IMU_QMI8658     0
+#define BOARD_HAS_IMU_LSM6DS3     1   /* ST LSM6DS3 on bit-banged SPI gpio8-11 (imu_lsm6ds3.c) */
+#define BOARD_HAS_HR_PAH8011      1   /* PixArt PAH8011 PPG at I2C 0x15 on gpio6/7 (hr_pah8011.c) */
 #define BOARD_HAS_BACKLIGHT_PWM   0   /* AMOLED: brightness by panel command */
 #define BOARD_HAS_LP_STEPS        0
 #define BOARD_WAKE_USE_EXT0       0   /* wake = PMIC PON / RTC alarm (Phase 6) */
-#define BOARD_HAS_BLE             0   /* Phase 7: NimBLE host over HCI-on-SMD (WCNSS) */
-#define BOARD_HAS_FFAT            0   /* storage lands with eMMC in Phase 5 */
+#define BOARD_HAS_BLE             1   /* NimBLE host over HCI-on-SMD (WCNSS BT core) */
+#define BOARD_HAS_FFAT            1   /* eMMC userdata FFAT region (2026-09-03) */
 
 /* BLE TX-power ladder placeholder (same contract as the Maix port: referenced
  * unconditionally by settings_store.h, never applied while BLE is off). */
@@ -94,7 +96,7 @@
  * node's display-coords 0x1c6 = 454). The 390x390 this file used to carry was
  * a pre-dump community guess and was simply wrong. The smaller "ray" variant
  * shares the SoC but needs its own dump before these numbers are trusted on
- * it; fossil-port/baremetal/boards/fossil_gen4.h holds the runtime copy. */
+ * it; snapdragon-port/baremetal/boards/fossil_gen4.h holds the runtime copy. */
 #define LCD_WIDTH  454
 #define LCD_HEIGHT 454
 #define BOARD_SCREEN_ROUND   1
@@ -105,7 +107,7 @@
  * setup() is long and this watch has no console at all (its UART is not bonded
  * out), so each marker arms a distinct watchdog timeout: the time until the
  * watch reboots names the last marker reached. Table in
- * fossil-port/baremetal/platform/msm_wdog.c. Identical contract to the Gen 6. */
+ * snapdragon-port/baremetal/platform/msm_wdog.c. Identical contract to the Gen 6. */
 #if defined(WDOG_TRACE)
 extern "C" void wdog_stage(unsigned stage);
 #define OWF_STAGE(n) wdog_stage(n)
@@ -119,7 +121,7 @@ extern "C" void fb_trace(uint32_t xrgb);
 #define OWF_VTRACE(c) fb_trace(c)
 #endif
 
-/* ---- Panel brightness: DCS 0x51 over the fossil-port DSI host --------------
+/* ---- Panel brightness: DCS 0x51 over the snapdragon-port DSI host --------------
  * The AUO h139 is qcom "bl_ctrl_dcs" — there is no PWM backlight on an AMOLED.
  * board_display_set_brightness() in the .ino routes here under
  * BOARD_PLATFORM_FOSSIL. */
@@ -184,3 +186,6 @@ extern "C" {
 #define BOOT_BTN_GPIO    201
 #define BOARD_WAKE_GPIO  0
 #define BOARD_LCD_BUS_HZ 0
+/* Idle loop pass every 10 ms instead of 5 (2026-09-04 idle-load work; see the
+ * loop() tail in OpenWatchFace.ino). */
+#define BOARD_LOOP_IDLE_MS 10

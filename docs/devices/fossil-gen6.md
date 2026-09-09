@@ -118,7 +118,7 @@ Only needed if you want to change the firmware or the build flags.
 | ARM toolchain | `arm-none-eabi-gcc` on your `PATH` (GCC 13+; 16.1 in use) |
 | Python3 | used by the image packer and the verifier |
 | LVGL | this repo's `libraries/lvgl`, or `~/Arduino/libraries/lvgl` |
-| DTB | `fossil-port/sda429-hoki.dtb` |
+| DTB | `snapdragon-port/dtbs/sda429-hoki.dtb` |
 
 The LVGL copy must be the one from this repo's `libraries/` folder, with
 `lv_conf.h` sitting **next to** the `lvgl` folder, the same arrangement the
@@ -130,7 +130,7 @@ Two commands. **Both matter.** The second one's DTB argument looks optional and
 is not, without it you get an image that will not boot.
 
 ```sh
-cd fossil-port/baremetal
+cd snapdragon-port/baremetal
 
 # 1. compile + link
 CFLAGS_EXTRA="-DWDOG_TRACE -DDISPLAY_BISECT -DPLAT_I2C_RETEST -DTOUCH_DIAG \
@@ -139,7 +139,7 @@ LVGL_DIR=$HOME/Arduino/libraries/lvgl \
 sh build-owf-image.sh
 
 # 2. pack into an Android boot image, WITH the DTB appended
-sh tools/mk-bootimg-gen6.sh build/gen6-owf/owf.bin ../sda429-hoki.dtb
+sh tools/mk-bootimg-gen6.sh build/gen6-owf/owf.bin ../dtbs/sda429-hoki.dtb
 
 ls build/gen6/ # result should be: build/gen6/owf-boot.img
 ```
@@ -186,7 +186,7 @@ Expected: payload offset **exactly** `size(owf.bin)`, dtb totalsize **235622**
 with md5 prefix **`68b17ef6`**, trailing **0**.
 
 Full build reference, including every flag in the tree:
-[`fossil-port/BUILD-GEN6.md`](../../fossil-port/BUILD-GEN6.md).
+[`snapdragon-port/BUILD-GEN6.md`](../../snapdragon-port/BUILD-GEN6.md).
 
 ---
 
@@ -446,7 +446,7 @@ the primary way to see what the firmware is doing.
 ## Build flags
 
 Only relevant if you are building yourself (Part 1, Option B). The full
-reference is in [`BUILD-GEN6.md`](../../fossil-port/BUILD-GEN6.md); this is the
+reference is in [`BUILD-GEN6.md`](../../snapdragon-port/BUILD-GEN6.md); this is the
 practical subset.
 
 ### Load-bearing flags (do not omit)

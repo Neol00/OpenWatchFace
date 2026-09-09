@@ -2,49 +2,35 @@
 /* ============================================================================
  *  ota_check.h — "is there a newer OpenWatchFace?", and nothing else.
  *
- *  DELIBERATELY THE CHECK ONLY. No download, no flashing, no partition work.
- *  The first question an over-the-air updater has to answer is whether this
- *  device can fetch a signed-by-TLS file from the internet at all, and that is
- *  worth answering on its own before anything is built on top of it — a
- *  download path that fails is indistinguishable from an install path that
- *  fails if both land in the same commit.
+ *  DELIBERATELY THE CHECK ONLY. No download, no flashing, no partition work;
+ *  that is ota_install.h, which consumes the OtaManifest this produces. The
+ *  split is kept on purpose: a manifest fetch that fails is a network or
+ *  certificate problem, an install that fails is a flash or image problem,
+ *  and each reports its own stage.
  *
- *  WHY THESE URLS. The obvious design fetches the GitHub *API*
- *  (api.github.com/repos/.../releases/latest). Do not: api.github.com and
- *  github.com are served from a Sectigo chain rooted at USERTrust ECC, which
- *  is NOT the CA this firmware pins, so every request would fail certificate
- *  validation. Measured 2026-08-28:
+ *  WHERE THE UPDATE COMES FROM: the GitHub release itself, nothing else. The
+ *  check asks api.github.com for the repo's latest release, reads the tag
+ *  (its version), and looks for an asset named owf-<board key>-<version><ext>
+ *  in that release. Publishing a release with the right asset name is the
+ *  whole publishing step — no file in the repo has to be edited or pushed.
+ *  (An earlier design read a committed ota/latest.json; that file was never
+ *  pushed and every watch reported "No manifest (404)". Gone.)
  *
- *      github.com, api.github.com, codeload  -> Sectigo      pin FAILS
- *      raw.githubusercontent.com             -> Let's Encrypt  pin OK
- *      release-assets.githubusercontent.com  -> Let's Encrypt  pin OK
- *      objects.githubusercontent.com         -> Let's Encrypt  pin OK
- *      <user>.github.io                      -> Let's Encrypt  pin OK
+ *  CERTIFICATES. api.github.com and github.com are served from a Sectigo
+ *  chain (USERTrust ECC root); the CDN the download redirects to
+ *  (*.githubusercontent.com) is Let's Encrypt (ISRG Root X1). OTA_ROOT_CA in
+ *  ota_ca.h carries both, and every hop is verified against it. The CDN URLs
+ *  are signed and expire, so only the github.com download URL is stored.
  *
- *  So the manifest is a plain FILE COMMITTED TO THE REPO, fetched over
- *  raw.githubusercontent.com — no GitHub API, and therefore no API rate limit
- *  and no token. The firmware image is an ordinary release asset, reached
- *  through the normal github.com/.../releases/download/... URL.
+ *  INTEGRITY. Size comes from the API. If the release also carries an asset
+ *  named SHA256SUMS (the output of `sha256sum owf-*` uploaded alongside), the
+ *  line for this board's asset is used and the installer refuses a hash
+ *  mismatch. Without it the installer still checks the size, the image
+ *  magic and the board marker inside the image — TLS to the pinned root
+ *  covers the transport.
  *
- *  That download URL is why ota_ca.h pins TWO roots: it starts on github.com
- *  (Sectigo) and only then redirects to the Let's Encrypt CDN, so Let's Encrypt
- *  alone fails on the first hop. The CDN URLs cannot be used directly instead —
- *  they are signed and expire. Any host added here must be checked against
- *  OTA_ROOT_CA first, or the feature breaks in the field with a bare
- *  "connect failed".
- *
- *  MANIFEST FORMAT (ota/latest.json in the repo, one object per board):
- *      {
- *        "version": "1.5.0",
- *        "notes":   "short human line shown in the UI",
- *        "builds": {
- *          "ws-s3-amoled-164": { "url": "https://release-assets.../owf-....bin",
- *                                "size": 1746732,
- *                                "sha256": "…64 hex…" }
- *        }
- *      }
- *  Parsed with the same substring approach notif_net.h uses for its payloads —
- *  a real JSON parser is not worth ~4 KB here, and the document is ours.
+ *  Unauthenticated API calls are limited to 60/hour per IP; the check is a
+ *  button, so that is plenty. A 403 is reported as the rate limit.
  * ========================================================================== */
 
 /* SELF-CONTAINED so it can be included BEFORE the app screens that use it —
@@ -70,13 +56,11 @@
  * include order can put this header where the UI needs it. */
 static bool wifi_connect(void);
 
-#ifndef OTA_MANIFEST_URL
-/* Points at the repo's own file. Branch is pinned deliberately: a manifest on
- * a moving branch is a manifest anyone with push access can point at any
- * binary, and "main" is the branch releases are cut from. */
-#define OTA_MANIFEST_URL \
-  "https://raw.githubusercontent.com/Neol00/OpenWatchFace/main/ota/latest.json"
+#ifndef OTA_REPO
+#define OTA_REPO "Neol00/OpenWatchFace"
 #endif
+#define OTA_API_HOST "api.github.com"
+#define OTA_LATEST_URL "https://" OTA_API_HOST "/repos/" OTA_REPO "/releases/latest"
 
 /* The board key this device looks for inside "builds", and the name its image
  * is published under. BOTH COME FROM THE BOARD HEADER (BOARD_OTA_KEY) rather
@@ -96,9 +80,19 @@ static bool wifi_connect(void);
 #  endif
 #endif
 
+/* Asset extension: an ESP app image is a .bin; the Wear 2100 watches boot an
+ * Android boot image, published as .img. */
+#ifndef OTA_ASSET_EXT
+#  if BOARD_PLATFORM_FOSSIL
+#    define OTA_ASSET_EXT ".img"
+#  else
+#    define OTA_ASSET_EXT ".bin"
+#  endif
+#endif
+
 /* Convenience for the release tooling and the About screen: the exact asset
  * filename this build expects to be published as. */
-#define OTA_ASSET_NAME "owf-" OTA_BOARD_KEY "-" DEVICE_VERSION ".bin"
+#define OTA_ASSET_NAME "owf-" OTA_BOARD_KEY "-" DEVICE_VERSION OTA_ASSET_EXT
 
 /* What the check found. Deliberately plain data: the UI renders it, the
  * installer (later) consumes it, and neither needs the HTTP layer again. */
@@ -106,10 +100,11 @@ struct OtaManifest {
   bool     ok;              /* the fetch AND the parse both succeeded      */
   int      http_code;       /* as returned, or a negative HTTPClient error */
   char     err[48];         /* short reason when !ok — shown verbatim      */
-  char     version[24];     /* "1.5.0"                                     */
-  char     notes[80];       /* one human line                              */
+  char     version[24];     /* "1.5.0" (the tag without its v/V)           */
+  char     notes[80];       /* the release title                           */
   char     url[192];        /* firmware image for THIS board               */
-  char     sha256[65];      /* 64 hex chars + NUL                          */
+  char     asset[64];       /* its filename, owf-<key>-<ver><ext>          */
+  char     sha256[65];      /* 64 hex + NUL, or "" when no SHA256SUMS      */
   uint32_t size;            /* bytes, for the progress bar and a sanity gate */
   bool     newer;           /* version differs from the running build      */
 };
@@ -234,7 +229,7 @@ static bool ntp_sync_if_due(bool force);
 
 /* The one host the manifest is fetched from; probed by name (never by IP, which
  * would defeat certificate hostname verification). */
-#define OTA_MANIFEST_HOST "raw.githubusercontent.com"
+#define OTA_MANIFEST_HOST OTA_API_HOST
 #endif /* OTA_DIAG */
 
 /* ---- the check -----------------------------------------------------------
@@ -293,10 +288,9 @@ static bool ota_check(OtaManifest *m) {
   USBSerial.printf("[ota] %s -> %s\n", OTA_MANIFEST_HOST, ip.toString().c_str());
 #endif /* OTA_DIAG */
 
-  /* ISRG Root X1 alone: raw.githubusercontent.com is Let's Encrypt, and parsing
-   * one root instead of two is memory this board would rather keep. The
-   * two-root OTA_ROOT_CA is for the download, which starts on github.com. */
-  client.setCACert(OTA_ROOT_CA_LE);
+  /* Both roots: api.github.com is Sectigo (USERTrust ECC), the download CDN
+   * is Let's Encrypt. */
+  client.setCACert(OTA_ROOT_CA);
   client.setHandshakeTimeout(20);        /* seconds; the default 120 s is worse
                                           * than useless on a UI-thread call */
 
@@ -313,33 +307,34 @@ static bool ota_check(OtaManifest *m) {
                      tls_err[0] ? tls_err : "(no mbedtls detail)");
     return false;
   }
-  USBSerial.println("[ota] TLS up, fetching manifest");
+  USBSerial.println("[ota] TLS up, asking for the latest release");
 #endif
 
   HTTPClient http;
-  if (!http.begin(client, OTA_MANIFEST_URL)) {
+  if (!http.begin(client, OTA_LATEST_URL)) {
     snprintf(m->err, sizeof m->err, "begin() failed");
     return false;
   }
   http.setConnectTimeout(8000);          /* TLS handshake headroom */
   http.setTimeout(8000);
-  http.setUserAgent("OpenWatchFace");
-  /* raw.githubusercontent.com serves a 302 to a CDN host; follow it, and note
-   * that the CDN is also Let's Encrypt so the pin still holds. */
+  http.setUserAgent("OpenWatchFace");    /* the API refuses requests without one */
+  http.addHeader("Accept", "application/vnd.github+json");
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   int code = http.GET();
   m->http_code = code;
 #if OTA_DIAG
-  USBSerial.printf("[ota] GET %s -> %d\n", OTA_MANIFEST_URL, code);
+  USBSerial.printf("[ota] GET %s -> %d\n", OTA_LATEST_URL, code);
 #endif
   if (code != 200) {
-    /* A negative code is an HTTPClient/TLS error, not an HTTP status — the
-     * distinction matters when diagnosing, so say which. A 404 here is not a
-     * fault in this code: it means ota/latest.json has not been pushed to the
-     * branch OTA_MANIFEST_URL names, or the URL names the wrong account. */
-    if (code < 0)         snprintf(m->err, sizeof m->err, "TLS/conn err %d", code);
-    else if (code == 404) snprintf(m->err, sizeof m->err, "No manifest (404)");
+    if (code < 0) {
+      snprintf(m->err, sizeof m->err, "TLS/conn err %d", code);
+#if BOARD_PLATFORM_FOSSIL
+      { char t[96]; if (client.lastError(t, sizeof t)) snprintf(m->err, sizeof m->err, "%.44s", t); }
+#endif
+    }
+    else if (code == 404) snprintf(m->err, sizeof m->err, "No release published yet");
+    else if (code == 403) snprintf(m->err, sizeof m->err, "GitHub rate limit, retry later");
     else                  snprintf(m->err, sizeof m->err, "HTTP %d", code);
     http.end();
     return false;
@@ -348,32 +343,77 @@ static bool ota_check(OtaManifest *m) {
   String body = http.getString();
   http.end();
 
-  if (ota_json_str(body, 0, "version", m->version, sizeof m->version) < 0) {
-    snprintf(m->err, sizeof m->err, "No version field");
+  /* tag "V1.4.1" / "v1.4.1" / "1.4.1" -> version "1.4.1" */
+  char tag[24];
+  if (ota_json_str(body, 0, "tag_name", tag, sizeof tag) < 0) {
+    snprintf(m->err, sizeof m->err, "No tag_name in release");
     return false;
   }
-  ota_json_str(body, 0, "notes", m->notes, sizeof m->notes);
+  {
+    const char *t = tag;
+    if (*t == 'v' || *t == 'V') t++;
+    snprintf(m->version, sizeof m->version, "%s", t);
+  }
+  {
+    int at = body.indexOf("\"tag_name\"");
+    ota_json_str(body, at < 0 ? 0 : at, "name", m->notes, sizeof m->notes);   /* release title */
+  }
 
-  /* Find this board's object, then read only from there — otherwise the first
-   * "url" in the document wins regardless of which board it belongs to. */
-  int b = body.indexOf(String("\"") + OTA_BOARD_KEY + "\"");
-  if (b < 0) {
-    snprintf(m->err, sizeof m->err, "No build for " OTA_BOARD_KEY);
+  /* The asset for THIS board, by exact filename, then its size and download
+   * URL — both follow the name inside the same asset object. */
+  snprintf(m->asset, sizeof m->asset, "owf-" OTA_BOARD_KEY "-%s" OTA_ASSET_EXT, m->version);
+  int a = body.indexOf(String("\"") + m->asset + "\"");
+  if (a < 0) {
+    snprintf(m->err, sizeof m->err, "No %s in %s", OTA_BOARD_KEY, tag);
     return false;
   }
-  ota_json_str(body, b, "url",    m->url,    sizeof m->url);
-  ota_json_str(body, b, "sha256", m->sha256, sizeof m->sha256);
-  ota_json_u32(body, b, "size",   &m->size);
-
-  if (!m->url[0] || strlen(m->sha256) != 64 || m->size == 0) {
-    snprintf(m->err, sizeof m->err, "Build entry incomplete");
+  /* The asset object nests an "uploader" user object between "name" and
+   * "size"; anchor on "content_type", which only the asset itself has, so
+   * a "size" key inside the nested object can never be picked up. */
+  {
+    int ct = body.indexOf("\"content_type\"", a);
+    ota_json_u32(body, ct < 0 ? a : ct, "size", &m->size);
+  }
+  ota_json_str(body, a, "browser_download_url", m->url, sizeof m->url);
+  if (!m->url[0] || m->size == 0) {
+    snprintf(m->err, sizeof m->err, "Asset entry incomplete");
     return false;
   }
-  /* Refuse a URL we could not validate the certificate for. Cheap, and it
-   * turns a confusing field failure into a clear one at check time. */
   if (strncmp(m->url, "https://", 8) != 0) {
     snprintf(m->err, sizeof m->err, "URL not https");
     return false;
+  }
+
+  /* Optional SHA256SUMS asset: fetch it and pick this asset's line. */
+  m->sha256[0] = '\0';
+  {
+    int sidx = body.indexOf("\"SHA256SUMS\"");
+    char surl[192] = {0};
+    if (sidx >= 0) ota_json_str(body, sidx, "browser_download_url", surl, sizeof surl);
+    body = String();                      /* free the release JSON first */
+    if (surl[0]) {
+      HTTPClient h2;
+      if (h2.begin(client, surl)) {
+        h2.setConnectTimeout(8000); h2.setTimeout(8000);
+        h2.setUserAgent("OpenWatchFace");
+        h2.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        int c2 = h2.GET();
+        if (c2 == 200) {
+          String sums = h2.getString();
+          int k = sums.indexOf(m->asset);
+          /* "<64 hex>  <name>" — the hash is the 64 chars before the two spaces */
+          if (k >= 66) {
+            int hs = k - 1;
+            while (hs > 0 && (sums[hs] == ' ' || sums[hs] == '*')) hs--;
+            if (hs >= 63) { sums.substring(hs - 63, hs + 1).toCharArray(m->sha256, sizeof m->sha256); }
+          }
+        }
+        h2.end();
+      }
+#if OTA_DIAG
+      USBSerial.printf("[ota] SHA256SUMS: %s\n", m->sha256[0] ? m->sha256 : "(no line for this asset)");
+#endif
+    }
   }
 
   m->newer = ota_ver_cmp(DEVICE_VERSION, m->version) < 0;
