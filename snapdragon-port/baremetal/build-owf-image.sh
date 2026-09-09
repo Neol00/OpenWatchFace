@@ -59,7 +59,7 @@ cc_one main.c "-DOWF_APP" "$B/main.o"
 for c in console ramlog timer uart_pl011 uart_msm gic irq fb_ramfb fb_splash gcc_mdss gcc_blsp tlmm dsi_dcs dsi_pll_12nm mmu \
          msm_dsi dsi_panel msm_mdp3 msm_i2c touch_raydium reboot_msm \
          smem scm smd wcnss wcn36xx wlan_crypto wlan_sta wlan_net bt_hci spmi_arb pmic_vib pmic_rtc pmic_fg pmic_pon pwr_diag suspend_msm sleep_stats psci pmic_irq cpu_pc mpm sdhci_msm msm_wdog bootmark ddr_size bootimg_write \
-         storage_gen6 nvs_store gcc_sdcc gfx_text logfile gcc_usb usb_phy_msm usb_ci recovery_gate uart_bt bt_wcn3990 bt_fw rng_msm kmsg_forensics; do
+         storage_gen6 nvs_store gcc_sdcc gfx_text logfile gcc_usb usb_phy_msm usb_ci recovery_gate uart_bt bt_wcn3990 bt_fw rng_msm kmsg_forensics sleep_quiesce; do
   cc_one platform/$c.c "" "$B/$c.o"
 done
 # lwIP 2.1.3 (third_party/lwip, NO_SYS; options in lwip_port/lwipopts.h)

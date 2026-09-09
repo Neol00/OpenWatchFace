@@ -146,6 +146,40 @@ ls build/gen4/       # result: build/gen4/owf-boot.img
 > sleep flags are what turn that into the ~6 mA cluster collapse. They are
 > explained one by one under [Build flags](#build-flags).
 
+#### Publishing an image: strip your MAC first
+
+The Gen 4 build embeds `firmware/gen4/wcnss_nv.c` when you have one, and
+`tools/mk-wcnss-nv.sh` bakes **your** watch's MAC into `wcnss_mac[]` — which is
+then compiled into the `.img`. Publish that build and every watch that flashes
+it transmits your address: your device identifier turns up on strangers'
+networks, and two of them on one network fight over ARP and DHCP.
+
+Build release images with `OWF_PUBLIC=1`:
+
+```sh
+OWF_PUBLIC=1 CFLAGS_EXTRA="..." sh build-owf-image-gen4.sh
+```
+
+That removes the `wcnss_mac` symbol from the object entirely — not merely
+ignoring it at runtime, which would leave the bytes in the binary for anyone to
+extract — and `wlan_mac()` derives a **locally-administered** MAC per device
+from the eMMC CID instead: unique to each watch, stable across reboots, nothing
+to do with whoever built the image. The boot log says which it used:
+
+```
+wlan: MAC 02:xx:xx:xx:xx:xx (derived per device from the eMMC CID)
+```
+
+The NV table itself stays in the image. It is board calibration data, contains
+no MAC (that lives in `/persist/wifimac.ini`), and is near-identical between
+units — the C2, C2+ and S2 blobs are byte-for-byte the same 31723 bytes, and the
+Gen 4's differs from them in 26 bytes of TX power table. Whether you may
+redistribute the vendor's NV table at all is a licensing question, the same one
+that applies to the `wcnss.mdt` radio firmware.
+
+BLE needs nothing: its address is a random static one generated on first boot
+and kept in NVS, so it is already per device.
+
 Full build reference: [`snapdragon-port/BUILD-GEN4.md`](../../snapdragon-port/BUILD-GEN4.md).
 
 ---

@@ -698,6 +698,7 @@ static uint8_t      rails_cut_count(void);
 #include "ota_install.h"
 #include "screen_cache.h"       // PSRAM pre-render cache: blit a static screen instantly on open, then render live over it
 #include "app_menu.h"
+#include "ui_keyboard.h"     // on-screen QWERTY (boards with no physical keyboard) — needs app_scr/nav_back_intercept
 #include "app_power.h"
 #include "app_wifi_ble.h"
 #include "app_settings.h"

@@ -395,6 +395,12 @@ void plat_suspend(void)
      * USB PHY), measured step by step on a cable. Undone in sleep_floor_exit. */
     sleep_floor_enter(floor_cable);
 #endif
+#if defined(SLEEP_QUIESCE)
+    /* The AP's OWN registers, which the RPM sleep set never sees: the
+     * bootloader's GPLL1/GPLL2 + crypto/PRNG votes, and the USB PHY PLL when
+     * no cable is attached. Costs microseconds, no RPM traffic, no ladder. */
+    sleep_quiesce_enter(usb_is_configured() && chg_usb_present() == 1);
+#endif
 #if defined(SYS_PC_8909)
     (void)sys_pc8909_prepare(deadline);                       /* cluster off + RPM sleep set; falls back to plain collapse */
 #endif
@@ -619,6 +625,9 @@ housekeeping:
 #endif
 #if defined(SLEEP_FLOOR)
     sleep_floor_exit();
+#endif
+#if defined(SLEEP_QUIESCE)
+    sleep_quiesce_exit();          /* PLL votes back before any branch re-enable */
 #endif
     usb_irq_arm(0);
     if (xo_parked) cpu_clk_sleep_exit();

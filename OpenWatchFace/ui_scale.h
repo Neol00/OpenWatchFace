@@ -78,6 +78,20 @@ static inline int ui_px(int ref_px) {
  *
  * Pass the ORIGINAL literal as `ref` and the call site keeps documenting what the
  * 2.06 layout was: lv_obj_set_width(col, UI_COL_W(374)). */
+/* PIXEL twin of UI_COL_W, for call sites that must do ARITHMETIC on the width:
+ * a child that has to fit inside it, or a text width measured against it. Those
+ * cannot use the LV_PCT form, and they must not simply apply UI_COL_W a second
+ * time -- nested percentages COMPOUND. That is what made the C2's notification
+ * rows 86% of 86% = 266 px on a 360 px panel, i.e. 47 px of black bar down each
+ * side. Keep the two macros in step. */
+#if BOARD_SCREEN_SUBREF
+#define UI_COL_PX(ref) ((int)screenWidth * 94 / 100)
+#elif BOARD_SCREEN_ROUND_SMALL
+#define UI_COL_PX(ref) ((int)screenWidth * 86 / 100)
+#else
+#define UI_COL_PX(ref) (ref)
+#endif
+
 #if BOARD_SCREEN_SUBREF
 #define UI_COL_W(ref) (LV_PCT(94))
 #elif BOARD_SCREEN_ROUND_SMALL

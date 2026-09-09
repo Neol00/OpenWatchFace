@@ -191,21 +191,36 @@ static void app_open_appearance(void) {
    * never gets a real wrap boundary in LVGL, so on the 360 px C2 four 68 px
    * swatches marched off the right edge and made the screen side-scroll. Same
    * fix the Power app's CPU-speed ladder carries. */
-  lv_obj_set_width(grid, ui_app_column_content_w());
+  /* LOCKED TO THREE COLUMNS. With six colors that always reads as a tidy 3x2
+   * block. Leaving it to flex wrapping made the count a coincidence of
+   * arithmetic: on the 360 px C2, four 68 px swatches plus three 14 px gaps come
+   * to exactly 314 px against exactly 314 px of content, so a fourth fitted by
+   * zero pixels and the picker rendered 4 + 2. Size the GRID to hold three and
+   * no more, and the wrap point stops depending on the panel. */
+  const int sw_pad = UI_PX(6), sw_gap = UI_PX(16);
+  const int appr_avail = ui_app_column_content_w();
+  int sw_sz = UI_PX(78);
+  if (3 * sw_sz + 2 * sw_gap + 2 * sw_pad > appr_avail)      /* narrow panel: shrink to fit */
+    sw_sz = (appr_avail - 2 * sw_gap - 2 * sw_pad) / 3;
+  const int grid_w = 3 * sw_sz + 2 * sw_gap + 2 * sw_pad;
+  lv_obj_set_width(grid, grid_w);
+  /* `col` places its children with cross-axis START, so a grid narrower than the
+   * column would hug the left edge. Centre it by hand. */
+  lv_obj_set_style_margin_left(grid, (appr_avail - grid_w) / 2, 0);
   lv_obj_set_height(grid, LV_SIZE_CONTENT);
   lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(grid, 0, 0);
-  lv_obj_set_style_pad_all(grid, UI_PX(6), 0);
+  lv_obj_set_style_pad_all(grid, sw_pad, 0);
   lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
   lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_row(grid, UI_PX(22), 0);
-  lv_obj_set_style_pad_column(grid, UI_PX(16), 0);
+  lv_obj_set_style_pad_column(grid, sw_gap, 0);
 
   for (uint8_t i = 0; i < APPR_COLOR_COUNT; i++) {
     lv_obj_t *sw = lv_btn_create(grid);
-    lv_obj_set_size(sw, UI_PX(78), UI_PX(78));
+    lv_obj_set_size(sw, sw_sz, sw_sz);
     lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(sw, lv_color_hex(APPR_COLORS[i]), 0);
     lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);

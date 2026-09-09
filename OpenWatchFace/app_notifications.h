@@ -161,7 +161,26 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
                           const char *body, bool unread, uint8_t cat) {
   lv_obj_t *row = lv_obj_create(list);    // plain container, made clickable below
   lv_obj_remove_style_all(row);
-  lv_obj_set_width(row, UI_COL_W(330));
+  /* WIDTH: the parent list is ALREADY narrowed for this panel (UI_COL_W(360)),
+   * so passing the row through UI_COL_W as well applied the panel percentage
+   * TWICE. On the 360 px C2 that is 86% of 86% = 266 px inside a 309 px list --
+   * 47 px of black bar down each side of a screen that has none to spare, which
+   * is what made the whole app look shrunken. Take the list's width and give
+   * back the room the scrollbar needs.
+   *
+   * The reserve is NOT the same on both: the reference layout gave up 30 px of
+   * 360, which is fine on a 410 px panel and is kept verbatim there so those
+   * boards do not move at all. On the C2 the list is already down to 309 px and
+   * a second 30 px bite is most of what is left, so the narrow panels reserve a
+   * scaled 12 instead. The result stays inside the circle: the list starts at
+   * y=90, where a 360 px round face allows a 312 px chord, and the row lands at
+   * 299. */
+#if BOARD_SCREEN_SUBREF || BOARD_SCREEN_ROUND_SMALL
+  const int row_w = UI_COL_PX(360) - UI_PX(12);
+#else
+  const int row_w = 330;                        /* reference: unchanged */
+#endif
+  lv_obj_set_width(row, row_w);
   // Fixed height: roomy enough for a two-line title. The list shows the TITLE ONLY
   // (the body preview used to sit under it and overlap on short rows); the title now
   // gets the whole row and may wrap to two lines. Full body is shown in the reader.
@@ -198,8 +217,11 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
     lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
   }
 
-  // Text takes the middle; the X button sits on the right.
-  const int text_w = 270 - text_x;
+  // Text takes the middle; the X button sits on the right. Derived from the row
+  // rather than the old hard-coded 270, which was the reference row's content
+  // width (330 - 24 pad - 36 button) and therefore ran the title straight under
+  // the X on any narrower panel.
+  const int text_w = row_w - 24 /* pad */ - 36 /* X button */ - text_x;
 
   // Title only — vertically centered, wrapping to (up to) two lines in the tall row.
   // The body preview was removed (it overlapped the title); the reader shows it in full.
@@ -331,7 +353,7 @@ static void app_open_notifications(void) {
   // Scrollable list area, from below the title down to just above the bottom bar.
   // When paged, leave extra room at the bottom for the Prev/Next row.
   lv_obj_t *list = lv_obj_create(app_scr);
-  lv_obj_set_width(list, UI_COL_W(360));
+  lv_obj_set_width(list, UI_COL_PX(360));
   lv_obj_set_height(list, multipage ? 280 : 320);
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 90);
   lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
@@ -356,7 +378,7 @@ static void app_open_notifications(void) {
   if (multipage) {
     lv_obj_t *pager = lv_obj_create(app_scr);
     lv_obj_remove_style_all(pager);
-    lv_obj_set_width(pager, UI_COL_W(360));
+    lv_obj_set_width(pager, UI_COL_PX(360));
     lv_obj_set_height(pager, 44);
     lv_obj_align(pager, LV_ALIGN_BOTTOM_MID, 0, -84);
     lv_obj_clear_flag(pager, LV_OBJ_FLAG_SCROLLABLE);

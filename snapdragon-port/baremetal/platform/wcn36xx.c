@@ -1,5 +1,5 @@
 /* wcn36xx.c — the WLAN data path (DXE DMA engine) and a passive scan
- * (step 6 of WIFI-BRINGUP.md, second half).
+ * (the WCN36xx HAL + DXE data path).
  *
  * Port of the parts of drivers/net/wireless/ath/wcn36xx/{dxe.c,txrx.c,smd.c}
  * that a polling, single-threaded caller needs to SEE FRAMES: the four DXE
@@ -398,10 +398,16 @@ static int hal_xfer(struct smd_chan *ch, uint32_t len, uint32_t want)
     return -1;
 }
 
-int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max)
+/* only_ch != 0 restricts the sweep to that one channel -- the "I already know
+ * where this AP lives" path in wlan_connect(). A full 1..13 passive sweep is
+ * 13 * dwell plus four HAL round-trips per channel; one channel is a twentieth
+ * of that, and the caller falls back to the full sweep if the AP is not there. */
+int wcn36xx_scan_ch(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max,
+                    uint32_t only_ch)
 {
     uint8_t *b = (uint8_t *)s_buf;
     uint32_t ch, i, t;
+    uint32_t ch_lo = only_ch ? only_ch : 1u, ch_hi = only_ch ? only_ch : 13u;
     int got;
 
     s_nres = s_nframes = s_nbeacon = 0;
@@ -413,9 +419,10 @@ int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net 
     vsay("wcn36xx: INIT_SCAN ... ");
     got = hal_xfer(wlan, 48u, HAL_INIT_SCAN_RSP);
     if (got < 12 || s_buf[2] != 0u) { say_hex("FAILED status=", got >= 12 ? s_buf[2] : 0xFFFFFFFFu); say("\n"); return -1; }
-    vsay("ok\nwcn36xx: passive scan, channels 1..13, dwell "); con_dbg_dec(dwell_ms); vsay(" ms each\n");
+    vsay("ok\nwcn36xx: passive scan, channels "); con_dbg_dec(ch_lo); vsay(".."); con_dbg_dec(ch_hi);
+    vsay(", dwell "); con_dbg_dec(dwell_ms); vsay(" ms each\n");
 
-    for (ch = 1; ch <= 13u; ch++) {
+    for (ch = ch_lo; ch <= ch_hi; ch++) {
         s_buf[0] = HAL_START_SCAN_REQ; s_buf[1] = 9u; b[8] = (uint8_t)ch;
         got = hal_xfer(wlan, 9u, HAL_START_SCAN_RSP);
         if (got < 12 || s_buf[2] != 0u) { say_dec("wcn36xx: START_SCAN ch ", ch); say_hex(" FAILED status=", got >= 12 ? s_buf[2] : 0xFFFFFFFFu); say("\n"); break; }
@@ -430,7 +437,7 @@ int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net 
     /* FINISH_SCAN: mode SCAN, back to channel 1, single-channel centred */
     memset(s_buf, 0, 56);
     s_buf[0] = HAL_FINISH_SCAN_REQ; s_buf[1] = 53u; s_buf[2] = HAL_SYS_MODE_SCAN;
-    b[12] = 1u;                                   /* oper_channel */
+    b[12] = (uint8_t)ch_lo;                       /* oper_channel */
     /* cb_state (u32 @13..16) = 0, bssid @17, notify/frame_type/len @23..25, mgmt hdr @26, scan_entry @50 */
     vsay("wcn36xx: FINISH_SCAN ... ");
     got = hal_xfer(wlan, 53u, HAL_FINISH_SCAN_RSP);
@@ -456,10 +463,17 @@ int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net 
     return (int)s_nres;
 }
 
+/* The full 1..13 sweep -- what every caller but wlan_connect()'s fast path wants. */
+int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max)
+{
+    return wcn36xx_scan_ch(wlan, dwell_ms, out, max, 0u);
+}
+
 #else
 int wcn36xx_dxe_init(void) { return -1; }
 uint32_t wcn36xx_rx_poll(void) { return 0; }
 int wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max) { (void)wlan; (void)dwell_ms; (void)out; (void)max; return -1; }
+int wcn36xx_scan_ch(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max, uint32_t only_ch) { (void)wlan; (void)dwell_ms; (void)out; (void)max; (void)only_ch; return -1; }
 int wcn36xx_tx(const uint8_t bd[40], const uint8_t *frame, uint32_t len, int high) { (void)bd; (void)frame; (void)len; (void)high; return -1; }
 void wcn36xx_set_rx_handler(void (*fn)(const uint8_t *f, uint32_t len, int8_t rssi)) { (void)fn; }
 #endif

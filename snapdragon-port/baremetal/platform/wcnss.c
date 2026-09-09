@@ -1,5 +1,5 @@
 /* wcnss.c — boot the Pronto/WCNSS WiFi co-processor (steps 3+4 of
- * WIFI-BRINGUP.md).
+ * the WCNSS bring-up).
  *
  * WHAT HAS TO HAPPEN, in the order mainline's qcom_wcnss.c + mdt_loader.c do
  * it (the vendor tree does the same things spread over three drivers):
@@ -51,6 +51,7 @@
 #endif
 static void say(const char *s) { con_puts(s); con_flush(); usb_poll(); blackbox_sync(); }
 static void say_hex(const char *s, uint32_t v) { con_puts(s); con_puthex(v); con_flush(); usb_poll(); }
+static void say_dec(const char *s, uint32_t v) { con_puts(s); con_putdec(v); con_flush(); usb_poll(); }
 static void say_rc(const char *s, int rc)
 {
     if (rc >= 0) { con_dbg(s); con_dbg(" ok"); if (rc) { con_dbg(" ("); con_dbg_dec((uint32_t)rc); con_dbg(")"); } con_dbg("\n"); }
@@ -1042,11 +1043,70 @@ int wcnss_boot(void)
 uint32_t wlan_hal_xfer(const void *msg, uint32_t len, uint32_t want, uint32_t *rsp, uint32_t max, uint32_t ms)
 {   return hal_send_wait(msg, len, want, rsp, max, ms); }
 
+/* ---- the WiFi MAC address ------------------------------------------------
+ *
+ * THIS IS A PUBLISHING HAZARD, so it is worth spelling out. tools/mk-wcnss-nv.sh
+ * bakes the builder's own /persist/wifimac.ini into wcnss_mac[], and that array
+ * ends up inside the .img. Ship such an image as a release and every watch that
+ * flashes it transmits the BUILDER's MAC: their device identifier shows up on
+ * strangers' networks, strangers' traffic looks like theirs, and two of the
+ * watches on one network fight over ARP and DHCP.
+ *
+ * So a MAC is only used when it was deliberately baked in. Otherwise -- and
+ * that is what a release image should be -- one is derived per device from the
+ * eMMC CID, which carries the card's manufacturer id and a 32-bit product
+ * serial: unique to the physical watch, identical across reboots, and nothing
+ * to do with whoever built the image. The result is marked LOCALLY ADMINISTERED
+ * (bit 1 of the first octet) and unicast (bit 0 clear), which is the range
+ * reserved for exactly this and is what phone MAC randomisation uses too.
+ *
+ * The last resort, if the eMMC never identified, is the old fixed address --
+ * still better than nothing, but two such watches on one network will collide.
+ *
+ * -DWLAN_MAC_DERIVE forces derivation even when a MAC was baked in: that is the
+ * flag to build public release images with while keeping your own NV blob. */
 extern const uint8_t wcnss_mac[6] __attribute__((weak));
+
+static void mac_from_cid(uint8_t out[6])
+{
+    static const uint8_t fixed[6] = { 0x02, 0x00, 0x5e, 0x00, 0x00, 0x01 };
+    uint32_t cid[4];
+    if (emmc_cid(cid) != 0) { memcpy(out, fixed, 6); return; }
+    /* FNV-1a over the CID, folded to 6 bytes. Any stable mixing would do; the
+     * point is only that two different CIDs do not land on the same MAC. */
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned i = 0; i < 16u; i++) {
+        h ^= (uint8_t)(cid[i / 4u] >> (8u * (i % 4u)));
+        h *= 1099511628211ull;
+    }
+    for (unsigned i = 0; i < 6u; i++) out[i] = (uint8_t)(h >> (8u * i));
+    out[0] = (uint8_t)((out[0] & 0xFEu) | 0x02u);   /* locally administered, unicast */
+}
+
 const uint8_t *wlan_mac(void)
 {
-    static const uint8_t fallback[6] = { 0x02, 0x00, 0x5e, 0x00, 0x00, 0x01 };   /* locally administered */
-    return wcnss_mac ? wcnss_mac : fallback;
+    static uint8_t mac[6];
+    static int done;
+    if (!done) {
+        done = 1;
+#if defined(WLAN_MAC_DERIVE)
+        int baked = 0;
+#else
+        int baked = (wcnss_mac != 0);
+#endif
+        if (baked) { memcpy(mac, wcnss_mac, 6); }
+        else       { mac_from_cid(mac); }
+        con_puts("wlan: MAC "); 
+        for (unsigned i = 0; i < 6u; i++) {
+            static const char hx[] = "0123456789ABCDEF";
+            con_putc(hx[mac[i] >> 4]); con_putc(hx[mac[i] & 15u]);
+            if (i < 5u) con_putc(':');
+        }
+        con_puts(baked ? " (baked into this image)\n"
+                       : " (derived per device from the eMMC CID)\n");
+        con_flush();
+    }
+    return mac;
 }
 
 /* ---- the radio as the app sees it ------------------------------------- */
@@ -1082,10 +1142,12 @@ int wlan_up(void)
     int rc;
     if (s_wlan_up && s_hal_up) return 0;
     if (s_wlan_up) {                          /* firmware resident, MAC stopped */
+        uint32_t t = timer_ms();
         vsay("wlan: restarting the MAC\n");
         wdog_extend(31u); deadman_kick();
         rc = wlan_hal_mac_start();
-        say(rc == 0 ? "wlan: radio UP (MAC restarted)\n" : "wlan: MAC restart FAILED\n");
+        if (rc == 0) say_dec("wlan: radio UP (MAC restarted in ", timer_ms() - t), say(" ms)\n");
+        else         say("wlan: MAC restart FAILED\n");
         return rc;
     }
     if (!smem_ok() && smem_init() != 0) { vsay("wlan: SMEM not available\n"); return -1; }
@@ -1194,19 +1256,69 @@ int wlan_scan(struct wlan_scan_net *out, uint32_t max)
     return n;
 }
 
+/* WHERE THE CONNECT SECONDS GO, and the one that is ours to fix.
+ *
+ * A join used to open with an unconditional PASSIVE sweep of channels 1..13 at
+ * 150 ms dwell -- ~2 s of dwell plus four HAL round-trips per channel, before a
+ * single frame of the actual join is sent. Passive is the right default when we
+ * do not know where the AP is; it is pure waste when we joined the same AP ten
+ * minutes ago and it has not moved.
+ *
+ * So remember the channel of the AP we last associated with, per SSID, and try
+ * THAT channel alone first (one dwell, ~200 ms). A hit goes straight to the
+ * join. A miss -- AP moved channel, different site, roamed to another band --
+ * falls through to the full sweep exactly as before, so this can only ever cost
+ * one extra dwell in the worst case and never changes which AP we pick.
+ *
+ * Cache is RAM-only and per SSID: after a reboot the first join pays the full
+ * sweep once and every join after that is short. */
+static char     s_hint_ssid[33];
+static uint32_t s_hint_chan;
+
+static int pick_best(const struct wlan_scan_net *nets, int n, const char *ssid)
+{
+    int i, best = -1;
+    for (i = 0; i < n; i++)
+        if (!strcmp(nets[i].ssid, ssid) && (best < 0 || nets[i].rssi > nets[best].rssi)) best = i;
+    return best;
+}
+
 int wlan_connect(const char *ssid, const char *pass)
 {
     static struct wlan_scan_net nets[16];
-    int n, i, best = -1;
+    int n, best = -1;
+    uint32_t t_scan, t0;
     if (wlan_up() != 0) return -1;
     if (wlan_sta_connected()) return 0;
-    vsay("wlan: connect: scanning for \""); vsay(ssid); vsay("\"\n");
-    n = wlan_scan(nets, 16u);
-    for (i = 0; i < n; i++)
-        if (!strcmp(nets[i].ssid, ssid) && (best < 0 || nets[i].rssi > nets[best].rssi)) best = i;
+
+    t0 = timer_ms();
+    if (s_hint_chan && !strcmp(s_hint_ssid, ssid)) {
+        vsay("wlan: connect: directed scan for \""); vsay(ssid);
+        vsay_dec("\" on ch ", s_hint_chan); vsay("\n");
+        wdog_extend(31u); deadman_kick();
+        n = (!s_wlan_up || !s_hal_up) ? -1 : wcn36xx_scan_ch(&s_wlan, 200u, nets, 16u, s_hint_chan);
+        wdog_extend(31u); deadman_kick();
+        best = (n > 0) ? pick_best(nets, n, ssid) : -1;
+        if (best < 0) vsay("wlan: connect: not on the remembered channel, full scan\n");
+    }
+    if (best < 0) {
+        vsay("wlan: connect: scanning for \""); vsay(ssid); vsay("\"\n");
+        n = wlan_scan(nets, 16u);
+        best = pick_best(nets, n, ssid);
+    }
+    t_scan = timer_ms() - t0;
     if (best < 0) { say("wlan: connect: network not seen\n"); return -1; }
+
+    /* Remember where it was, for the next join. */
+    { uint32_t l = (uint32_t)strlen(ssid); if (l > 32u) l = 32u;
+      memcpy(s_hint_ssid, ssid, l); s_hint_ssid[l] = 0; s_hint_chan = nets[best].chan; }
+
     wdog_extend(31u); deadman_kick();
-    return wlan_sta_connect(ssid, pass, &nets[best]);   /* link only; the caller brings IP up WITHOUT holding the lock */
+    t0 = timer_ms();
+    { int rc = wlan_sta_connect(ssid, pass, &nets[best]);   /* link only; the caller brings IP up WITHOUT holding the lock */
+      say_dec("wlan: connect timing: scan ", t_scan);
+      say_dec(" ms, link ", timer_ms() - t0); say(" ms\n");
+      return rc; }
 }
 int wlan_connected(void) { return s_wlan_up && s_hal_up && wlan_sta_connected(); }
 int wlan_disconnect(void) { net_down(); return wlan_sta_disconnect(); }

@@ -1,5 +1,5 @@
 /* smd.c — Shared Memory Driver: byte/packet channels to the other cores
- * (step 2 of WIFI-BRINGUP.md), plus the RPM "ping" that validates it.
+ * (the RPM transport), plus the RPM "ping" that validates it.
  *
  * WHAT SMD IS: a pair of ring buffers in SMEM per channel, one per direction,
  * each with an 11-word control block (state, handshake flags, head, tail),

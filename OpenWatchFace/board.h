@@ -62,10 +62,10 @@
 #define BOARD_ID_FOSSIL_GEN6 12 /* Fossil Gen 6 hoki (Wear 4100+ / SDA429W, bare-metal A53/AArch32) */
 #define BOARD_ID_TDECK_PRO 13   /* LilyGo T-Deck Pro (e-paper, QWERTY, LoRa, GNSS) */
 #define BOARD_ID_TICWATCH_C2 14 /* Mobvoi TicWatch C2 skipjack (Wear 2100, bare-metal A7) */
-#define BOARD_ID_TICWATCH_S2 15 /* Mobvoi TicWatch S2/E2 tunny (Wear 2100, bare-metal A7) */
+#define BOARD_ID_TICWATCH_S2 15 /* Mobvoi TicWatch S2/E2 tunny (Wear 2100, bare-metal A7, 400x400) */
 
 #ifndef BOARD_SELECT
-#define BOARD_SELECT  BOARD_ID_S3_206         /* <-- change this line to pick the board */
+#define BOARD_SELECT  BOARD_ID_FOSSIL_GEN6         /* <-- change this line to pick the board */
 #endif
 
 #if   BOARD_SELECT == BOARD_ID_S3_206

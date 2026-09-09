@@ -17,7 +17,7 @@
 
 #define DEVICE_NAME    "OpenWatchFace"        // full product name
 #define DEVICE_SHORT   "WatchFace"            // short form
-#define DEVICE_VERSION "1.5.0"                // firmware version
+#define DEVICE_VERSION "1.5.1"                // firmware version
 #define DEVICE_AUTHOR  "Noel Ejemyr"          // project author
 #ifndef BOARD_VENDOR
 #define BOARD_VENDOR   "Unknown"              // boards should define this next to BOARD_NAME

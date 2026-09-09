@@ -34,9 +34,9 @@ void mmu_enable_flat(void)
 #if defined(PLAT_SOC_MSM8909)
     /* Same carve-out reasoning as the Gen 6 block below, with this SoC's own
      * numbers, read from the reserved-memory node of the DTB dumped off a
-     * Fossil Gen 4 (snapdragon-port/firefish-stock.dts) — and then found to be
+     * Fossil Gen 4 (snapdragon-port/dtbs/firefish-stock.dts) — and then found to be
      * BYTE-IDENTICAL in the TicWatch C2's tree
-     * (dumps/c2-skipjack-fromsource/skipjack.dts:9109-9132), all four ranges
+     * (dtbs/skipjack-fromsource.dts:9109-9132), all four ranges
      * including ramoops. They describe where the modem, ADSP and TrustZone
      * images live on msm8909w, which is a property of the SoC's memory map
      * rather than of either watch, so both get them:

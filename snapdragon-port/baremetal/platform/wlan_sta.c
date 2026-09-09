@@ -1,5 +1,5 @@
 /* wlan_sta.c — station side: authenticate, associate, WPA2-PSK 4-way
- * handshake, install the keys (step 7 of WIFI-BRINGUP.md).
+ * handshake, install the keys (the 802.11 STA client).
  *
  * The sequence is the one mainline's wcn36xx + mac80211 + wpa_supplicant
  * perform, collapsed into one polled state machine:
@@ -483,9 +483,33 @@ int wlan_sta_connect(const char *ssid, const char *pass, const struct wlan_scan_
     memcpy(s_rsn_ie, rsn, 22);
     say("sta: connecting to \""); say(ssid); say_hex("\" ch ", s_chan); say_hex(" rssi -", (uint32_t)-bss->rssi); say("\n");
 
-    vsay("sta: deriving PMK (PBKDF2, 8192 HMACs) ... ");
-    wpa_pmk_from_passphrase(pass, s_ssid, s_ssid_len, s_pmk);
-    vsay("done\n");
+    /* PBKDF2 4096 iterations over two output blocks = 8192 HMAC-SHA1, in
+     * software, on a 400 MHz A7. It is pure arithmetic over (passphrase, SSID)
+     * -- nothing about the AP, the session or the nonce goes into it -- so the
+     * answer is the same every single time we rejoin the same network, and
+     * paying it on every join is the definition of waste. Cache the last one.
+     *
+     * RAM only, deliberately: the PMK is passphrase-equivalent, and while the
+     * passphrase is already stored on the watch, writing a derived key into
+     * flash as well buys nothing except another copy to leak. First join after
+     * a boot pays; every one after it does not. */
+    { static uint8_t s_pmk_valid;
+      static char    s_pmk_ssid[33];
+      static char    s_pmk_pass[64];
+      static uint8_t s_pmk_cache[32];
+      if (s_pmk_valid && !strncmp(s_pmk_ssid, ssid, 33) && !strncmp(s_pmk_pass, pass, 64)) {
+          memcpy(s_pmk, s_pmk_cache, 32);
+          vsay("sta: PMK from cache\n");
+      } else {
+          uint32_t t_pmk = timer_ms();
+          vsay("sta: deriving PMK (PBKDF2, 8192 HMACs) ... ");
+          wpa_pmk_from_passphrase(pass, s_ssid, s_ssid_len, s_pmk);
+          con_puts("sta: PMK derived in "); con_putdec(timer_ms() - t_pmk); con_puts(" ms\n"); con_flush();
+          memcpy(s_pmk_cache, s_pmk, 32);
+          strncpy(s_pmk_ssid, ssid, 32); s_pmk_ssid[32] = 0;
+          strncpy(s_pmk_pass, pass, 63); s_pmk_pass[63] = 0;
+          s_pmk_valid = 1;
+      } }
 
     wcn36xx_set_rx_handler(rx_handler);
     if (hal_add_sta_self() < 0) return -1;

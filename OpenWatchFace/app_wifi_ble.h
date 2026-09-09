@@ -306,10 +306,10 @@ static void wifi_forget_prompt_cb(lv_event_t *e) {
 
 /* =====================  Available networks (WiFi scan)  =====================
  * A refresh-button section listing every AP in range. Joining differs by board:
- *   - Keyboard boards (T-Deck Pro): ANY network is selectable. A secured one
- *     opens a password prompt typed on the physical keyboard.
- *   - No keyboard: only OPEN networks and already-saved ones are listed at all —
- *     there is no way to enter a password on those devices.
+ * every network in range is listed and any of them can be joined; the only
+ * difference between boards is where the password is typed:
+ *   - T-Deck Pro (physical QWERTY): a small modal with a textarea.
+ *   - Everything else: the full-screen on-screen keyboard from ui_keyboard.h.
  * Gated off the platforms whose WiFi shim has no scan API (Tuya's compat WiFi
  * class, Maix, Fossil). */
 #define WIFI_SCAN_SUPPORTED (!BOARD_PLATFORM_TUYA && !BOARD_PLATFORM_MAIX)   /* Fossil: scan backed by the WCNSS stack since 2026-09-03 */
@@ -321,7 +321,7 @@ static void wifi_forget_prompt_cb(lv_event_t *e) {
  * seconds instead of waiting for the next scheduled sync. */
 static volatile bool s_wifi_join_kick = false;
 
-#define WSCAN_MAX 16
+#define WSCAN_MAX 24
 struct WifiScanNet { char ssid[WIFI_SSID_MAX]; int16_t rssi; bool secured; };
 static WifiScanNet s_wscan[WSCAN_MAX];
 static uint8_t     s_wscan_count = 0;
@@ -395,13 +395,21 @@ static void wscan_start_cb(lv_event_t *e) {
   wb_rebuild_keep_scroll();               // show the "Scanning..." state
 }
 
+/* Shown under the Scan button when a join could not be saved. Without it a full
+ * network list swallows the tap silently, which reads as "typing the password
+ * did nothing". Cleared by the next successful join. */
+static char s_wjoin_msg[64] = "";
+
 /* Save a network chosen from the scan list and nudge the net task to connect. */
 static void wifi_join_commit(const char *ssid, const char *pass) {
   store_lock();                           // list is shared with the net task
   bool added = wifi_nets_add(ssid, pass);
   if (added) wifi_nets_save();
+  uint8_t cap = s_wifi_sd ? WIFI_NET_CAP : WIFI_NET_MAX;
   store_unlock();
-  if (added) s_wifi_join_kick = true;
+  if (added) { s_wifi_join_kick = true; s_wjoin_msg[0] = '\0'; }
+  else snprintf(s_wjoin_msg, sizeof(s_wjoin_msg),
+                "Saved-network list is full (%u) - forget one first", cap);
   wb_rebuild_keep_scroll();               // row now shows its "saved" tag
 }
 
@@ -496,15 +504,40 @@ static void wifi_pass_prompt(const char *ssid) {
 }
 #endif  /* BOARD_HAS_KEYBOARD_TCA8418 */
 
+#if OWF_HAS_OSK
+/* ---- Password prompt (every board without a physical keyboard) ----
+ * The on-screen QWERTY (ui_keyboard.h) takes the whole screen, so unlike the
+ * T-Deck Pro's modal there is no room for the SSID in a box around it — the
+ * title line carries it instead. The SSID is COPIED here rather than held as an
+ * index into s_wscan: a rescan can complete while the keyboard is open and
+ * renumber that list, and joining a different network than the one you tapped
+ * is the kind of bug nobody would think to look for. */
+static char s_osk_ssid[WIFI_SSID_MAX];
+
+static void wifi_osk_done_cb(const char *pass, void *user) {
+  (void)user;
+  if (s_osk_ssid[0]) wifi_join_commit(s_osk_ssid, pass);
+}
+
+static void wifi_osk_prompt(const char *ssid) {
+  strncpy(s_osk_ssid, ssid, WIFI_SSID_MAX - 1);
+  s_osk_ssid[WIFI_SSID_MAX - 1] = '\0';
+  char title[WIFI_SSID_MAX + 16];
+  snprintf(title, sizeof(title), "Password for %s", s_osk_ssid);
+  owf_kb_open(title, "", WIFI_PASS_MAX, wifi_osk_done_cb, nullptr);
+}
+#endif  /* OWF_HAS_OSK */
+
 static void wifi_scan_row_cb(lv_event_t *e) {
   uint8_t idx = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
   if (idx >= s_wscan_count) return;
   if (wifi_ssid_known(s_wscan[idx].ssid)) return;   // already saved; row shows the tag
   if (!s_wscan[idx].secured) { wifi_join_commit(s_wscan[idx].ssid, ""); return; }
 #if BOARD_HAS_KEYBOARD_TCA8418
-  wifi_pass_prompt(s_wscan[idx].ssid);
+  wifi_pass_prompt(s_wscan[idx].ssid);              // type on the physical QWERTY
+#elif OWF_HAS_OSK
+  wifi_osk_prompt(s_wscan[idx].ssid);               // type on the on-screen QWERTY
 #endif
-  // No keyboard: secured unknown networks are never rendered, so no else-branch.
 }
 
 /* One scan-result row: WiFi icon + SSID + a right-aligned status tag. The whole
@@ -892,6 +925,16 @@ static void app_open_wifi_ble(void) {
   lv_obj_center(sbl);
 
 
+  if (s_wjoin_msg[0]) {
+    lv_obj_t *jm = lv_label_create(list);
+    lv_obj_set_style_text_font(jm, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(jm, lv_color_hex(0xE0A030), 0);
+    lv_obj_set_width(jm, LV_PCT(92));
+    lv_label_set_long_mode(jm, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(jm, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(jm, s_wjoin_msg);
+  }
+
   if (!settings_get_wifi_enabled()) {
     lv_obj_t *off = lv_label_create(list);
     lv_obj_set_style_text_font(off, &FONT_SMALL, 0);
@@ -900,11 +943,11 @@ static void app_open_wifi_ble(void) {
   } else if (!s_wscan_busy) {
     uint8_t shown = 0;
     for (uint8_t i = 0; i < s_wscan_count; i++) {
-#if !BOARD_HAS_KEYBOARD_TCA8418
-      // No keyboard = no way to type a password: hide secured networks unless
-      // they're already saved (their password came from elsewhere: BLE, CSV).
-      if (s_wscan[i].secured && !wifi_ssid_known(s_wscan[i].ssid)) continue;
-#endif
+      // EVERY network in range is listed, secured or not. This used to hide
+      // secured-and-unknown ones on boards with no physical keyboard, because
+      // back then there was no way to type a password on them; the on-screen
+      // keyboard (ui_keyboard.h) removed that reason, and hiding them made the
+      // scan look broken ("it only finds the ones I already saved").
       wifi_scan_row(list, i);
       shown++;
     }

@@ -736,6 +736,14 @@ static void app_menu_init(void) {
   // the tiles at 75 px — 2 px off the previous 77 — instead of paying the full
   // 16 px out of the tile.
   const int qs_dots_strip = 60;
+#elif BOARD_SCREEN_ROUND
+  // FULL-SIZE ROUND face (Gen 4 416, T5 466). The strip was 22 RAW px while the
+  // dots are anchored UI_PX(-44) from the bottom -- so the reserved band ended at
+  // y=394 on the Gen 4 while the dots sat at 363..371, i.e. INSIDE the pager. The
+  // bottom tile row (Weather) was drawn straight over them. The two numbers have
+  // to come from the same place, so derive the strip from the anchor: the lift,
+  // plus the dot itself, plus a little air above it.
+  const int qs_dots_strip = UI_PX(44) + UI_PX(8) + UI_PX(10);
 #else
   const int qs_dots_strip = 22;                 // bottom strip height for the page dots
 #endif
@@ -815,9 +823,12 @@ static void app_menu_init(void) {
   // by a fallback rather than by the fit — cap honestly instead.
   if (tile_sz > 96) tile_sz = 96;
 #elif BOARD_SCREEN_ROUND
-  // ROUND (T5): full 104 px tiles sat a touch tight; shrink VERY slightly to 96 so the
-  // grid is a bit more compact (the user wanted only a small reduction). Cap to fit_w.
-  tile_sz = (fit_w < 96) ? fit_w : 96;
+  // ROUND (Gen 4 416, T5 466): 96 is the preferred size, but cap it to the fit on
+  // BOTH axes. This used to cap to fit_w alone, which re-made the exact bug the
+  // comment two branches down describes: on a square 416 panel fit_w is 114 and
+  // fit_h is 80, so a width-only cap handed back 96 and the 3-row grid grew 48 px
+  // taller than the space it had. tile_sz already holds min(fit_w, fit_h).
+  if (tile_sz > 96) tile_sz = 96;
 #elif !BOARD_SCREEN_NARROW
   // The ORIGINAL menu used FIXED 104x104 tiles, and the S3-2.06 look is defined by
   // that size — so 104 stays the PREFERRED size. But it is only a PREFERENCE: cap it

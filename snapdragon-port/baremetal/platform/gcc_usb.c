@@ -161,4 +161,41 @@ int gcc_usb_hs_up(void)
     return rc;
 }
 
+/* Gate the four USB branch clocks and put them back (mirrors gcc_mdss_sleep).
+ *
+ * CURRENTLY UNUSED, ON PURPOSE. Calling this for a sleep rebooted the watch the
+ * instant it slept (v205, 2026-09-09): THE LOG CONSOLE IS THIS USB CONTROLLER,
+ * the suspend path keeps printing after the gate, and an MMIO access into a
+ * block whose AHB clock has stopped is a NoC error -> TrustZone -> PS_HOLD. Any
+ * future caller must be after the LAST con_flush()/usb_poll() of the sleep and
+ * must restore before the first one on wake. The PHY's 480 MHz PLL, which is
+ * where the power actually is, is stopped by PORTSC.PHCD without any of this
+ * (usb_phy_lowpower(), used by sleep_quiesce.c). Only branches that were
+ * running are restored, so it is a no-op on a boot that never used USB. */
+void gcc_usb_sleep(int on)
+{
+    static const uint32_t k_usb_branches[] = {
+        USB_HS_SYSTEM_CBCR, USB2A_PHY_SLEEP_CBCR,
+        USB_HS_PHY_CFG_AHB_CBCR, USB_HS_AHB_CBCR,   /* AHB last off, first on */
+    };
+    static uint32_t s_usb_sleep_mask;
+    unsigned n = sizeof k_usb_branches / sizeof k_usb_branches[0];
+    if (on) {
+        s_usb_sleep_mask = 0;
+        for (unsigned i = 0; i < n; i++) {
+            uint32_t off = k_usb_branches[i];
+            if (GCC_R(off) & CBCR_CLK_ENABLE) {
+                s_usb_sleep_mask |= 1u << i;
+                GCC_W(off, GCC_R(off) & ~CBCR_CLK_ENABLE);
+            }
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
+    } else {
+        for (unsigned i = n; i-- > 0;)
+            if (s_usb_sleep_mask & (1u << i)) (void)branch_enable(k_usb_branches[i]);
+        timer_delay_us(200u);
+        s_usb_sleep_mask = 0;
+    }
+}
+
 #endif /* PLAT_HAVE_USB_CDC */

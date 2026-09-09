@@ -78,6 +78,10 @@ void usb_phy_qusb_por(void);
 void gcc_usb_qusb2_phy_reset(void);
 void usb_diag(uint32_t *portsc, uint32_t *usbsts, uint32_t *vid, int *cfg);
 void usb_phy_lowpower(int on);
+void gcc_usb_sleep(int on);       /* gcc_usb.c: gate/restore the USB branch clocks for a cable-less sleep */
+int  emmc_cid(uint32_t out[4]);   /* sdhci_msm.c: the eMMC's CID (device-unique, stable); -1 if it never identified */
+void sleep_quiesce_enter(int cable_live);   /* sleep_quiesce.c (-DSLEEP_QUIESCE): AP-owned clocks the RPM sleep set cannot reach */
+void sleep_quiesce_exit(void);
 void usb_irq_arm(int on);             /* usb_ci.c (-DUSB_IRQ_WAKE): controller IRQ as a wake source */        /* usb_ci.c: PORTSC.PHCD for a cable-less sleep */
 /* sleep_floor.c (-DSLEEP_FLOOR): RPM active-set trimming + measured ladder */
 void sleep_floor_census(const char *tag);
@@ -697,6 +701,8 @@ struct wlan_scan_net { char ssid[33]; uint8_t bssid[6]; uint8_t chan; int8_t rss
 int      wcn36xx_dxe_init(void);
 uint32_t wcn36xx_rx_poll(void);
 int      wcn36xx_scan(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max);
+int      wcn36xx_scan_ch(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_net *out, uint32_t max,
+                         uint32_t only_ch);   /* only_ch 0 = the full 1..13 sweep */
 int      wcn36xx_tx(const uint8_t bd[40], const uint8_t *frame, uint32_t len, int high);   /* high = mgmt ring */
 void     wcn36xx_set_rx_handler(void (*fn)(const uint8_t *f, uint32_t len, int8_t rssi));
 /* wcnss.c: one HAL request/response over WLAN_CTRL; returns reply bytes or 0 */

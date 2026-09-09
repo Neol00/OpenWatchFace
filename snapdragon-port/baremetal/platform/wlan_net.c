@@ -1,5 +1,5 @@
 /* wlan_net.c — lwIP (NO_SYS, raw API) on top of the station link
- * (step 8 of WIFI-BRINGUP.md). One netif, DHCP, DNS, SNTP, and a small
+ * (lwIP on top of the STA). One netif, DHCP, DNS, SNTP, and a small
  * blocking TCP client API for the Arduino-facing classes in compat/.
  *
  * THREADING: lwIP NO_SYS is single-context. Everything that touches it runs
@@ -22,6 +22,7 @@ unsigned long owf_lwip_rand(void)
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
+#include "lwip/prot/dhcp.h"   /* DHCP_STATE_* -- the client states live in the protocol header */
 #include "lwip/dns.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
@@ -105,9 +106,29 @@ static void net_task(void *arg)
     }
 }
 
+/* Wait for the DHCP client to actually reach BOUND (an ACK), not merely for the
+ * netif to hold an address: the INIT-REBOOT path below keeps the old address
+ * set while it re-REQUESTs it, so "netif has an IP" is true from the first
+ * instant and says nothing about whether the lease is still ours. */
+static int wait_dhcp_bound(uint32_t ms)
+{
+    uint32_t t = timer_ms();
+    while (timer_ms() - t < ms) {
+        int bound; wlan_lock();
+        { struct dhcp *d = netif_dhcp_data(&s_nif);
+          bound = d && d->state == DHCP_STATE_BOUND &&
+                  !ip4_addr_isany_val(*netif_ip4_addr(&s_nif)); }
+        wlan_unlock();
+        if (bound) return 1;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return 0;
+}
+
 int net_up(void)
 {
     ip4_addr_t z; ip4_addr_set_zero(&z);
+    int reboot_path;
     wlan_lock();
     if (!s_lwip_inited) { lwip_init(); s_lwip_inited = 1; }
     if (!s_nif_added) {
@@ -122,22 +143,57 @@ int net_up(void)
     netif_set_up(&s_nif);
     s_link_up = 1;
     wlan_sta_tx_probe();
-    vsay("net: DHCP discover ...\n");
-    dhcp_start(&s_nif);
+
+    /* DHCP INIT-REBOOT instead of a cold DISCOVER whenever we still hold the
+     * lease from last time (net_down() no longer throws it away). A DISCOVER
+     * costs the full four-packet dance plus lwIP's retry backoff -- measured at
+     * ~4 s of a 9 s post-sleep reconnect -- while a REBOOT is one REQUEST and
+     * one ACK, typically tens of milliseconds.
+     *
+     * Joining a DIFFERENT network with a stale lease is handled by the protocol
+     * rather than by us guessing: the server NAKs a REQUEST for an address that
+     * is not ours on this subnet, and lwIP's dhcp_handle_nak() drops straight
+     * back to DISCOVER. The 2.5 s guard below covers the other case -- a server
+     * that simply ignores the REQUEST -- by restarting cold. */
+    { struct dhcp *d = netif_dhcp_data(&s_nif);
+      reboot_path = d && d->state != DHCP_STATE_OFF &&
+                    !ip4_addr_isany_val(*netif_ip4_addr(&s_nif));
+      if (reboot_path) { vsay("net: DHCP re-request (INIT-REBOOT) ...\n"); dhcp_network_changed(&s_nif); }
+      else             { vsay("net: DHCP discover ...\n");                 dhcp_start(&s_nif); } }
+
     if (!s_task_started) {
         xTaskCreate(net_task, "wlan-net", 4096, 0, 2, 0);
         s_task_started = 1;
     }
     wlan_unlock();
+
+    if (reboot_path) {
+        if (wait_dhcp_bound(2500u)) return 0;
+        say("net: lease not confirmed, falling back to a full DHCP discover\n");
+        wlan_lock();
+        dhcp_release_and_stop(&s_nif);
+        dhcp_start(&s_nif);
+        wlan_unlock();
+    }
     return net_wait_ip(15000u) ? 0 : -1;
 }
 
+/* Bring the interface down but KEEP the DHCP lease.
+ *
+ * This runs on every sleep (wlan_idle -> wlan_down -> here), and the old
+ * dhcp_release_and_stop() sent a DHCPRELEASE and freed the client state, so
+ * every single wake had to start again from DISCOVER. A watch that comes back
+ * to the same AP minutes later has no reason to hand the address back; phones
+ * do not release on screen-off either. The lease is re-verified with one
+ * REQUEST in net_up(), and the server NAKs it if it is no longer valid.
+ *
+ * net_has_ip()/net_ip() both gate on s_link_up, so a kept lease is never
+ * mistaken for a live connection while the radio is down. */
 void net_down(void)
 {
     wlan_lock();
     if (s_nif_added && s_link_up) {
         sntp_stop();
-        dhcp_release_and_stop(&s_nif);
         netif_set_down(&s_nif);
         netif_set_link_down(&s_nif);
     }

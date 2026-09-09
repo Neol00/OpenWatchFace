@@ -34,6 +34,16 @@
 #define BOOT_DIAG 1
 #endif
 #include "platform.h"
+
+/* eMMC CID, captured at CMD2 (see emmc_ident). Device-unique and stable. */
+static uint32_t s_cid[4];
+static uint8_t  s_cid_ok;
+int emmc_cid(uint32_t out[4])
+{
+    if (!s_cid_ok) return -1;
+    for (unsigned i = 0; i < 4u; i++) out[i] = s_cid[i];
+    return 0;
+}
 #if defined(PLAT_SOC_MSM)
 
 #include <string.h>
@@ -531,8 +541,14 @@ static int emmc_full_init(void)
         con_puts("emmc: CMD2 fail e="); con_puthex(s_last_err); con_puts("\n");
         return -1;
     }
-    bdiag_puts("emmc: CID0="); bdiag_puthex(hc_r32(SDHCI_RESPONSE0));
-    bdiag_puts(" CID1="); bdiag_puthex(hc_r32(SDHCI_RESPONSE0 + 4u)); bdiag_puts("\n");
+    /* Keep the whole CID: it carries the manufacturer id, the product name and
+     * a 32-bit product SERIAL, so it is the one value on this board that is
+     * unique to this physical watch and identical across reboots. wlan_mac()
+     * derives a per-device MAC from it for images built without one. */
+    for (unsigned ci = 0; ci < 4u; ci++) s_cid[ci] = hc_r32(SDHCI_RESPONSE0 + 4u * ci);
+    s_cid_ok = 1;
+    bdiag_puts("emmc: CID0="); bdiag_puthex(s_cid[0]);
+    bdiag_puts(" CID1="); bdiag_puthex(s_cid[1]); bdiag_puts("\n");
     s_rca = 1u;
     if (emmc_cmd_rt(3u, s_rca << 16, 0x02u, &r) < 0) {
         con_puts("emmc: CMD3 fail e="); con_puthex(s_last_err); con_puts("\n");

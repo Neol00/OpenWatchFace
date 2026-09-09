@@ -168,8 +168,42 @@ ls build/s2/         # result: build/s2/owf-boot.img
 [`OpenWatchFace/OpenWatchFace.ino`](../../OpenWatchFace/OpenWatchFace.ino)
 has `WIFI_SSID` / `WIFI_PASS` defines near the top. Fill them
 in for a build that joins at boot. **An image built with credentials in it
-contains your password in clear text. Do not share it.** A wifi network
-can otherwise be shared via a BLE connection to the watch.
+contains your password in clear text. Do not share it.** A network can otherwise
+be joined on the watch itself: **Settings -> WiFi & BLE -> Available networks ->
+Scan**, tap any network in the list and type its password on the on-screen
+keyboard. Sharing one over BLE from the phone app still works too.
+#### Publishing an image: strip your MAC first
+
+`tools/mk-wcnss-nv.sh` bakes **your** watch's MAC into `wcnss_mac[]`, and that
+array is compiled into the `.img`. Publish such a build and every watch that
+flashes it transmits your address: your device identifier turns up on strangers'
+networks, and two of them on one network fight over ARP and DHCP.
+
+Build release images with `OWF_PUBLIC=1`:
+
+```sh
+OWF_PUBLIC=1 CFLAGS_EXTRA="..." sh build-owf-image-c2.sh
+```
+
+That removes the `wcnss_mac` symbol from the object entirely — not merely
+ignoring it at runtime, which would leave the bytes in the binary for anyone to
+extract — and `wlan_mac()` then derives a **locally-administered** MAC per
+device from the eMMC CID: unique to each watch, stable across reboots, and
+nothing to do with whoever built the image. The boot log says which it used:
+
+```
+wlan: MAC 02:xx:xx:xx:xx:xx (derived per device from the eMMC CID)
+```
+
+The NV table itself stays in the image, and that is fine: it is board
+calibration data, byte-identical across every unit compared so far (C2, C2+ and
+S2 are the same 31723 bytes; the Gen 4 differs in 26 bytes of TX power table),
+and it contains no MAC — that lives in `/persist/wifimac.ini`, separately.
+Whether you may redistribute the vendor's NV table at all is a licensing
+question, the same one that applies to the `wcnss.mdt` radio firmware.
+
+BLE needs nothing: its address is a random static one generated on first boot
+and kept in NVS, so it is already per device.
 
 #### WiFi needs your watch's NV blob
 

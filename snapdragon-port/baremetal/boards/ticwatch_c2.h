@@ -23,7 +23,7 @@
  *     from its own by-name listing), so there is no blob to pull off the eMMC
  *     even with root. Instead the kernel tree's single skipjack board file was
  *     preprocessed and compiled here with dtc, and the result decompiled to a
- *     merged tree: snapdragon-port/dumps/c2-skipjack-fromsource/skipjack.dts.
+ *     merged tree: snapdragon-port/dtbs/skipjack-fromsource.dts.
  *     `ro.hardware`/`ro.product.board` read `skipjack` off the real watch and
  *     `ro.boot.bootdevice` reads `7824900.sdhci`, so the tree that was built
  *     is the tree this watch boots. Reading the MERGED output matters: several
@@ -302,7 +302,7 @@
  * inherited whole rather than written. Worse data than a coulomb counter (no
  * current sense, so state-of-charge comes from an OCV lookup) but zero new
  * code, which for a watch whose display is not yet lit is the better trade. */
-/* CORRECTION FROM THE WATCH'S OWN DTB (2026-09-06, dumps/c2-skipjack-stock):
+/* CORRECTION FROM THE WATCH'S OWN DTB (2026-09-06, dtbs/skipjack-stock.dts):
  * the VM-BMS node is there, but so are smb231@12 and st-fg@70 on i2c@78b8000
  * (BLSP1 QUP4, gpio14/15 blsp_i2c4) with NO status property, i.e. ENABLED.
  * VBUS from the pads feeds the SMB231, not the PM8916 LBC, so cable and

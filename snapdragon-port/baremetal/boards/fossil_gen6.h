@@ -2,7 +2,7 @@
  *
  * Every address below is VERBATIM from the stock device tree, which AsteroidOS
  * recovered from a real watch and published as a kernel patch. A decompiled
- * copy is checked in at ../../sda429-hoki-decompiled.dts (fully flattened —
+ * copy is checked in at ../../dtbs/sda429-hoki-decompiled.dts (fully flattened —
  * every node inline, so a grep for a node name finds the real values).
  * See ../../HARDWARE-GEN6.md for provenance and the carries-over matrix.
  *

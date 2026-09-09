@@ -10,7 +10,10 @@ WiFiClass WiFi;
 #include "FreeRTOS.h"
 #include "semphr.h"
 #if defined(PLAT_WLAN_APP)
-static struct wlan_scan_net s_nets[16];
+/* Capacity matches the UI's WSCAN_MAX: the scan list is meant to show every AP
+ * in range, so the glue must not be the thing that truncates it first. */
+#define WIFI_GLUE_SCAN_MAX 24
+static struct wlan_scan_net s_nets[WIFI_GLUE_SCAN_MAX];
 static int s_nnets = -1;                  /* -1 = no scan results held */
 
 /* The app drives WiFi from TWO tasks -- the UI (scan screen, settings toggle,
@@ -29,13 +32,26 @@ bool WiFiClass::mode(wifi_mode_t m)
 wl_status_t WiFiClass::begin(const char *ssid, const char *pass)
 {
     if (!ssid || !ssid[0]) return WL_CONNECT_FAILED;
+    /* Split the wall-clock cost in two, because the two halves have completely
+     * different fixes: everything up to "associated + keys installed" is ours
+     * (scan strategy, PBKDF2, HAL round-trips), while the DHCP half is the AP's
+     * lease server and lwIP's retry backoff. Without this line the answer to
+     * "why does WiFi take 20 s" is a guess. */
+    uint32_t t_link = timer_ms();
     {
-        WifiLock l;                                   /* link: scan, join, WPA2 handshake, keys (~5..15 s) */
+        WifiLock l;                                   /* link: scan, join, WPA2 handshake, keys */
         if (wlan_up() != 0) return WL_CONNECT_FAILED;
         if (wlan_connect(ssid, pass ? pass : "") != 0) return WL_CONNECT_FAILED;
     }
+    t_link = timer_ms() - t_link;
     /* IP: DHCP needs the poll task, which needs the lock we just released */
-    if (net_up() != 0) { con_puts("[wifi] link up but no IP lease\n"); return WL_DISCONNECTED; }
+    uint32_t t_dhcp = timer_ms();
+    int rc = net_up();
+    t_dhcp = timer_ms() - t_dhcp;
+    con_puts("[wifi] link "); con_putdec(t_link);
+    con_puts(" ms + dhcp "); con_putdec(t_dhcp);
+    con_puts(" ms = "); con_putdec(t_link + t_dhcp); con_puts(" ms\n"); con_flush();
+    if (rc != 0) { con_puts("[wifi] link up but no IP lease\n"); return WL_DISCONNECTED; }
     return WL_CONNECTED;
 }
 wl_status_t WiFiClass::status() { return (wlan_connected() && net_has_ip()) ? WL_CONNECTED : WL_DISCONNECTED; }
@@ -47,7 +63,7 @@ int16_t WiFiClass::scanNetworks(bool, bool)
 {
     WifiLock l;
     if (wlan_up() != 0) return WIFI_SCAN_FAILED;
-    int n = wlan_scan(s_nets, 16u);
+    int n = wlan_scan(s_nets, (unsigned)WIFI_GLUE_SCAN_MAX);
     if (n < 0) { s_nnets = -1; return WIFI_SCAN_FAILED; }
     s_nnets = n;
     return (int16_t)n;                     /* synchronous: the result is ready now */

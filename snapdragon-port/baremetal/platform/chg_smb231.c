@@ -1,7 +1,7 @@
 /* chg_smb231.c — TicWatch C2 / S2 charger + gauge over BLSP1 QUP4 I2C.
  *
  * THE PMIC IS NOT THE CHARGER ON THESE WATCHES. The C2's own boot-partition
- * DTB (dumps/c2-skipjack-stock/skipjack-stock.dts) enables, on i2c@78b8000
+ * DTB (dtbs/skipjack-stock.dts) enables, on i2c@78b8000
  * (BLSP1 QUP4, gpio14/15 = blsp_i2c4, 375 kHz in the DT):
  *     smb231@12   compatible "qcom,smb231-charger"   (no status = enabled)
  *     st-fg@70    compatible "st,stc3117"            (no status = enabled)

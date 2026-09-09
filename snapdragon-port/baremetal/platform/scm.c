@@ -1,4 +1,4 @@
-/* scm.c — Qualcomm SCM: calls into TrustZone (step 1 of WIFI-BRINGUP.md).
+/* scm.c — Qualcomm SCM: calls into TrustZone (SMC calls for PAS, boot addresses, power collapse).
  *
  * WHY: the WCNSS firmware is signed. Only the secure world can copy-check it,
  * program the XPU to protect its memory and release the Pronto core from

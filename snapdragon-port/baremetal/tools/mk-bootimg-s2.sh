@@ -15,7 +15,7 @@
 # board-id match succeeds. Pass its path as $2 (or set DTB=...).
 #
 # Usage: ./mk-bootimg-s2.sh [payload.bin] [dtb]   ->  build/s2/owf-boot.img
-# Default DTB: ../dumps/s2-tunny-stock/tunny-stock.dtb (the S2's own boot DTB,
+# Default DTB: ../dtbs/tunny-stock.dtb (the S2's own boot DTB,
 # extracted from its stock boot partition 2026-09-04).
 #   e.g. ./mk-bootimg.sh build/s2/owf.bin ~/firefish-dt/dtb-out/dtb-00.dtb
 set -e
@@ -31,7 +31,7 @@ mkdir -p "build/s2"
 # carries its own decompressor stub; our payload doesn't, and at ~3 KB it
 # doesn't need one.)
 PAYLOAD="${1:-build/s2/owf.bin}"
-DTB="${2:-${DTB:-../dumps/s2-tunny-stock/tunny-stock.dtb}}"
+DTB="${2:-${DTB:-../dtbs/tunny-stock.dtb}}"
 OUT="build/s2/owf-boot.img"
 
 [ -f "$PAYLOAD" ] || { echo "payload missing: $PAYLOAD (run: ./build.sh c2)"; exit 1; }

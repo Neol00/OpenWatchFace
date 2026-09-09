@@ -4,7 +4,7 @@
  *  WHY THIS FILE EXISTS. The C2's QUP5 bus carries three touch nodes in its
  *  device tree and only one is live — synaptics@20 and it7260@46 are both
  *  status="disabled", while focaltech@38 carries no status property and is
- *  therefore enabled. (See dumps/c2-skipjack-fromsource/skipjack.dts.) So the
+ *  therefore enabled. (See dtbs/skipjack-fromsource.dts.) So the
  *  Gen 4's Raydium driver does not apply here at all, and this is the one
  *  genuinely new driver the C2 port needs.
  *

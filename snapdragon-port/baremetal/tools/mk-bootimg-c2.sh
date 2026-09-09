@@ -35,7 +35,7 @@ PAYLOAD="${1:-build/c2/owf.bin}"
 # and the C2+ subtype 5, and aboot wants an exact match, so the from-source
 # tree (one id) is refused by the C2+ with "dtb not found". One tree, both
 # watches.
-DTB="${2:-${DTB:-../dumps/c2-skipjack-stock/skipjack-stock.dtb}}"
+DTB="${2:-${DTB:-../dtbs/skipjack-stock.dtb}}"
 OUT="build/c2/owf-boot.img"
 
 [ -f "$PAYLOAD" ] || { echo "payload missing: $PAYLOAD (run: ./build.sh c2)"; exit 1; }

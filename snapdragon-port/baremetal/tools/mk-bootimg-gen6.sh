@@ -16,9 +16,9 @@
 # instead. So the DTB argument here is OPTIONAL:
 #   - with no DTB, we try the simple case first (fastest thing to test)
 #   - if the flashed image fails with a dtb complaint, re-pack passing the
-#     decompiled hoki DTB (../sda429-hoki-decompiled.dts recompiled with dtc,
+#     decompiled hoki DTB (../dtbs/sda429-hoki-decompiled.dts recompiled with dtc,
 #     or better: the real dtb dumped from your watch).
-# SETTLED: pass ../sda429-hoki.dtb. A DTB-less image is ~232 KB smaller and
+# SETTLED: pass ../dtbs/sda429-hoki.dtb. A DTB-less image is ~232 KB smaller and
 # does not work; BUILD-GEN6.md's verifier checks for exactly this.
 #
 # Usage: ./mk-bootimg-gen6.sh [payload.bin] [dtb]  -> build/gen6/owf-boot.img
