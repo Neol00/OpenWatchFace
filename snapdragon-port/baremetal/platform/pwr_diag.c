@@ -169,6 +169,15 @@ static uint32_t s_loops;        /* app-loop iterations in this window */
 static uint32_t s_win_start;
 static uint32_t s_armed;        /* 0 = waiting, 1 = marker printed, 2 = live */
 static uint32_t s_last_cpu_pct; /* last census window's real compute share */
+/* Where that compute share GOES, same window, same denominator. These were
+ * already computed for the console breakdown; on the Gen 4 and Gen 5 there is
+ * no UART, so they are latched here for the Power app to show instead. */
+static uint32_t s_pct_touch;    /* LVGL indev read (I2C to the touch chip) */
+static uint32_t s_pct_spmi;     /* PMIC bus traffic (button poll, FG, rail) */
+static uint32_t s_pct_refr;     /* inside the LVGL refresh */
+static uint32_t s_pct_cache;    /* D-cache clean of the frame buffer */
+static uint32_t s_last_loops;   /* app-loop iterations per window */
+static uint32_t s_last_touch_n; /* indev reads per window */
 
 /* ===== App-facing accessors (OWF power app, 2026-08-07) ====================
  * Everything below was validated on hardware by the PWR census before being
@@ -177,6 +186,14 @@ static uint32_t s_last_cpu_pct; /* last census window's real compute share */
 /* Real CPU usage of this core, 0-100: last census window's compute share
  * (loop body minus sleep minus display-wait). */
 int pwr_cpu_pct(void) { return (int)s_last_cpu_pct; }
+
+/* Breakdown of the same window, as whole percents of wall time. */
+int pwr_touch_pct(void)  { return (int)s_pct_touch; }
+int pwr_spmi_pct(void)   { return (int)s_pct_spmi; }
+int pwr_refr_pct(void)   { return (int)s_pct_refr; }
+int pwr_cache_pct(void)  { return (int)s_pct_cache; }
+int pwr_loops_win(void)  { return (int)s_last_loops; }
+int pwr_touch_n_win(void){ return (int)s_last_touch_n; }
 int pwr_cpu1_pct(void) { return -1; }   /* single core here; the 8909 watches answer from smp_8909.c */
 
 /* SoC die temperature in deci-degC: hottest currently-valid TSENS channel
@@ -407,6 +424,7 @@ void pwr_diag_poll(uint32_t body_ms)
             lvdiag_puts(" screens=");    lvdiag_putdec(px / (416u * 416u));
             lvdiag_puts(" refr_ms=");    lvdiag_putdec(rus / 1000u);
             lvdiag_puts(" flush_ms=");   lvdiag_putdec(fus / 1000u);
+            if (win) s_pct_refr = (rus / 1000u) * 100u / win;
             if (win) {
                 lvdiag_puts(" refr%=");  lvdiag_putdec((rus / 1000u) * 100u / win);
                 lvdiag_puts(" flush%="); lvdiag_putdec((fus / 1000u) * 100u / win);
@@ -428,6 +446,11 @@ void pwr_diag_poll(uint32_t body_ms)
             lvdiag_puts("LV2 cache_ms=");  lvdiag_putdec(cus / 1000u);
             lvdiag_puts(" touch_n=");      lvdiag_putdec(tn);
             lvdiag_puts(" touch_ms=");     lvdiag_putdec(tus / 1000u);
+            if (win) {
+                s_pct_cache = (cus / 1000u) * 100u / win;
+                s_pct_touch = (tus / 1000u) * 100u / win;
+            }
+            s_last_touch_n = tn;
             if (win) {
                 lvdiag_puts(" cache%=");   lvdiag_putdec((cus / 1000u) * 100u / win);
                 lvdiag_puts(" touch%=");   lvdiag_putdec((tus / 1000u) * 100u / win);
@@ -455,6 +478,8 @@ void pwr_diag_poll(uint32_t body_ms)
             lvdiag_puts("LV3 loops=");    lvdiag_putdec(s_loops);
             lvdiag_puts(" spmi_n=");      lvdiag_putdec(sn);
             lvdiag_puts(" spmi_ms=");     lvdiag_putdec(sms);
+            if (win) s_pct_spmi = sms * 100u / win;
+            s_last_loops = s_loops;
             if (win) { lvdiag_puts(" spmi%="); lvdiag_putdec(sms * 100u / win); }
             if (sn)  { lvdiag_puts(" us/spmi="); lvdiag_putdec(sus / sn); }
             if (s_loops) {

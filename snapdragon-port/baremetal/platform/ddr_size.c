@@ -109,19 +109,54 @@ static uint64_t smem_ram_bytes(void)
     return sum;
 }
 
-static uint32_t s_ddr_bytes;
+static uint32_t s_ddr_bytes;              /* set ONLY by a real detection */
 static const char *s_ddr_src = "board header";
 
+/* Plausibility window. Anything outside it is a misparse, not a watch: the
+ * smallest of these boards has 512 MB and the field cannot hold 4 GB. */
+#define DDR_MIN_BYTES (128u * 1024u * 1024u)
+#define DDR_MAX_BYTES 0x80000000ull          /* 2 GB */
+
+/* CALLABLE MORE THAN ONCE, AND DELIBERATELY SO (2026-09-12). The fallback is
+ * no longer cached: only a successful detection is. The two sources become
+ * available at different times, and one of them can go away --
+ *
+ *   - the device tree is aboot's copy in plain DDR. It sits inside the region
+ *     the malloc arena grows into, so it is intact early and may be overwritten
+ *     later. The FDT_MAGIC check is what makes reading it after that safe: a
+ *     clobbered buffer fails the check and we fall through rather than parse
+ *     garbage.
+ *   - the SMEM table lives in a reserved carveout and is never clobbered, but
+ *     it cannot be read until smem_init() has run, which happens during the
+ *     radio/co-processor bring-up well after boot.
+ *
+ * So an early call tends to succeed on the tree and a late call on SMEM, and
+ * caching a FAILURE would freeze in whichever gap the first caller landed in.
+ * The log line prints once per successful detection and once if we give up. */
 uint32_t ddr_size_detect(void)
 {
     uint64_t b = 0;
+    static int s_said_fallback;
+
     if (s_ddr_bytes) return s_ddr_bytes;
+
     if (boot_r2 >= PLAT_DDR_BASE && boot_r2 < PLAT_DDR_BASE + 0x10000000u && (boot_r2 & 3u) == 0u) {
         const uint8_t *fdt = (const uint8_t *)(uintptr_t)boot_r2;
         if (be32(fdt) == FDT_MAGIC) { b = fdt_memory_bytes(fdt); if (b) s_ddr_src = "device tree from aboot"; }
     }
     if (!b) { b = smem_ram_bytes(); if (b) s_ddr_src = "smem ram table"; }
-    if (!b || b > 0xFFFFFFFFull) b = PLAT_DDR_SIZE;
+
+    if (b < DDR_MIN_BYTES || b > DDR_MAX_BYTES) {
+        /* No answer yet. Report the header's value but do NOT cache it, so a
+         * later call can still find the real size once SMEM is up. */
+        if (!s_said_fallback) {
+            s_said_fallback = 1;
+            con_puts("ddr: "); con_putdec((uint32_t)(PLAT_DDR_SIZE >> 20));
+            con_puts(" MB (board header; no DT or SMEM answer yet)\n");
+        }
+        return (uint32_t)PLAT_DDR_SIZE;
+    }
+
     s_ddr_bytes = (uint32_t)b;
     con_puts("ddr: "); con_putdec(s_ddr_bytes >> 20); con_puts(" MB ("); con_puts(s_ddr_src); con_puts(")\n");
     return s_ddr_bytes;

@@ -281,6 +281,66 @@ void vAssertCalled(const char *pcFile, unsigned long ulLine)
  * Now: fault record like startup.S (class 6 = malloc failed, 7 = stack
  * overflow), ramlog to DDR, reset. */
 extern char __ramlog_end[];
+/* 2026-09-18: the previous-life CPU fault record used to be printed only from
+ * cpu_pc8909_prev_report(), i.e. from loop(). A build that dies in setup() never
+ * gets there, so gen5-modem-19..28 rebooted ten times without ever saying
+ * whether the death was a data abort, a stack overflow or a plain hang.
+ * Callable from anywhere once the console is up; prints once and clears. */
+/* 2026-09-18 (gen5-modem-34/35): read-only data was READ WRONG at runtime twice, at the same
+ * spot in three layouts: a switch's jump-table byte came back 0, then a const string-pointer
+ * table entry came back pointing at "D5". The image on disk is correct. This checks .rodata
+ * against a CRC taken at the first call and names the first differing offset. */
+extern char __rodata_start[], __rodata_end[];
+static uint32_t s_rodata_crc, s_rodata_have;
+static uint32_t crc32_buf(const uint8_t *p, uint32_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++) { c ^= p[i]; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
+    return ~c;
+}
+/* Full copy of .rodata taken at the first call (fits: .bss is 36 MB); a change prints the first
+ * differing bytes with old/new values, so the map names the object and the value names the
+ * writer. */
+#define RODATA_COPY_MAX (2u * 1024u * 1024u)
+static uint8_t s_rodata_copy[RODATA_COPY_MAX];
+void rodata_verify(const char *where)
+{
+    const uint8_t *p = (const uint8_t *)__rodata_start; uint32_t n = (uint32_t)(__rodata_end - __rodata_start);
+    if (n > RODATA_COPY_MAX) n = RODATA_COPY_MAX;
+    uint32_t c = crc32_buf(p, n);
+    if (!s_rodata_have) {
+        s_rodata_have = 1; s_rodata_crc = c;
+        for (uint32_t i = 0; i < n; i++) s_rodata_copy[i] = p[i];
+        con_puts("rodata: "); con_putdec(n); con_puts(" B crc "); con_puthex(c); con_puts(" recorded at "); con_puts(where); con_puts("\n");
+        return;
+    }
+    if (c == s_rodata_crc) return;
+    con_puts("!! rodata CHANGED at "); con_puts(where); con_puts(": crc "); con_puthex(c); con_puts(" was "); con_puthex(s_rodata_crc); con_puts("\n");
+    { uint32_t shown = 0, total = 0, first = 0, last = 0;
+      for (uint32_t i = 0; i < n; i++) {
+          if (s_rodata_copy[i] == p[i]) continue;
+          if (!total) first = i; last = i; total++;
+          if (shown < 16u) { shown++; con_puts("rodata-diff: "); con_puthex((uint32_t)(uintptr_t)(p + i)); con_puts(" was "); con_puthex(s_rodata_copy[i]); con_puts(" now "); con_puthex(p[i]); con_puts("\n"); }
+          s_rodata_copy[i] = p[i];
+      }
+      con_puts("rodata-diff: "); con_putdec(total); con_puts(" bytes differ, "); con_puthex((uint32_t)(uintptr_t)(p + first)); con_puts(".."); con_puthex((uint32_t)(uintptr_t)(p + last)); con_puts("\n"); }
+    s_rodata_crc = c;
+}
+void fault_record_report(void)
+{
+    volatile uint32_t *f = (volatile uint32_t *)(__ramlog_end - 32);
+    if ((f[0] & 0xFF000000u) != 0xFA000000u) return;
+    uint32_t cls = f[0] & 0xFFu;
+    con_puts("!! FAULT in previous life: ");
+    con_puts(cls == 1u ? "UNDEF" : cls == 3u ? "PREFETCH ABORT" : cls == 4u ? "DATA ABORT" : cls == 5u ? "FIQ"
+           : cls == 6u ? "MALLOC FAILED (FreeRTOS heap)" : cls == 7u ? "STACK OVERFLOW (task tag in far)"
+           : cls == 8u ? "DEAD-MAN TIMEOUT (30 s without a loop kick)" : "?");
+    con_puts(" lr="); con_puthex(f[1]); con_puts(" (pc ~ lr-8 for a data abort, lr-4 otherwise)");
+    con_puts(" fsr="); con_puthex(f[2]); con_puts(" far="); con_puthex(f[3]);
+    con_puts("  -> arm-none-eabi-addr2line -e build/<board>/owf.elf 0x"); con_puthex(f[1] - (cls == 4u ? 8u : 4u)); con_puts("\n");
+    f[0] = 0u;
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(f)); __asm__ volatile("dsb sy" ::: "memory");
+}
 static void hook_record_and_reset(uint32_t cls, const char *name)
 {
     volatile uint32_t *f = (volatile uint32_t *)(__ramlog_end - 32);

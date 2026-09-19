@@ -108,11 +108,24 @@ int pwr_cpu_mhz(void)
     uint32_t raw = cfg & CFG_DIV_MASK;
     uint32_t doubled = (raw ? raw : 1u) + 1u;   /* kernel's rcg_get_src_div */
 
+    if (src == 0u)                     /* mux 0 = XO (19.2 MHz), the sleep park */
+        return (int)((19u * 2u) / doubled);
     if (src != A7_SRC_GPLL0)
         return -1;    /* on the A7 PLL: its rate needs the PLL block, not ported */
     if (!doubled) return -1;
     return (int)((GPLL0_MHZ * 2u) / doubled);
 }
+
+/* --- DIAGNOSTICS -------------------------------------------------------
+ * There is no UART on the Gen 4 or the Gen 5, so when a frequency change
+ * does not take there is nothing to read. These expose the two RCG words and
+ * the reason the last attempt gave up, for the Power app to print on-screen.
+ * s_last_err: 0 ok, 1 rate not in the table, 2 config dirty, 3 UPDATE stuck,
+ *             4 write ignored (readback did not change). */
+static int s_last_err;
+uint32_t cpu_clk_cfg_raw(void) { return mmio_read(A7_CFG_RCGR); }
+uint32_t cpu_clk_cmd_raw(void) { return mmio_read(A7_CMD_RCGR); }
+int      cpu_clk_last_err(void) { return s_last_err; }
 
 int cpu_clk_set_mhz(int mhz)
 {
@@ -130,12 +143,14 @@ int cpu_clk_set_mhz(int mhz)
         con_puts("cpu-clk: "); con_putdec((uint32_t)mhz);
         con_puts(" MHz not reachable from GPLL0 (needs the A7 PLL + an RPM "
                  "voltage vote); refused\n");
+        s_last_err = 1;
         return -1;
     }
 
     /* A pending config means someone else is mid-update; do not stack on it. */
     if (mmio_read(A7_CMD_RCGR) & CMD_DIRTY_MASK) {
         con_puts("cpu-clk: config dirty, refusing\n");
+        s_last_err = 2;
         return -1;
     }
 
@@ -157,12 +172,17 @@ int cpu_clk_set_mhz(int mhz)
 
     if (a7_rcg_update() < 0) {
         con_puts("cpu-clk: RCG update stuck\n");
+        s_last_err = 3;
         return -1;
     }
 
     if (!going_up) cpu_volt_set_for_mhz(mhz);
 
     int now = pwr_cpu_mhz();
+    /* A write the hardware ignored looks exactly like success from here: the
+     * UPDATE bit never sets, so a7_rcg_update() returns immediately and the
+     * old rate is still running. Catch that explicitly. */
+    s_last_err = (now == (int)k_a7_rates[i].mhz) ? 0 : 4;
     bdiag_puts("cpu-clk: -> "); bdiag_putdec((uint32_t)k_a7_rates[i].mhz);
     bdiag_puts(" MHz (readback "); bdiag_putdec((uint32_t)(now < 0 ? 0 : now));
     bdiag_puts(", cfg "); bdiag_puthex(mmio_read(A7_CFG_RCGR)); bdiag_puts(")\n");

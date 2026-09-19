@@ -88,9 +88,14 @@ static void render_only(const char *why)
     con_puts(") buf@"); con_puthex((uint32_t)s_fb); con_puts("\n");
 }
 
+static int s_fb_inited;
 void *fb_init(uint32_t w, uint32_t h)
 {
     (void)w; (void)h;
+    /* v396: the modem loading screen (arduino_main.cpp) brings the display up BEFORE setup();
+     * the app's own fb_init() call must then be a no-op returning the same buffer. */
+    if (s_fb_inited) return (void *)s_fb;
+    s_fb_inited = 1;
     bdiag_puts("fb: gen4 MDP3 DMA_P takeover path\n");
 #if defined(WDOG_TRACE)
     wdog_stage(24);

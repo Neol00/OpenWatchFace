@@ -28,8 +28,22 @@
 #if defined(PLAT_SOC_MSM8909)
 #include <string.h>
 
-#define P_SDA 6u
-#define P_SCL 7u
+/* PINS PER BOARD (2026-09-11). The Gen 4 / C2 wire the PAH8011 to the BLSP1
+ * QUP1 pins gpio6/7 with its INT on gpio110. The Fossil Gen 5 has the SAME part
+ * at the SAME address (persist/sensors/registry: pah_8011, slave 21 = 0x15),
+ * but INT on gpio34 (dri_irq_num) and a registry bus_instance that does not name
+ * the pins directly. So a board may give a list of candidate SDA/SCL pairs; the
+ * driver keeps the first one on which the chip answers its id, and says which. */
+#ifndef PLAT_HR_PAH8011_PINS
+#define PLAT_HR_PAH8011_PINS { 6u, 7u }
+#endif
+#ifndef PLAT_HR_PAH8011_INT
+#define PLAT_HR_PAH8011_INT  110u
+#endif
+static const struct { uint32_t sda, scl; } k_hr_pins[] = { PLAT_HR_PAH8011_PINS };
+static uint32_t s_sda = 6u, s_scl = 7u;
+#define P_SDA s_sda
+#define P_SCL s_scl
 #define ADDR  0x15u
 
 /* ---- bit-banged I2C (open drain: drive low, release = input + pull-up) ---- */
@@ -167,6 +181,11 @@ int pah8011_present(void) { return s_present; }
 int pah8011_init(void)
 {
     uint8_t id = 0;
+    for (unsigned p = 0; p < sizeof k_hr_pins / sizeof k_hr_pins[0]; p++) {
+    s_sda = k_hr_pins[p].sda; s_scl = k_hr_pins[p].scl;
+    con_puts("hr: probing PAH8011 @0x15 on SDA gpio"); con_putdec(s_sda);
+    con_puts(" / SCL gpio"); con_putdec(s_scl); con_puts("\n");
+    con_flush(); usb_poll();   /* the probe is the last thing before the boots of 2026-09-18 went quiet: keep the cable current */
     s_bank = -1;
     sda_hi(); scl_hi(); timer_delay_ms(2);
     /* The chip keeps its state across an AP reboot: whoever ran last (our own
@@ -182,8 +201,11 @@ int pah8011_init(void)
         con_puts("hr: id read "); con_puthex(id); con_puts(" (wake acks "); con_putdec((uint32_t)w1); con_putdec((uint32_t)w2); con_puts("), retrying\n");
         timer_delay_ms(20);
     }
+    if (id == 0x11) break;
+    }
     if (id != 0x11) {
-        con_puts("hr: PAH8011 not found (id="); con_puthex(id); con_puts(")\n");
+        con_puts("hr: PAH8011 not found on any candidate pins (last id="); con_puthex(id); con_puts(")\n");
+        con_flush(); usb_poll();
         return 0;
     }
     wr_b(4, 0x69, 0);                       /* wake */
@@ -192,7 +214,8 @@ int pah8011_init(void)
     wr_b(4, 0x70, 0x18);
     wr_b(4, 0x69, 1);                       /* shutdown until a measurement starts */
     s_present = 1;
-    con_puts("hr: PAH8011 ready (I2C gpio6/7)\n");
+    con_puts("hr: PAH8011 ready (I2C SDA gpio"); con_putdec(s_sda); con_puts(" SCL gpio"); con_putdec(s_scl);
+    con_puts(", INT gpio"); con_putdec(PLAT_HR_PAH8011_INT); con_puts(")\n");
     return 1;
 }
 
@@ -328,7 +351,7 @@ void pah8011_diag(void)
     con_puts("] b2[int="); con_puthex(st); con_puts(" fifo="); con_putdec((uint32_t)(cnt[0] | (cnt[1] << 8)));
     con_puts(" touch="); con_puthex(tch); con_puts(" pkg="); con_puthex(pkg);
     con_puts(" led70/71/72="); con_puthex(led[0]); con_puts("/"); con_puthex(led[1]); con_puts("/"); con_puthex(led[2]);
-    con_puts("] b4[69="); con_puthex(pwr); con_puts("] int_pin="); con_putdec((uint32_t)tlmm_in(110u));
+    con_puts("] b4[69="); con_puthex(pwr); con_puts("] int_pin="); con_putdec((uint32_t)tlmm_in(PLAT_HR_PAH8011_INT));
     con_puts("\n");
 }
 

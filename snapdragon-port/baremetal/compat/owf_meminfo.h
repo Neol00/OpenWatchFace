@@ -28,7 +28,21 @@
  * up to here is contiguous DDR that belongs to us alone, and it is what bounds
  * the malloc arena. There IS more usable DDR above the carveouts (0x8B0-0x8FF
  * and 0x914-0xC00 MB), but reaching it needs a non-contiguous heap. */
-/* SoC tier: both Wear 2100 watches. Before this the guard was board-only and
+/* OWF_DDR_SIZE HERE IS ONLY A FALLBACK (2026-09-12). DDR size is NOT a
+ * property of the SoC tier, and this guard treats it as one: every
+ * PLAT_SOC_MSM8909 board takes the 512 MB branch, which is wrong for the
+ * Fossil Gen 5 (1 GB, and its own board header says so) and cannot be made
+ * right for the TicWatch C2 vs C2+ at all — same board key, same dtb, same
+ * image, 512 MB vs 1 GB. owf_meminfo() therefore DETECTS the real size at
+ * runtime (platform/ddr_size.c) and only falls back to this constant when
+ * neither the device tree nor the SMEM table answers. Do not add board keys
+ * here to fix a size; fix the detection.
+ *
+ * SAFE_END is a different question and stays compile-time: it is bounded by
+ * the CARVEOUT LAYOUT, which really is shared across the tier, not by how much
+ * DDR is fitted.
+ *
+ * SoC tier: both Wear 2100 watches. Before this the guard was board-only and
  * the TicWatch C2 fell through to the Gen 6 branch, so its About screen
  * claimed 1 GB of DDR on a 512 MB watch — and, more seriously, the malloc
  * arena was bounded by the wrong SAFE_END. The C2's own device tree confirms

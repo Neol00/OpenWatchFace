@@ -23,14 +23,24 @@
 #pragma once
 
 /* All the MSM watches: shared driver model (SPMI, GIC-400, msm reboot). */
-#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6) || \
-    defined(PLAT_BOARD_TICWATCH_C2)
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5) || \
+    defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_TICWATCH_C2)
 #define PLAT_SOC_MSM 1
 #endif
 
 /* The Snapdragon Wear 2100 (msm8909w / APQ8009W): Fossil Gen 4 (firefish) and
  * Mobvoi TicWatch C2 (skipjack). Same silicon, same registers, same fuse rows,
- * same 512 MB of DDR at 0x80000000 — different vendors' watches around it. */
-#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_TICWATCH_C2)
+ * DDR at 0x80000000 — different vendors' watches around it.
+ *
+ * NOT the same amount of DDR, though this comment used to say so: the Gen 5 in
+ * this tier has 1 GB, and the C2 ships in both 512 MB and 1 GB (C2+) variants
+ * that share a board key. Anything needing the real size calls
+ * ddr_size_detect() / plat_ddr_size(); nothing may infer it from this tier. */
+/* The Gen 5 (triggerfish, Wear 3100) belongs here: the Wear 3100 is the Wear
+ * 2100 AP plus an always-on co-processor, so every AP-side register in this
+ * tier is the same silicon. Its PMIC is NOT the same, which is exactly why the
+ * PMIC-side drivers ask about the PMIC rather than about the SoC tier. */
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5) || \
+    defined(PLAT_BOARD_TICWATCH_C2)
 #define PLAT_SOC_MSM8909 1
 #endif

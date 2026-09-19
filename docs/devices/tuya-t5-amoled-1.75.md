@@ -1,4 +1,4 @@
-# Waveshare T5-E1-Touch-AMOLED-1.75 — install guide
+# Waveshare T5-E1-Touch-AMOLED-1.75 install guide
 
 | | |
 |---|---|
@@ -55,7 +55,7 @@ On Windows the default location for the libraries is:
 `C:\Users\yourusername\Documents\Arduino\libraries`
 
 On Linux the default location for the libraries is:
-`/home/yourusername/Arduino/libraries`
+`~/Arduino/libraries`
 
 Copy the **contents** of this repo's `libraries/` folder in, so the library folders and
 `lv_conf.h` land directly inside it. `lv_conf.h` must sit **next to** the `lvgl` folder,
@@ -161,7 +161,7 @@ underneath (the TuyaOpen core + `tyutool`), not in how you drive the IDE.
 
 All of these are compile-time and live in the sketch folder.
 
-### Board header — `OpenWatchFace/board_tuya_t5_amoled_175.h`
+### Board header `OpenWatchFace/board_tuya_t5_amoled_175.h`
 
 | Setting | Default | What it does |
 |---|---|---|

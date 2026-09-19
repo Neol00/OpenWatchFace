@@ -183,6 +183,11 @@
 #define PLAT_WCNSS_GPIO_FIRST 40u
 #define PLAT_WCNSS_GPIO_FUNC  1u
 #define PLAT_WCNSS_RAILS_PM8916 1
+/* Drain the WLAN RX rings on descriptor state, not only on the raw DXE
+ * interrupt bit (wcn36xx.c). Unit C0F8413D3327 (2026-09-19) never raised the
+ * raw CH1/CH3 bit: every scan read "RX frames 0" while BT paired fine, same
+ * firmware and NV as a working Gen 4. With this it scans and connects. */
+#define PLAT_WCNSS_RX_DESC_POLL 1
 #define PLAT_TZLOG_PTR        0x08600720u
 #define PLAT_TZLOG_SIZE       0x1000u
 /* The app drives the radio (compat/WiFi.h -> wlan_up/down/scan). Not on the
@@ -294,6 +299,14 @@
  * roughly 40 counts. */
 #define PLAT_CROWN_AXIS_X     1
 
+/* PixArt PAH8011 PPG is FITTED on this watch (DTB: I2C 0x15 on gpio6/7).
+ * Declared as a CAPABILITY because suspend_msm.c has to turn the LEDs off
+ * before every sleep, and it used to ask "is this an msm8909?" instead. (An
+ * earlier note here said the Fossil Gen 5 has no PPG sensor. WRONG: it has a
+ * PAH8011 too, on a different INT pin -- see boards/fossil_gen5.h. The
+ * capability is still right, for boards that genuinely have none.) */
+#define PLAT_HAS_HR_PAH8011 1
+
 /* ---- Vibrator drive -------------------------------------------------------
  * The DTB says qcom,vib-vtg-level-mV = 3100 for this watch and the TicWatches
  * alike, but the Gen 4's motor is a good deal stronger at the same voltage
@@ -302,3 +315,44 @@
  * roughly three quarters of the stock drive. One knob; pmic_vib.c does the
  * rest. Floor 1200 (motor may not start), ceiling 3100 (stock). */
 #define PLAT_VIB_VTG_MV     2400u
+
+/* Send the legacy TCSR boot-misc hint alongside the IMEM restart cookie.
+ * Kept ON here only because reboot-to-fastboot is PROVEN working on the Gen 4
+ * with it present, and a proven recovery path is not worth disturbing. It is
+ * off by default for new boards -- the value is LK's EDL cookie; see the long
+ * note in platform/reboot_msm.c. */
+#define PLAT_REBOOT_TCSR_HINT 1
+
+/* qcom,use-legacy-hard-reset-offset: firefish's qcom,power-on@800 does NOT carry the property.
+ * Selects where qpnp_pon_set_restart_reason() puts the restart reason in
+ * SOFT_RB_SPARE -- see the long note in platform/reboot_msm.c. */
+#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 0
+
+/* CPU core rail: 8916_s2, qcom,spm-regulator @0x1700 on qcom,pm8916@1 (sid 1).
+ * Stated explicitly now that a second msm8909 board with a different PMIC
+ * exists -- see the note in platform/cpu_volt_a7.c. */
+#define PLAT_APC_SID            1u
+#define PLAT_APC_SPMI_BASE      0x1700u
+
+/* ---- Buttons: two gpio_keys pushers (2026-09-15) ----------------------------
+ * FROM-DTB (firefish gpio_keys): stem_1 "STEM_1" TLMM gpio91 (KEY 0x109) and
+ * stem_2 "STEM_2" gpio90 (0x10a), both active low, wakeup-capable, 15 ms
+ * debounce. MPM wake pins from qcom,gpio-map: <0x20 0x5b> gpio91 = MPM 32,
+ * <0x1e 0x5a> gpio90 = MPM 30. The DT only names them; which one is the top
+ * pusher is assumed (STEM_1 = top) until a press log confirms it. */
+#define PLAT_BTN_STEM1_GPIO   91u
+#define PLAT_BTN_STEM2_GPIO   90u
+#define PLAT_BTN_STEM1_MPM    32u
+#define PLAT_BTN_STEM2_MPM    30u
+
+/* ---- Modem channels: NO DIAG, NO FASTRPC on this watch (2026-09-17) --------
+ * Same reasoning as the TicWatch C2 header: mss_boot.c's 0x7F default exists
+ * for the Wear 3100 stall hunt, and bit 4 (DIAG_CNTL) compiles in mss_diag.c,
+ * which enables EVERY F3 debug level on every SSID range and then takes the
+ * resulting stream for the life of the boot; bit 1 does the same for fastrpc.
+ * Neither was linked into a Wear 2100 image before v473, and neither tells us
+ * anything on a board whose modem boots. 0x6D opens the SAME channels as
+ * before -- modem bring-up untouched -- and asks the modem for nothing. */
+#ifndef MSS_OPEN_MASK
+#define MSS_OPEN_MASK 0x6Du
+#endif

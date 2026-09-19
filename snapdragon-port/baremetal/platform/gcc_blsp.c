@@ -81,6 +81,32 @@ int gcc_blsp_qup_i2c_up(uint32_t cmd_rcgr, uint32_t cbcr, const char *name)
     return 0;
 }
 
+/* Any BLSP1 QUP SPI clock pair. Same shape as the I2C helper above, but the
+ * caller supplies the CFG word because SPI ports run at many rates: CFG is
+ * (src_sel << 8) | (2 * pre_div - 1), and M/N/D are left alone, so only
+ * MND-free rates (XO and its integer divisions) may be asked for here.
+ * Added 2026-09-12 for the Gen 5's BG co-processor bus (QUP4 SPI). */
+int gcc_blsp_qup_spi_up(uint32_t cmd_rcgr, uint32_t cbcr, uint32_t cfg, const char *name)
+{
+    uint32_t t0;
+    GCC_W(GCC_APCS_BRANCH_ENA_VOTE, GCC_R(GCC_APCS_BRANCH_ENA_VOTE) | BLSP1_AHB_VOTE_BIT);
+    t0 = timer_ms();
+    while (GCC_R(GCC_BLSP1_AHB_CBCR) & CBCR_CLK_OFF)
+        if ((uint32_t)(timer_ms() - t0) > 10u) { con_puts("gcc-blsp: AHB clk stuck\n"); return -1; }
+    GCC_W(cmd_rcgr + 4u, cfg);
+    GCC_W(cmd_rcgr, GCC_R(cmd_rcgr) | RCG_ROOT_EN | RCG_UPDATE);
+    t0 = timer_ms();
+    while (GCC_R(cmd_rcgr) & RCG_UPDATE)
+        if ((uint32_t)(timer_ms() - t0) > 10u) { con_puts("gcc-blsp: SPI RCG update stuck\n"); return -1; }
+    GCC_W(cbcr, GCC_R(cbcr) | CBCR_CLK_ENABLE);
+    t0 = timer_ms();
+    while (GCC_R(cbcr) & CBCR_CLK_OFF)
+        if ((uint32_t)(timer_ms() - t0) > 10u) { con_puts("gcc-blsp: SPI core clk stuck\n"); return -1; }
+    timer_delay_us(200u);
+    con_puts("gcc-blsp: "); con_puts(name); con_puts(" iface+core clocks up\n");
+    return 0;
+}
+
 /* Bring up the touch-I2C QUP clocks. Idempotent; bounded; never touches the
  * QUP itself. Returns 0 when both iface and core clocks report running. */
 int gcc_blsp_qup4_up(void)
@@ -137,13 +163,25 @@ int gcc_blsp_qup4_up(void)
  * QUP5, charger bus QUP4, sensor buses QUP1/2). The QUP registers keep their
  * state (AHB stays); wake re-enables the same set. */
 static uint32_t s_qup_sleep_mask;
+static int s_qup_asleep;
+/* 1 while gcc_blsp_sleep(1) has the QUP core clocks gated: no I2C until wake. */
+int gcc_blsp_asleep(void) { return s_qup_asleep; }
 static const uint32_t k_qup_cbcr[] = { 0x02008u, 0x03010u, 0x04020u, 0x05020u, 0x06020u, 0x07020u };
 void gcc_blsp_sleep(int on)
 {
     unsigned n = sizeof k_qup_cbcr / sizeof k_qup_cbcr[0];
+    /* v370: with the modem booted (MSS_BOOT), QUP1/QUP2/QUP3 (indexes 0..2) belong to the modem's
+     * sensor stack; gating a clock IT enabled hangs its I2C/SPI transfer forever (suspected cause of
+     * "dog.c:1522 stalled initialization" ~10 s after our first sleep). Only touch QUP4..6. */
+#if defined(MSS_BOOT)
+    const unsigned first = 3u;
+#else
+    const unsigned first = 0u;
+#endif
+    s_qup_asleep = on ? 1 : 0;
     if (on) {
         s_qup_sleep_mask = 0;
-        for (unsigned i = 0; i < n; i++)
+        for (unsigned i = first; i < n; i++)
             if (GCC_R(k_qup_cbcr[i]) & CBCR_CLK_ENABLE) { s_qup_sleep_mask |= 1u << i; GCC_W(k_qup_cbcr[i], GCC_R(k_qup_cbcr[i]) & ~CBCR_CLK_ENABLE); }
         __asm__ volatile("dsb sy" ::: "memory");
     } else {

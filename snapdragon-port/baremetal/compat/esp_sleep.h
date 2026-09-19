@@ -10,7 +10,11 @@ typedef enum { ESP_PD_DOMAIN_RTC_PERIPH=0, ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_DO
 typedef enum { ESP_PD_OPTION_OFF=0, ESP_PD_OPTION_ON, ESP_PD_OPTION_AUTO } esp_sleep_pd_option_t;
 typedef int esp_err_t;
 typedef int gpio_num_t_placeholder;
-#if defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_TICWATCH_C2)
+/* The Gen 5 was missing from this list (2026-09-10): its deep sleep fell
+ * through to the bring-up stub below ("pause, then return") and plat_suspend()
+ * never ran on that watch at all. Same recurring bug class as the CPU1 one-shot. */
+#if defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_TICWATCH_C2) || \
+    defined(PLAT_BOARD_FOSSIL_GEN5)
 #define OWF_PLAT_SUSPEND 1
 extern "C" { void plat_suspend(void); void plat_suspend_set_timer_us(unsigned long long us);
              void plat_suspend_keep_dark(int on); int plat_suspend_last_cause(void); void plat_display_on(void); }

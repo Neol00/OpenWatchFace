@@ -28,13 +28,22 @@ case "$PLATFORM" in
   gen6|gen6-hoki)
                  PLAT_DEF=PLAT_BOARD_FOSSIL_GEN6; LINK_BASE=0x80008000
                  BUILD_TAG=gen6 ;;
+  # Fossil Gen 5 (triggerfish, Carlyle HR, Snapdragon Wear 3100). The Wear 3100
+  # is the Wear 2100 AP plus a QCC1110 co-processor, so it is the SAME AArch32
+  # A7 codegen and the SAME link base as the Gen 4 — its stock boot.img loads at
+  # 0x80008000 with ramdisk 0x82000000 / tags 0x81e00000, byte-identical to
+  # firefish's. What differs is the PMIC (PM660, not PM8916) and therefore which
+  # PMIC-side drivers the board header selects.
+  gen5|gen5-triggerfish|triggerfish)
+                 PLAT_DEF=PLAT_BOARD_FOSSIL_GEN5; LINK_BASE=0x80008000
+                 BUILD_TAG=gen5 ;;
   # Mobvoi TicWatch C2 (skipjack) — same APQ8009W as the Gen 4, so the same
   # link base and the same SoC drivers (PLAT_SOC_MSM8909); only the board
   # header, panel and touch differ.
   c2|ticwatch-c2|skipjack)
                  PLAT_DEF=PLAT_BOARD_TICWATCH_C2; LINK_BASE=0x80008000
                  BUILD_TAG=c2 ;;
-  *) echo "usage: $0 [qemu|gen4|gen4-firefish|gen4-ray|gen6|c2] [run]"; exit 1 ;;
+  *) echo "usage: $0 [qemu|gen4|gen4-firefish|gen4-ray|gen5|gen6|c2] [run]"; exit 1 ;;
 esac
 
 BUILD="build/$BUILD_TAG"
@@ -98,7 +107,7 @@ ${CROSS}size "$BUILD/owf.elf"
 ${CROSS}objcopy -O binary "$BUILD/owf.elf" "$BUILD/owf.bin"
 
 case "$BUILD_TAG" in
-  gen4|gen6|c2)
+  gen4|gen5|gen6|c2)
     gzip -9 -k -f "$BUILD/owf.bin"
     echo "payload: $BUILD/owf.bin  (pack with tools/mk-bootimg.sh)"
     ;;

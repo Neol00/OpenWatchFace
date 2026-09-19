@@ -32,17 +32,53 @@ static void summary_handler(void *arg)
             if (s_pins[i].fn) s_pins[i].fn(s_pins[i].arg);
         }
     }
-    if (!any) g_tlmm_irq_spurious++;
+    if (!any) {
+        /* 2026-09-18: a pin we never registered can still be pending here -- an interrupt
+         * enable left in INTR_CFG by the bootloader, stock, TZ or the modem, on a line we
+         * then toggle or that its owner raises (the BG's gpio110, a sensor INT). Leaving its
+         * status set re-asserts the summary line the instant we EOI: the core never leaves
+         * this handler, every task freezes, the log stops and the watchdog bites -- a
+         * signature indistinguishable from a hang in whatever the app was doing. Same policy
+         * as irq.c's unowned-source disable: clear it, switch it off, and say which pin. */
+        g_tlmm_irq_spurious++;
+        for (uint32_t p = 0; p < 113u; p++) {
+            if (!(mmio_read(INTR_STATUS(p)) & 1u)) continue;
+            mmio_write(INTR_CFG(p), mmio_read(INTR_CFG(p)) & ~1u);   /* enable off */
+            mmio_write(INTR_STATUS(p), 0u);
+            __asm__ volatile("dsb sy" ::: "memory");
+            con_puts("tlmm: UNOWNED gpio"); con_putdec(p); con_puts(" interrupt pending -- cleared and disabled\n");
+        }
+    }
 }
 
 /* detect: 1 rising, 2 falling, 3 both edges. The pin must already be an input. */
 /* Mask/unmask the whole TLMM summary line at the GIC (suspend: the touch
  * controller's INT was waking a collapsed core ~every 0.7 s idle and 10x/s
  * when the glass was brushed, C2 2026-09-06). */
+static uint32_t s_wake;   /* bit i: s_pins[i] is a wake source (a pusher) */
+
+void tlmm_irq_set_wake(uint32_t pin)
+{
+    for (unsigned i = 0; i < s_n; i++) if (s_pins[i].pin == pin) s_wake |= 1u << i;
+}
+
+/* 2026-09-15: with a pusher registered as a wake source the summary line has to
+ * stay live through a suspend, so the non-wake pins (the touch INT) are gated
+ * at their own INTR_CFG enable bit instead of masking the whole line. */
 void tlmm_irq_mask(int mask)
 {
-    if (mask) gic_disable_irq(TLMM_SUMMARY_IRQ);
-    else      gic_enable_irq(TLMM_SUMMARY_IRQ, 0xC0);
+    if (!s_wake) {
+        if (mask) gic_disable_irq(TLMM_SUMMARY_IRQ);
+        else      gic_enable_irq(TLMM_SUMMARY_IRQ, 0xC0);
+        return;
+    }
+    for (unsigned i = 0; i < s_n; i++) {
+        if (s_wake & (1u << i)) continue;
+        uint32_t cfg = mmio_read(INTR_CFG(s_pins[i].pin));
+        mmio_write(INTR_CFG(s_pins[i].pin), mask ? (cfg & ~1u) : (cfg | 1u));
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (!mask) gic_enable_irq(TLMM_SUMMARY_IRQ, 0xC0);
 }
 
 int tlmm_irq_enable(uint32_t pin, uint32_t detect, void (*fn)(void *), void *arg)

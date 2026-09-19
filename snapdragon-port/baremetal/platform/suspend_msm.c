@@ -57,7 +57,27 @@
  * each step rather than on inference.
  */
 #include "platform.h"
-#if defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_TICWATCH_C2)
+
+/* 2026-09-18 (gen5-modem-33, chime27/28): the first idle sleeps of this series, with the modem
+ * and the audio DSP stream up, ended in a runaway inside tz_boot_counters() -- the collapse's
+ * pre/post print -- at ~18,000 iterations a second, then a freeze and a reset. The resume path
+ * with the modem owning IMEM/XPU has never been validated. Until it is, a modem-up watch idles
+ * on WFI chunks: no cluster collapse, no RPM sleep set, no TZ warm boot. Costs current, keeps
+ * the watch. */
+static int collapse_blocked(void)
+{
+#if defined(MSS_BOOT)
+    extern int mss_ready(void);
+    static int said;
+    if (mss_ready()) {
+        if (!said) { said = 1; con_puts("sleep: modem up -> WFI-only idle, no cluster collapse (gen5-modem-33 runaway)\n"); }
+        return 1;
+    }
+#endif
+    return 0;
+}
+#if defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_FOSSIL_GEN4) || \
+    defined(PLAT_BOARD_FOSSIL_GEN5) || defined(PLAT_BOARD_TICWATCH_C2)
 
 /* 8909w PORT (2026-09-03): the Gen 4 and the C2 run this same loop. What
  * differs is gated on SUSPEND_GEN6 below:
@@ -80,6 +100,23 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
+
+#if defined(PLAT_SOC_MSM8909)
+/* v406: S3 (8916_s3, the buck stock leaves OFF in idle and sleep) read straight from the PMIC
+ * (SPMI sid 1, EN_CTL 0x1A46 bit7) around the collapse. The user wants S3 off in sleep; the
+ * RPM message acks prove nothing (v329). Points: after wlan_idle + the RPM sleep set, before
+ * the first collapse; after the first collapse returns; at the final sleep exit. */
+void owf_radio_sleep_hook(int entering) __attribute__((weak));
+int wlan_down(void); int wlan_power_off(void); int wlan_up(void); int wlan_is_up(void);
+static int s_radio_was_up;
+static void s3_check(const char *where)
+{
+    uint8_t en = 0xFF; int rc = spmi_read8(1u, 0x1A46u, &en);
+    con_puts("s3-check["); con_puts(where); con_puts("]: EN_CTL=");
+    if (rc < 0) con_puts("read-failed"); else { con_puthex(en); con_puts(en & 0x80u ? " (ON)" : " (off)"); }
+    con_puts("\n");
+}
+#endif
 
 /* Chunk length while suspended.
  *
@@ -145,6 +182,8 @@ static uint64_t s_wake_deadline_ms;   /* 0 = no timer wake armed */
 static int s_keep_dark;
 static int s_panel_off;
 static int s_last_cause;              /* PLAT_WAKE_* */
+static int s_rtc_alm_ok = -2;         /* rtc_alarm_writable(): -2 unknown, 1 EE0 owns the alarm */
+extern int rtc_alarm_writable(void);
 
 void plat_suspend_keep_dark(int on) { s_keep_dark = on; }
 int  plat_suspend_last_cause(void)  { return s_last_cause; }
@@ -158,7 +197,44 @@ static void panel_dcs(uint8_t cmd)
     dsi_dcs_write(cmd, 0, 0);
 #endif
 }
+/* Carried across a sleep so the NEXT sleep entry can price the awake window
+ * that preceded it (see wake-gauge below). -1 = no previous wake to compare. */
+static int      s_awake_soc = -1;
+static uint32_t s_awake_t0;
 static int s_panel_sleeping;     /* DCS 0x10 sent: DDIC analog + boost off */
+
+/* THE PANEL CAME BACK UPSIDE DOWN (2026-09-13, v309 -> v310).
+ *
+ * Dropping l6 for the sleep (-DSLEEP_RAILS_OFF bit 6) works: the watch wakes, the
+ * DSI host/PHY/PLL survive and the display lights up. But l6 is the panel
+ * DDIC's vddio as well, so the DDIC loses its register state and comes back at
+ * its power-on defaults -- and the one default that shows is MADCTL (DCS 0x36,
+ * memory access control). The picture was rotated exactly 180 degrees, which is
+ * the MY|MX pair (bits 7 and 6) reverting to 0. Colours were unaffected, so the
+ * BGR/ML/MV bits are at their defaults either way.
+ *
+ * So aboot programs 0xC0 and the POR value is 0x00, and restoring orientation
+ * is one DCS write rather than the panel bring-up this looked like it needed
+ * (the C2 has no on/off command table -- see dsi_panel.c).
+ *
+ * WHY THIS IS A VALUE AND NOT A READBACK: there is no DCS read path in this
+ * tree (no BTA sequence against DSI_RDBK_DATA0) and no kernel source on hand to
+ * write one against. MADCTL is safe to get wrong in a way a power sequence is
+ * not -- the result is a visibly different rotation, not a DDIC stuck in a
+ * state only a power cycle clears -- so a value that is checked on the glass is
+ * the honest trade here. Override with -DPLAT_PANEL_MADCTL=<v> if a unit
+ * differs. */
+#ifndef PLAT_PANEL_MADCTL
+#define PLAT_PANEL_MADCTL 0xC0u
+#endif
+void plat_panel_madctl_restore(void)
+{
+    uint8_t v = (uint8_t)PLAT_PANEL_MADCTL;
+    (void)dsi_dcs_write(0x36u, &v, 1u);
+    con_puts("panel: MADCTL restored to "); con_puthex(v);
+    con_puts(" (DDIC lost its state with the rail)\n");
+}
+
 void plat_display_on(void)
 {
     if (!s_panel_off) return;
@@ -244,6 +320,11 @@ void plat_suspend(void)
 #endif
     uint64_t chunk_ticks = (uint64_t)(hz / 1000u) * chunk_ms;
     uint32_t parks = 0, caught = 0;
+    uint32_t spurious_slept = 0;   /* PMIC IRQs that were neither alarm nor press */
+    uint32_t kpd0 = g_pmic_irq_kpdpwr, resin0 = g_pmic_irq_resin;   /* edge snapshot */
+#if defined(PLAT_BTN_STEM1_GPIO)
+    uint32_t stem0 = stem_keys_irq_total();                          /* gpio_keys pushers, same idea */
+#endif
     uint32_t pc_ms = 0, pc_n = 0, pc_fail = 0;   /* collapse residency, see the report below */
     /* CPU1 is brought up for frame pushes and NOTHING in this path takes it
      * down. It sits in WFI, which on an A7 is clock gating, not power off —
@@ -262,7 +343,12 @@ void plat_suspend(void)
      * alarm (armable + delivering on this PMIC, proven 2026-09-06). */
     if (smp_flush_available()) smp_flush_wait();
     uint32_t alarm0 = g_pmic_irq_alarm;
-    if (deadline) {
+    /* Only arm what EE0 owns (2026-09-10). Proven armable on the PM8916 watches;
+     * on the Gen 5's PM660 -- the part whose RTC_CTRL write hard-reset the Gen 6
+     * -- it is decided by the arbiter's ownership table, read once per boot. If
+     * the alarm is not ours the QTimer / vMPM deadline is the only timed wake. */
+    if (s_rtc_alm_ok == -2) s_rtc_alm_ok = rtc_alarm_writable();
+    if (deadline && s_rtc_alm_ok == 1) {
         uint64_t left = deadline > (uint64_t)timer_ms() ? deadline - (uint64_t)timer_ms() : 0;
         rtc_alarm_arm((uint32_t)(left / 1000u) + 1u);
     }
@@ -272,7 +358,9 @@ void plat_suspend(void)
      * as the re-pin path). Self-refresh stops driving the OLED: true black,
      * and the DDIC keeps its RAM + init state so 0x29 restores instantly. */
     if (!s_panel_off) { panel_dcs(0x28); s_panel_off = 1; }
-#if defined(PLAT_SOC_MSM8909)
+#if defined(PLAT_HAS_HR_PAH8011) && !defined(MSS_BOOT)
+    /* v370: with the modem booted (MSS_BOOT) the sensor buses are the MODEM's again: bit-banging
+     * gpio6/7 here would corrupt its QUP1 traffic, so the HR sensor is left to the modem's SMGR. */
     /* The PPG LEDs must never ride through a sleep. force_off() now returns
      * whether its writes were ACKed: a failure here means the sensor is still
      * powered and is a prime suspect for a hot watch. Reported once per boot —
@@ -301,13 +389,21 @@ void plat_suspend(void)
      *  - cluster clock to the 19.2 MHz crystal while CPU0 is down (CPU1 and
      *    the L2 are otherwise clocked at 200 MHz all night). */
     if (!s_panel_sleeping) { panel_dcs(0x10); s_panel_sleeping = 1; timer_delay_ms(20u); }
-#if defined(SLEEP_PAS_KILL_RADIO)
-    if (wcnss_fw_resident()) { con_puts("suspend: radio power-off\n"); wlan_power_off(); }
-#else
-    /* v168: never PAS-kill the radio for a sleep -- its RPM votes would
-     * outlive it (Gen 4 v166/v167 census: l9 held ON by the dead session).
-     * Firmware stays resident and idles itself, exactly like stock. */
+#if defined(SLEEP_RADIO_IDLE_ONLY)
+    /* v168 behaviour: firmware resident, MAC stopped, Pronto idles itself. */
     if (wcnss_fw_resident()) { con_puts("suspend: radio idle (resident)\n"); wlan_idle(); }
+#else
+    /* v432 (user, 2026-09-15): WiFi and BLE go OFF for every sleep whatever the settings say, and
+     * come back on wake if they were up. BLE first (the app owns its GATT server: weak hook defined
+     * in OpenWatchFace.ino), then the WCNSS is powered off (MAC stop + PAS shutdown + our votes
+     * released). Restore = wlan_up() + hook(0) on the wake side. -DSLEEP_RADIO_IDLE_ONLY restores
+     * the old resident-idle behaviour. */
+    if (owf_radio_sleep_hook) owf_radio_sleep_hook(1);
+    s_radio_was_up = wlan_is_up();
+    if (wcnss_fw_resident()) { con_puts("suspend: radio OFF for the sleep (was up "); con_putdec((uint32_t)s_radio_was_up); con_puts(")\n"); wlan_down(); wlan_power_off(); }
+#endif
+#if defined(PRONTO_HS_PROBE)
+    pronto_hs_probe();                 /* route 1: drive the Pronto SAW2 handshake ourselves */
 #endif
 #endif
 #endif
@@ -368,16 +464,51 @@ void plat_suspend(void)
     logfile_flush();                                  /* last eMMC write before its clocks stop */
 #if defined(PLAT_CHG_SMB231)
     int soc0 = smb231_soc_x512(); uint32_t soc_t0 = timer_ms();
+    /* THE AWAKE WINDOW, which nothing measured until now (2026-09-13).
+     *
+     * sleep-gauge reports the SLEEP. The periodic notification wake is the
+     * other half of the budget and was invisible: at a 1200 s check interval
+     * the watch wakes 72 times a day, and each wake is a full resume plus a
+     * BLE reconnect. A 6 mA floor is 144 mAh/day on this cell -- survivable --
+     * but 72 wakes at even 15 s of radio work swamp it. Nothing in the log
+     * said how long the watch stayed awake or what it spent, so the two halves
+     * could not be compared. This prints the same figure for the awake window:
+     * SOC delta and mA between the LAST wake and this sleep entry. */
+    if (s_awake_soc >= 0 && soc0 >= 0) {
+        uint32_t adt = soc_t0 - s_awake_t0;
+        con_puts("wake-gauge: awake "); con_putdec(adt / 1000u); con_puts(" s");
+        if (adt >= 5000u) {
+            int d = s_awake_soc - soc0;                    /* + = discharged */
+            int64_t ma100 = (int64_t)d * PLAT_BATT_MAH * 3600000LL * 100 / (512LL * 100 * adt);
+            con_puts(", soc "); con_putdec((uint32_t)s_awake_soc * 100u / 512u);
+            con_puts(" -> ");    con_putdec((uint32_t)soc0 * 100u / 512u);
+            con_puts(" (x0.01%) = avg ");
+            if (ma100 < 0) { con_puts("-"); ma100 = -ma100; }
+            con_putdec((uint32_t)(ma100 / 100)); con_puts(".");
+            con_putdec((uint32_t)((ma100 % 100) / 10)); con_puts(" mA");
+            /* What the budget actually cares about: mAh burned by THIS wake. */
+            con_puts(" = "); con_putdec((uint32_t)((int64_t)(d < 0 ? -d : d) * PLAT_BATT_MAH * 100 / (512 * 100)));
+            con_puts(".");
+            con_putdec((uint32_t)(((int64_t)(d < 0 ? -d : d) * PLAT_BATT_MAH * 1000 / (512 * 100)) % 10));
+            con_puts(" mAh this wake");
+        } else con_puts(" (too short to price)");
+        con_puts("\n");
+    }
 #endif
 #if defined(SYS_PC_8909) && defined(SYS_PC_STAGE) && SYS_PC_STAGE == 5
     (void)smp_cpu1_pc_request_mode(2u);               /* CPU1 off via its SPM on WFI, TZ not involved */
 #else
     (void)smp_cpu1_pc_request();                      /* CPU1 off (own SPM + TERMINATE_PC) */
 #endif
+    /* USB log live = cable present. chg_usb_present() reads 0 at sleep entry while still
+     * enumerated (phy-bsv/usbin 0, enum=1 -- with or without SLEEP_BATT_DIAG), and taking the
+     * no-cable path then (no USB wake, PHY PLL quiesced) with the host still streaming reset the
+     * watch in the system collapse (PON: PS_HOLD, only with the USB log attached). */
+    int usb_cable = usb_is_configured();
     gcc_blsp_sleep(1);                                /* QUP cores: touch, charger, sensors */
     gcc_sdcc1_sleep(1);                               /* eMMC */
     gcc_mdss_sleep(1);                                /* MDP + DSI link clocks */
-    if (usb_is_configured() && chg_usb_present() == 1) { usb_poll(); usb_irq_arm(1); }   /* cable: USB completions wake the core (USB_IRQ_WAKE builds) */
+    if (usb_cable) { usb_poll(); usb_irq_arm(1); }   /* cable: USB completions wake the core (USB_IRQ_WAKE builds) */
     con_puts("suspend: buses gated, cluster clock -> XO\n"); con_flush();
 #if defined(SYS_PC_8909) && !defined(SYS_PC_XO_PARK)
     /* v175: the kernel's ramp_down_last_cpu() = a7ssmux to its SAFE rate,
@@ -395,14 +526,17 @@ void plat_suspend(void)
      * USB PHY), measured step by step on a cable. Undone in sleep_floor_exit. */
     sleep_floor_enter(floor_cable);
 #endif
+#if !defined(SLEEP_FLOOR) && defined(SLEEP_RAILS_OFF) && (SLEEP_RAILS_OFF)
+    sleep_rails_enter();          /* the proven rails only, no ladder */
+#endif
 #if defined(SLEEP_QUIESCE)
     /* The AP's OWN registers, which the RPM sleep set never sees: the
      * bootloader's GPLL1/GPLL2 + crypto/PRNG votes, and the USB PHY PLL when
      * no cable is attached. Costs microseconds, no RPM traffic, no ladder. */
-    sleep_quiesce_enter(usb_is_configured() && chg_usb_present() == 1);
+    sleep_quiesce_enter(usb_cable);
 #endif
 #if defined(SYS_PC_8909)
-    (void)sys_pc8909_prepare(deadline);                       /* cluster off + RPM sleep set; falls back to plain collapse */
+    if (!collapse_blocked()) (void)sys_pc8909_prepare(deadline);   /* cluster off + RPM sleep set; falls back to plain collapse */
 #endif
 #endif
     for (;;) {
@@ -447,9 +581,11 @@ void plat_suspend(void)
          * Once it declines, stay on WFI for the rest of this boot. */
 #if defined(USE_CPU_PC_8909)
         if (!cpu_pc8909_ready() && parks == 0u) con_puts("cpu-pc: not ready (init failed at the 20 s one-shot) - WFI suspend\n");
-        if (cpu_pc8909_ready() && (g_cpu_pc_attempts == 0u || g_cpu_pc_ok)) {
+        if (cpu_pc8909_ready() && !collapse_blocked() && (g_cpu_pc_attempts == 0u || g_cpu_pc_ok)) {
             uint32_t pc_t0 = timer_ms();
+            if (parks == 0u) s3_check("before first collapse");
             did_pc = cpu_pc8909_sleep(park);
+            if (parks == 0u) s3_check("after first collapse");
             if (did_pc) { pc_ms += timer_ms() - pc_t0; pc_n++; } else pc_fail++;
             if (did_pc) {
                 parks++;
@@ -580,9 +716,61 @@ housekeeping:
 #endif
 #if defined(PLAT_SOC_MSM8909)
         if (g_pmic_irq_wake && g_pmic_irq_alarm == alarm0 && (timer_ms() - t0) < 300u) g_pmic_irq_wake = 0u;  /* same press */
-        if (g_pmic_irq_wake) { why = (g_pmic_irq_alarm != alarm0) ? "timer" : "pmic-irq"; break; }
+        if (g_pmic_irq_wake) {
+            /* A PMIC INTERRUPT IS NOT A BUTTON PRESS (2026-09-13).
+             *
+             * This used to break out of the sleep for ANY interrupt on GIC 222,
+             * with why = "pmic-irq". Because the reason string does not begin
+             * with 't', s_last_cause below made it PLAT_WAKE_BUTTON, so the app
+             * took its button branch: out of the dark check loop, panel on,
+             * awake until the idle timeout. A single spurious PMIC interrupt
+             * therefore cost a full lit wake, and on a watch left overnight
+             * that is the battery, not the 6 mA floor.
+             *
+             * pmic_irq.c already knows the difference -- g_pmic_irq_kpdpwr /
+             * g_pmic_irq_resin count real edges and g_pmic_irq_spurious counts
+             * an interrupt that fired with nothing pending -- and button_wake()
+             * below reports a genuine press as "kpdpwr"/"resin". That check was
+             * simply unreachable, because this break came first.
+             *
+             * Now: the RTC alarm is a timer wake, a real edge falls through to
+             * button_wake() and is reported honestly, and anything else is
+             * spurious -- cleared, counted, and slept through. */
+            if (g_pmic_irq_alarm  != alarm0) { why = "timer";  break; }
+            /* USE THE COUNTERS, NOT button_wake() (2026-09-13, v322 -> v323).
+             *
+             * v322 called button_wake() here and bricked the wake: it reads the
+             * LIVE button level (pon_kpdpwr_pressed()), and by the time this
+             * loop runs the handler has already cleared the PON latch
+             * (pmic_irq.c:117) and the finger is off the button, so it returns
+             * 0 for a genuine press. Every real press was then classified
+             * spurious and slept through -- an unwakeable watch.
+             *
+             * g_pmic_irq_kpdpwr / g_pmic_irq_resin are incremented by the
+             * handler (pmic_irq.c:114) from the latched status BEFORE it clears
+             * anything, so a delta against the sleep-entry snapshot is the only
+             * honest record that an edge happened. */
+            if (g_pmic_irq_kpdpwr != kpd0)   { why = "kpdpwr"; break; }
+            if (g_pmic_irq_resin  != resin0) { why = "resin";  break; }
+            /* FAIL SAFE: never let this path make the watch unwakeable. If the
+             * PMIC is producing interrupts we cannot attribute, wake on the
+             * 16th rather than sleep through an unbounded number of them --
+             * a needless wake costs battery, a missed one costs the device. */
+            if (spurious_slept >= 16u) { why = "pmic-irq"; break; }
+            g_pmic_irq_wake = 0u;
+            spurious_slept++;
+            continue;                     /* back to the top: re-park, stay asleep */
+        }
 #else
         if (g_pmic_irq_wake) { why = "pmic-irq"; break; }
+#endif
+#if defined(PLAT_BTN_STEM1_GPIO)
+        /* gpio_keys pushers (2026-09-15): a counted TLMM edge, or -- after a
+         * system collapse -- the MPM pin, which is what actually woke the RPM. */
+        if (stem_keys_irq_total() != stem0 || (g_cpu_pc_l2_off && stem_keys_mpm_fired())) {
+            if ((timer_ms() - t0) < 300u) stem0 = stem_keys_irq_total();   /* the press that forced this sleep */
+            else { why = "stem"; break; }
+        }
 #endif
         int b = button_wake(&armed_kpd, &armed_resin);
         if (b && (timer_ms() - t0) < 300u) b = 0;   /* the press that forced this sleep, still settling */
@@ -615,16 +803,16 @@ housekeeping:
 #if defined(USE_CPU_PC_8909)
     cpu_pc8909_state_line("sleep-exit");
 #endif
-#if defined(SLEEP_BATT_DIAG) && defined(PLAT_CHG_SMB231)
-    smb231_charger_suspend(0);
-    con_puts("sleep-batt: charger input restored\n");
-#endif
+    s3_check("sleep exit, radio still idle");
 #if defined(SLEEP_NO_WDOG) && defined(PLAT_SOC_MSM8909)
 #if defined(SYS_PC_8909)
     sys_pc8909_finish();
 #endif
 #if defined(SLEEP_FLOOR)
     sleep_floor_exit();
+#endif
+#if !defined(SLEEP_FLOOR) && defined(SLEEP_RAILS_OFF) && (SLEEP_RAILS_OFF)
+    sleep_rails_exit();           /* FIRST: l6 must be up before the panel re-init */
 #endif
 #if defined(SLEEP_QUIESCE)
     sleep_quiesce_exit();          /* PLL votes back before any branch re-enable */
@@ -634,18 +822,24 @@ housekeeping:
     gcc_mdss_sleep(0);
     gcc_sdcc1_sleep(0);
     gcc_blsp_sleep(0);
+    /* after the QUP clocks are back: I2C is refused while they are gated */
+#if defined(SLEEP_BATT_DIAG) && defined(PLAT_CHG_SMB231)
+    smb231_charger_suspend(0);
+    con_puts("sleep-batt: charger input restored\n");
+#endif
     (void)smp_cpu1_wake();
 #if defined(SYS_PC_8909)
     /* v193: the USB console did not come back after the first real cluster
      * collapses (RPM sleep set applied). Bring the controller up from scratch
      * whenever a cable is present; ~300 ms, host re-enumerates. */
-    if (pc_n && chg_usb_present() == 1) { con_puts("usb: re-init after the system collapse\n"); (void)usb_dev_reinit(); }
+    if (pc_n && (usb_cable || chg_usb_present() == 1)) { con_puts("usb: re-init after the system collapse\n"); (void)usb_dev_reinit(); }
 #endif
 #if defined(PLAT_CHG_SMB231)
     /* TRUE AVERAGE SLEEP CURRENT (v190): STC3117 SOC delta over the sleep.
      * 1 LSB = 1/512 %; cell = PLAT_BATT_MAH. Only meaningful on battery and
      * over long sleeps (1 LSB ~ 0.7 mAh on a 350 mAh cell). */
     { int soc1 = smb231_soc_x512(); uint32_t dt = timer_ms() - soc_t0;
+      s_awake_soc = soc1; s_awake_t0 = timer_ms();   /* the awake window starts here */
       con_puts("sleep-gauge: soc "); 
       if (soc0 >= 0 && soc1 >= 0) {
           con_putdec((uint32_t)soc0 * 100u / 512u); con_puts(" -> "); con_putdec((uint32_t)soc1 * 100u / 512u); con_puts(" (x0.01%) over ");
@@ -672,12 +866,29 @@ housekeeping:
 #if defined(SLEEP_NO_WDOG)
     wdog_extend(30u);                /* re-arm only now that we are awake */
 #endif
-    rtc_alarm_disarm();
+    if (s_rtc_alm_ok == 1) rtc_alarm_disarm();
     tlmm_irq_mask(0);
     touch_set_sleep(0);              /* reset pulse: the only way out of hibernate */
 #endif
     s_last_cause = (why[0] == 't') ? PLAT_WAKE_TIMER : PLAT_WAKE_BUTTON;
+#if defined(SLEEP_RAILS_OFF) && ((SLEEP_RAILS_OFF) & (1u << 6))
+    /* l6 is the DDIC's vddio: it came back at POR. sleep_floor_exit() has
+     * already re-voted the rail. v310 got away with MADCTL alone; with the
+     * modem asleep the chip comes back needing its whole init (v407: black
+     * screen), so run the stock reset + on-command first, then MADCTL. The
+     * table leaves the display OFF (no 0x29) and the chip out of sleep, which
+     * is exactly the state plat_display_on() expects. */
+#if defined(PLAT_BOARD_TICWATCH_C2)
+    if (panel_reinit_after_rail() == 0) { s_panel_off = 1; s_panel_sleeping = 0; }
+#endif
+    plat_panel_madctl_restore();
+#endif
     if (!(s_keep_dark && s_last_cause == PLAT_WAKE_TIMER)) plat_display_on();
+#if !defined(SLEEP_RADIO_IDLE_ONLY)
+    if (s_radio_was_up) { con_puts("resume: bringing the radio back (was up before the sleep)\n"); (void)wlan_up(); }
+    if (owf_radio_sleep_hook) owf_radio_sleep_hook(0);
+    s_radio_was_up = 0;
+#endif
 
     /* THE NUMBER THAT MATTERS (2026-09-06): the C2 lost 4.15 -> 3.67 V in
      * 3 h 50 min asleep, i.e. tens of mA, which is cluster-awake territory
@@ -701,6 +912,14 @@ housekeeping:
     if (parks) cpu_pc8909_mark(0x3A);
 #endif
     irq_hist_report();
+    if (spurious_slept) {
+        /* Unconditional, not diag-gated: if the watch is being woken by
+         * phantom PMIC interrupts this is the number that says so. */
+        con_puts("suspend: slept through "); con_putdec(spurious_slept);
+        con_puts(" spurious pmic irq(s) (kpd="); con_putdec(g_pmic_irq_kpdpwr);
+        con_puts(" resin="); con_putdec(g_pmic_irq_resin);
+        con_puts(" spur="); con_putdec(g_pmic_irq_spurious); con_puts(")\n");
+    }
     con_puts("suspend: woke by "); con_puts(why);
     if (s_panel_off) con_puts(" (dark)");
     con_puts(" after ");           con_putdec(slept);

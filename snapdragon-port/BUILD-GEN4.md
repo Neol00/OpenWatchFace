@@ -31,7 +31,7 @@ on the sibling C2, stock territory). The per-subsystem table is under
 cd snapdragon-port/baremetal
 
 # 1. compile + link the real firmware
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN" \
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES" \
 LVGL_DIR=$HOME/Arduino/libraries/lvgl \
 sh build-owf-image-gen4.sh
 
@@ -42,9 +42,11 @@ sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../dtbs/firefish-stock.dtb
 cp build/gen4/owf-boot.img build/gen4-owf/owf-gen4-<TAG>.img
 ```
 
-The flag set above is the release set (2026-09-09): `-DWDOG_TRACE` alone still
-boots, but the other five are the deep sleep (cluster power collapse + RPM XO
-shutdown, ~6 mA). Every flag is explained in
+The flag set above is the release set (updated 2026-09-17): `-DWDOG_TRACE` alone
+still boots, the next five are the deep sleep (cluster power collapse + RPM XO
+shutdown, ~6 mA), and the two `MSS_*` ones load the modem. `MSS_OPEN_MASK` is
+deliberately **not** here — `boards/fossil_gen4.h` defaults it to `0x6D`, which
+keeps the Wear 3100's diag/fastrpc channels shut. Every flag is explained in
 [docs/devices/fossil-gen4.md](../docs/devices/fossil-gen4.md#build-flags);
 `-DBOOT_DIAG` is a diagnostic, add it only when chasing a display problem.
 
@@ -167,7 +169,7 @@ this watch's DTB) for the case where aboot hands over a dark display.
 | Panel brightness (DCS 0x51) | **Working.** `platform/dsi_panel.c` sends DCS 0x51/0x53 over the existing command-mode link, and refuses if DSI is not enabled in command mode. |
 | Storage (eMMC / NVS / FatFs / log file) | **Working.** (Ported from the Gen 6 on 2026-08-30, confirmed since.) `sdhci_msm.c`, `gcc_sdcc.c`, `storage_gen6.c`, `nvs_store.c`, `logfile.c` are built as-is; `boards/fossil_gen4.h` declares `PLAT_HAVE_EMMC_STORAGE` plus what differs from the Gen 6 (DTB sdc1 pad values, card VDD = PM8916 L8 on sid 1, no CQE, no ICE). The same `sdhci@7824900` node is in the C2's DTB, so the C2 shares every value. First boot creates the userdata superblock and formats FFat — Wear OS `/data` is gone from then on (the GPT is untouched; fastboot/EDL unaffected). Read-only trial: `-DPLAT_STORAGE_NOWRITE`. |
 | USB CDC log console | **Working** — `cat /dev/ttyACM0`. The old note here (that msm8909w has a ULPI SNPS PHY and needed a port) was a guess and the device trees contradict it: `usb@78d9000` is phy-type <3> with a `phy_csr` window at 0x6c000, field-for-field the Gen 6's node. gcc_usb.c / usb_phy_msm.c / usb_ci.c are now shared verbatim, gated on `PLAT_HAVE_USB_CDC`. |
-| Power (RPM, cpufreq, deep sleep) | **Working.** 400 MHz on GPLL0 by default (Power app ladder 800/533/400/200). Deep sleep = L2/cluster power collapse through the SAW sequence and TrustZone, RPM sleep set with the crystal released (XO shutdown), PMIC button + RTC alarm wake; ~6 mA measured on the C2. Flags: `-DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN`. The stock C2+ was the reference; see `notes/C2PLUS-FINDINGS.md`. |
+| Power (RPM, cpufreq, deep sleep) | **Working.** 400 MHz on GPLL0 by default (Power app ladder 800/533/400/200). Deep sleep = L2/cluster power collapse through the SAW sequence and TrustZone, RPM sleep set with the crystal released (XO shutdown), PMIC button + RTC alarm wake; ~6 mA measured on the C2. Flags: `-DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN`. The stock C2+ was the reference. |
 | BLE / WiFi (WCNSS) | **Working.** WCNSS firmware loaded through PAS from the watch's own NV blob, wcn36xx HAL, WPA2 STA + lwIP (DHCP, DNS, SNTP, HTTP, HTTPS via mbedTLS with the SoC PRNG), NimBLE over HCI-on-SMD (iPhone pairing, ANCS). The radio stays resident and idle through deep sleep. |
 | SMP | **Working.** Core 1 is cold-booted through TrustZone, renders frame pushes, and is handed to TZ with the hotplug flag before every collapse. |
 | OTA | **Working** (confirmed 2026-09-09 with 1.5.0): GitHub `releases/latest`, resumable HTTPS download, SHA-256 from `SHA256SUMS`, written to `boot` header-last. |

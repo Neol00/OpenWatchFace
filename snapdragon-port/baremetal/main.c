@@ -6,6 +6,7 @@
  *  - counter: busy-ish worker at lower priority proving preemptive scheduling.
  * Next step stacks LVGL + the ramfb framebuffer on top of this.
  */
+#include <string.h>
 #include "platform.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -38,6 +39,35 @@ static void heartbeat_task(void *arg)
     }
 }
 
+extern uint32_t boot_r2;
+static void boot_dtb_ids(void)
+{
+    /* v440: print the ids of the tree aboot CHOSE (Gen 5E "sole": its tree is unreadable from Wear
+ * OS; a sweep image of stub trees lets aboot reveal the ids it wants). Root-level props only. */
+if (boot_r2 >= 0x80000000u && (boot_r2 & 3u) == 0u) {
+    const uint8_t *f = (const uint8_t *)(uintptr_t)boot_r2;
+    #define BE32(p) ((uint32_t)(p)[0] << 24 | (uint32_t)(p)[1] << 16 | (uint32_t)(p)[2] << 8 | (uint32_t)(p)[3])
+    if (BE32(f) == 0xd00dfeedu) {
+        uint32_t so = BE32(f + 8), ss = BE32(f + 12), p2 = so; int depth = 0;
+        con_puts(" dtb-ids:");
+        for (unsigned guard = 0; guard < 4000u; guard++) {
+            uint32_t tok = BE32(f + p2); p2 += 4;
+            if (tok == 1u) { depth++; while (f[p2]) p2++; p2 = (p2 + 4u) & ~3u; }
+            else if (tok == 2u) { if (--depth <= 0) break; }
+            else if (tok == 3u) { uint32_t len = BE32(f + p2), no = BE32(f + p2 + 4); p2 += 8;
+                const char *nm = (const char *)f + ss + no;
+                if (depth == 1 && (!strcmp(nm, "qcom,board-id") || !strcmp(nm, "qcom,msm-id") || !strcmp(nm, "qcom,pmic-id"))) {
+                    con_puts(" "); con_puts(nm + 5); con_puts("=<");
+                    for (uint32_t k = 0; k + 4u <= len; k += 4u) { if (k) con_puts(" "); con_puthex(BE32(f + p2 + k)); }
+                    con_puts(">");
+                }
+                p2 = (p2 + len + 3u) & ~3u; }
+            else if (tok == 4u) { }
+            else break;
+        }
+    }
+}
+}
 void main(void)
 {
 #if defined(PLAT_SOC_MSM)
@@ -264,6 +294,7 @@ void main(void)
     }
 #endif
 
+    { con_puts("boot: r2="); con_puthex(boot_r2); boot_dtb_ids(); con_puts("\n"); }
 #if defined(PING_TEST) && defined(PLAT_SOC_MSM)
     /* PING_TEST — the smallest possible round-trip diagnostic, and the FIRST
      * hardware experiment when there is no way to feel the buzz or read the UART.
@@ -281,7 +312,7 @@ void main(void)
      * it does NOT, the fault is upstream and none of the richer images would
      * have run either. */
     con_puts("\nPING_TEST [" PLAT_NAME "]: reached main; mmu+uart+gic up\n");
-    con_puts("boot_r2=");   con_puthex(boot_r2);
+    con_puts("boot_r2=");   con_puthex(boot_r2); boot_dtb_ids();
     con_puts(" boot_fault="); con_puthex(boot_fault);
     con_puts("\nPING_TEST: rebooting to bootloader in 6s\n");
     timer_delay_ms(6000);
@@ -415,16 +446,42 @@ void main(void)
     con_puts("\n");
 
     if (fb) {
-        /* Paint the whole buffer white and kick the MDP, so if the panel IS
-         * updatable you SEE it go white before the reboot — that alone would
-         * prove the command-mode kickoff works. */
+        /* Paint COLOUR BANDS and kick the MDP.
+         *
+         * This used to paint the whole buffer WHITE, and on the Gen 5
+         * (2026-09-10) that turned out to be ambiguous in the worst way: the
+         * watch showed a white screen and then landed in recovery, and stock
+         * recovery ALSO flashes white on its way to "No command". So the one
+         * observation that was supposed to prove the display works could not
+         * be told apart from the display never working at all.
+         *
+         * Four horizontal bands fix that, and pay for themselves twice:
+         *   - no boot screen, splash or recovery UI looks like this, so seeing
+         *     them is unambiguous proof that OUR pixels reached the panel;
+         *   - the ORDER of the colours reports the pixel format. Reading them
+         *     top-to-bottom as red/green/blue means the buffer is xRGB8888 as
+         *     assumed; blue/green/red means the panel wants the bytes swapped
+         *     (the DTB says rgb_swap_rgb, which is exactly the kind of thing
+         *     that is easier to read off the glass than out of a register). */
         volatile uint32_t *p = (volatile uint32_t *)fb;
-        for (uint32_t i = 0; i < fb_width() * fb_height(); i++) p[i] = 0x00FFFFFFu;
+        const uint32_t bands[4] = { 0x00FF0000u,   /* red    */
+                                    0x0000FF00u,   /* green  */
+                                    0x000000FFu,   /* blue   */
+                                    0x00FFFFFFu }; /* white  */
+        const uint32_t h = fb_height(), w = fb_width();
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t c = bands[(y * 4u) / (h ? h : 1u)];
+            for (uint32_t x = 0; x < w; x++) p[y * w + x] = c;
+        }
         fb_flush_all();
         timer_delay_ms(4000);    /* long enough to see it */
         con_puts("STAGE_REPORT: display OK -> rebooting to FASTBOOT\n");
         reboot_to_bootloader();
     } else {
+        /* THREE buzzes = "no framebuffer", matching the pattern vocabulary
+         * below. Without this the failure path is silent and looks identical
+         * to a watch that simply rebooted on its own. */
+        vib_buzz(3, 150);
         timer_delay_ms(2000);
         con_puts("STAGE_REPORT: no framebuffer -> rebooting to RECOVERY\n");
         reboot_to_recovery();
@@ -454,8 +511,12 @@ void main(void)
     /* Record what the SPMI layer actually managed: a PMIC register read-back
      * proves arbiter addressing works even when the motor stays silent (a dead
      * motor and a misprogrammed arbiter look identical from outside). */
-#if defined(PLAT_BOARD_FOSSIL_GEN6)   /* PM660 haptics regs; the Gen 4's PM8916
-                                         vibrator block has a different map */
+#if defined(PLAT_VIB_PM660_HAPTICS)   /* PM660 haptics regs; the Gen 4's PM8916
+                                      * vibrator block has a different map.
+                                      * Asked as "which PMIC block", not "which
+                                      * watch": the Gen 5 is an msm8909 with a
+                                      * PM660, so a board test would read the
+                                      * wrong registers back on it. */
     {
         uint8_t v = 0xEE;
         int rc = spmi_read8(PLAT_PMIC_SID, PLAT_HAP_BASE + 0x44u, &v); /* EN_CTL */
@@ -473,6 +534,7 @@ void main(void)
     bdiag_puts("\nramlog: "); bdiag_puthex((uint32_t)(uintptr_t)__ramlog_start);
     bdiag_puts(ramlog_had_previous() ? " (previous boot log preserved)\n" : " (fresh)\n");
     bdiag_puts("timer:  ");  bdiag_putdec(timer_freq_hz()); bdiag_puts(" Hz\n");
+
 
 #if defined(SAFETY_TEST) && defined(PLAT_SOC_MSM)
     /* SAFETY_TEST build: prove the RECOVERY PATH in isolation before trusting
@@ -603,21 +665,19 @@ void main(void)
 #endif
 
 #if defined(PLAT_SOC_MSM)
-    /* SAFETY NET (see reboot_msm.c): this watch has no button force-reset and no
-     * button route to fastboot, so a hung custom image would otherwise be
-     * recoverable only by draining the battery. Arm a dead-man BEFORE the
-     * scheduler runs: if nothing kicks it within the timeout, it reboots to the
-     * bootloader. During bring-up NOTHING kicks it, so EVERY boot — working or
-     * hung — returns to fastboot after 30 s. Raise/kick/disarm once trusted.
-     * (xTimerStart before vTaskStartScheduler queues the command; it runs as
-     * soon as the timer service task starts.) */
-#if !defined(NO_AUTO_REBOOT)
-    deadman_arm(30000u);
-#else
-    con_puts("NO_AUTO_REBOOT: dead-man DISARMED; the watch will never "
-             "reboot itself. Force-reboot by hand if it hangs.\n");
-#endif
+    /* The bring-up dead-man is GONE (2026-09-18). It was armed here for 30 s and
+     * kicked from the modem gate loop and loop() -- but never from setup(), so on
+     * this watch, where the modem gate ends at +85 s, setup() got a fresh 30 s and
+     * the watch rebooted to the bootloader partway through it, every single boot.
+     * It cost this audio bring-up seven images (gen5-modem-19..25): the reboot
+     * landed on the same line each time and read exactly like a firmware crash,
+     * while what it actually did was truncate every log at the point where the
+     * speaker work begins. The firmware is past bring-up and trusted now.
+     * Recovery if an image does hang: hold power to switch off, then re-enter
+     * fastboot. The mechanism itself is still in reboot_msm.c and the SAFETY_TEST
+     * image still arms it on purpose; nothing arms it on a normal boot. */
     bootmark(BOOTMARK_SCHED);
+    mmu_protect_code_ro();   /* 2026-09-18: catch the runtime writer of .rodata (gen5-modem-36) */
 #endif /* PLAT_SOC_MSM */
 
 #if defined(WDOG_TRACE)

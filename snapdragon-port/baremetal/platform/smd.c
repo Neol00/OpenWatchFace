@@ -28,6 +28,8 @@
 #if defined(PLAT_SMEM_BASE) && defined(PLAT_APCS_IPC)
 
 #include <string.h>
+#include "FreeRTOS.h"
+#include "semphr.h"
 
 /* smd_channel_info_word field indices */
 enum { I_STATE, I_DSR, I_CTS, I_CD, I_RI, I_HEAD, I_TAIL, I_STATE_F, I_BLOCKREADINTR, I_TAILP, I_HEADP, I_WORDS };
@@ -325,6 +327,12 @@ static struct smd_chan s_rpm;
 static int s_rpm_open;
 static uint32_t s_rpm_msg_id = 1;
 
+/* Is the RPM request channel actually open? rpm_smd_request() returns -1
+ * without a word when it is not (the kv_bytes guard shares that return), which
+ * on the C2+ looked exactly like "the RPM refused our vote" -- see finding 114.
+ * Callers that report vote failures should say which of the two it was. */
+int rpm_smd_is_open(void) { return s_rpm_open; }
+
 int rpm_smd_init(void)
 {
     if (s_rpm_open) return 0;
@@ -336,7 +344,7 @@ int rpm_smd_init(void)
 /* Send one request and wait for its ack. `kv` is the key/value payload
  * (words). Returns 0 = accepted, -2 = RPM said "resource does not exist",
  * -3 = other RPM error (text printed), -1 = transport failure/timeout. */
-int rpm_smd_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t kv_bytes)
+static int rpm_smd_request_unlocked(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t kv_bytes)
 {
     uint32_t pkt[64], rsp[64], n, i, got, status = 0;
     uint32_t my_id = s_rpm_msg_id++;
@@ -399,3 +407,18 @@ void rpm_diag(void)
 }
 
 #endif /* PLAT_SMEM_BASE && PLAT_APCS_IPC */
+
+/* v277: rail votes now come from the WiFi task AND the BG bring-up task.
+ * One request/ack exchange at a time; lock only once the scheduler runs. */
+static SemaphoreHandle_t s_rpm_lock;
+int rpm_smd_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t kv_bytes)
+{
+    int rc, locked = 0;
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        if (!s_rpm_lock) s_rpm_lock = xSemaphoreCreateMutex();
+        if (s_rpm_lock && xSemaphoreTake(s_rpm_lock, portMAX_DELAY) == pdTRUE) locked = 1;
+    }
+    rc = rpm_smd_request_unlocked(set, type, id, kv, kv_bytes);
+    if (locked) xSemaphoreGive(s_rpm_lock);
+    return rc;
+}

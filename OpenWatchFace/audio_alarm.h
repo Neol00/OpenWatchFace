@@ -31,7 +31,202 @@
 /* AUDIO_PIN_* come from the board header; the BOARD_HAS_AUDIO_* backend flags
  * are defaulted centrally in board.h (at most one =1, enforced there). */
 
-#if !BOARD_HAS_AUDIO_ES8311 && !BOARD_HAS_AUDIO_PWM && !BOARD_HAS_AUDIO_TUYA
+#if BOARD_HAS_AUDIO_Q6
+/* ---------------------------------------------------------------------------
+ *  Q6 (Snapdragon Wear 3100): the speaker hangs off the BG co-processor and its
+ *  PCM comes from the audio DSP inside the modem. snapdragon-port brings that
+ *  path up at boot (mss_apr.c: AFE primary TDM port, ASM stream, ADM routing;
+ *  bgcom.c: the BG amp, left running) and keeps one buffer in flight.
+ *
+ *  This board renders the SAME chime melody and ding as the ES8311 boards --
+ *  chiptune square-wave voices from chime_melody.h -- and pushes 48 kHz stereo
+ *  PCM into the DSP's ring with q6_audio_push(). No task and no codec I2C: the
+ *  render runs in small slices from audio_alarm_tick() (the loop task), which
+ *  only ever fills what the ring has room for.
+ * ------------------------------------------------------------------------- */
+extern "C" uint32_t q6_audio_push(const int16_t *frames, uint32_t n);
+extern "C" uint32_t q6_audio_space(void);
+extern "C" uint32_t q6_audio_queued(void);
+extern "C" void     q6_audio_flush(void);
+extern "C" int      q6_audio_ready(void);
+extern "C" void     q6_audio_sleep(void);
+extern "C" void     q6_audio_wake(void);
+extern "C" void     q6_audio_active(int on);   // a sound is live: the DSP path stays up even if the loop stalls
+
+#define AUDIO_SAMPLE_RATE  48000            // the DSP stream's rate
+#if defined(AUDIO_Q6_FULL)
+#define AUDIO_MASTER_GAIN  36000.0f         // chime62: one note peaks ~29500, the boot tone's level (32000)
+#elif defined(AUDIO_Q6_SINE)
+#define AUDIO_MASTER_GAIN  15000.0f         // chime59: no clipping (the renderer clamps at 32000)
+#elif defined(AUDIO_QUIET)
+#define AUDIO_MASTER_GAIN  3000.0f          // chime44: -20 dB, testing for TFA9897 protection muting
+#else
+#define AUDIO_MASTER_GAIN  30000.0f         // louder than the ES8311 boards (6500) while we are still
+                                            // finding out whether this speaker makes sound at all
+#endif
+#define CHIME_RAMP_S       10.0f            // gentle start: 60% -> 100% (the boot tone at 32000 is the reference)
+#define CHIME_VOICES       10
+#include "chime_melody.h"
+#ifndef CHIME_INTRO_MS
+#define CHIME_INTRO_MS 0
+#endif
+#define CHIME_ATTACK_SAMP  (AUDIO_SAMPLE_RATE / 333)   // ~3 ms fade-in
+#define CHIME_RELEASE_SAMP (AUDIO_SAMPLE_RATE / 50)    // ~20 ms fade-out
+
+typedef struct {
+  float ph, w, amp;
+  uint32_t sustain;
+  uint16_t attack, release;
+  uint8_t  nharm;
+  bool live;
+} q6_voice_t;
+
+static bool      s_q6_alarm_live = false;
+static bool      s_q6_ding_live  = false;
+static q6_voice_t s_q6_v[CHIME_VOICES];
+static uint32_t  s_q6_frames_total = 0;     // ring time (for the gentle-start ramp)
+static uint32_t  s_q6_period_pos   = 0;     // position inside the melody loop
+static size_t    s_q6_next_note    = 0;
+static uint32_t  s_q6_ding_left    = 0;     // frames left of the one-shot ding
+
+static void q6_voice_start(float freq, float amp, uint32_t dur_ms) {
+  uint8_t nh = 0;                           // odd harmonics under the alias guard
+  for (int n = 1; n <= 7; n += 2)
+    if (freq * n < AUDIO_SAMPLE_RATE * 0.44f) nh++;
+#if defined(AUDIO_Q6_SINE)
+  nh = 1;                                   // chime59: fundamental only -- a pure sine, like the boot tone
+#endif
+  for (int k = 0; k < CHIME_VOICES; k++) {
+    if (s_q6_v[k].live) continue;
+    s_q6_v[k] = { 0.0f, 2.0f * (float)M_PI * freq / AUDIO_SAMPLE_RATE, amp,
+                  dur_ms * (AUDIO_SAMPLE_RATE / 1000),
+                  CHIME_ATTACK_SAMP, CHIME_RELEASE_SAMP, nh, true };
+    return;
+  }
+}
+
+/* Render n frames of whatever is sounding into buf; returns false when silent. */
+static bool q6_render(int16_t *buf, uint32_t n) {
+  bool any = false;
+  for (uint32_t i = 0; i < n; i++) {
+    if (s_q6_alarm_live) {                  // the melody's note scheduler
+      uint32_t pos_ms = s_q6_period_pos / (AUDIO_SAMPLE_RATE / 1000);
+      while (s_q6_next_note < sizeof(chime_notes) / sizeof(chime_notes[0]) &&
+             pos_ms >= chime_notes[s_q6_next_note].at_ms) {
+        q6_voice_start(chime_notes[s_q6_next_note].freq, chime_notes[s_q6_next_note].amp,
+                       chime_notes[s_q6_next_note].dur_ms);
+        s_q6_next_note++;
+      }
+      if (++s_q6_period_pos >= (uint32_t)CHIME_PERIOD_MS * (AUDIO_SAMPLE_RATE / 1000)) {
+        s_q6_period_pos = (uint32_t)CHIME_INTRO_MS * (AUDIO_SAMPLE_RATE / 1000);
+        s_q6_next_note  = 0;
+        while (s_q6_next_note < sizeof(chime_notes) / sizeof(chime_notes[0]) &&
+               chime_notes[s_q6_next_note].at_ms < CHIME_INTRO_MS) s_q6_next_note++;
+      }
+    }
+    float s = 0.0f;
+    for (int k = 0; k < CHIME_VOICES; k++) {
+      if (!s_q6_v[k].live) continue;
+      float sq = 0.0f, h = 1.0f;            // band-limited square
+      for (uint8_t j = 0; j < s_q6_v[k].nharm; j++, h += 2.0f)
+        sq += sinf(h * s_q6_v[k].ph) / h;
+      float env;
+      if      (s_q6_v[k].attack)  { env = 1.0f - (float)s_q6_v[k].attack / CHIME_ATTACK_SAMP; s_q6_v[k].attack--; }
+      else if (s_q6_v[k].sustain) { env = 1.0f; s_q6_v[k].sustain--; }
+      else if (s_q6_v[k].release) { env = (float)s_q6_v[k].release / CHIME_RELEASE_SAMP; s_q6_v[k].release--; }
+      else                        { s_q6_v[k].live = false; continue; }
+      s += s_q6_v[k].amp * env * sq;
+      s_q6_v[k].ph += s_q6_v[k].w;
+      if (s_q6_v[k].ph > 2.0f * (float)M_PI) s_q6_v[k].ph -= 2.0f * (float)M_PI;
+      any = true;
+    }
+    float vol = 1.0f;
+#if defined(AUDIO_Q6_FULL)
+    if (0) {                                // chime62: no gentle start -- full level from the first sample
+#else
+    if (s_q6_alarm_live) {
+#endif                  // gentle start, as on the codec boards
+      float t = (float)s_q6_frames_total / AUDIO_SAMPLE_RATE;
+      vol = 0.60f + 0.40f * (t >= CHIME_RAMP_S ? 1.0f : t / CHIME_RAMP_S);
+    }
+    int32_t q = (int32_t)(s * vol * AUDIO_MASTER_GAIN);
+    if (q >  32000) q =  32000;
+    if (q < -32000) q = -32000;
+    buf[2 * i] = buf[2 * i + 1] = (int16_t)q;
+    s_q6_frames_total++;
+    if (s_q6_ding_left && --s_q6_ding_left == 0) s_q6_ding_live = false;
+  }
+  return any;
+}
+
+static void audio_alarm_init(void) {}
+static void audio_alarm_warmup(void) {}
+static void audio_alarm_quiesce_codec(void) {}
+static void audio_alarm_prepare_sleep(void) {
+  if (s_q6_alarm_live || s_q6_ding_live) Serial.println("[audio] Q6 prepare_sleep -> sound stopped");
+  s_q6_alarm_live = s_q6_ding_live = false;
+  q6_audio_active(0);
+  q6_audio_sleep();                         // no DSP buffers in flight across the collapse (chime27 wake loop)
+}
+
+static void audio_alarm_start(void) {
+  if (s_q6_alarm_live) return;
+  q6_audio_wake();
+  if (!q6_audio_ready()) { Serial.println("[audio] Q6 stream not up - no alarm sound"); return; }
+  for (int k = 0; k < CHIME_VOICES; k++) s_q6_v[k].live = false;
+  s_q6_frames_total = 0;
+  s_q6_period_pos   = 0;
+  s_q6_next_note    = 0;
+  s_q6_ding_live    = false;
+  s_q6_alarm_live   = true;
+  q6_audio_active(1);
+  Serial.printf("[audio] Q6 alarm start: ring space %u frames, queued %u\n", (unsigned)q6_audio_space(), (unsigned)q6_audio_queued());
+}
+static void audio_alarm_stop(void) {
+  if (!s_q6_alarm_live) return;
+  Serial.printf("[audio] Q6 alarm stop (mute=%d)\n", (int)settings_get_mute());
+  s_q6_alarm_live = false;
+  for (int k = 0; k < CHIME_VOICES; k++) s_q6_v[k].live = false;
+  q6_audio_flush();
+  q6_audio_active(0);
+}
+static void audio_notify_ding(void) {
+  if (settings_get_mute()) { Serial.println("[audio] Q6 ding: muted"); return; }
+  if (s_q6_alarm_live || s_q6_ding_live) return;
+  q6_audio_wake();
+  if (!q6_audio_ready()) { Serial.println("[audio] Q6 ding: stream not up"); return; }
+  for (int k = 0; k < CHIME_VOICES; k++) s_q6_v[k].live = false;
+  q6_voice_start(1318.51f, 0.55f, 90);      // one short E6, as on the other boards
+  s_q6_ding_left = 150 * (AUDIO_SAMPLE_RATE / 1000);
+  s_q6_ding_live = true;
+  q6_audio_active(1);
+  Serial.printf("[audio] Q6 ding: ring space %u frames, queued %u\n", (unsigned)q6_audio_space(), (unsigned)q6_audio_queued());
+}
+
+/* Called every loop: keep the DSP ring fed while something is sounding. */
+static void audio_alarm_tick(void) {
+  static bool s_active_sent;                         // tell the DSP side once when a ding runs out
+#if defined(AUDIO_BOOT_MELODY)
+  { // chime58: the alarm melody as the boot sound, in the boot tone's slot (the first moment the DSP
+    // can play). Audible -> the melody is fine and later sounds are what die; silent -> the melody is.
+    static uint32_t s_bm_t0; static int s_bm_state;
+    if (s_bm_state == 0 && q6_audio_ready()) { s_bm_state = 1; s_bm_t0 = millis(); Serial.println("[audio] BOOT MELODY: alarm melody in the boot tone's slot"); audio_alarm_start(); }
+    else if (s_bm_state == 1 && millis() - s_bm_t0 >= 8000u) { s_bm_state = 2; Serial.println("[audio] BOOT MELODY: 8 s done"); audio_alarm_stop(); }
+  }
+#endif
+  if (!s_q6_alarm_live && !s_q6_ding_live) { if (s_active_sent) { s_active_sent = false; q6_audio_active(0); } return; }
+  s_active_sent = true;
+  if (s_q6_alarm_live && settings_get_mute()) { audio_alarm_stop(); return; }
+  static int16_t buf[240 * 2];                       // 5 ms per slice
+  uint32_t guard = 0;
+  while (q6_audio_space() >= 240u && guard++ < 24u) {  // at most 120 ms of render per loop
+    bool any = q6_render(buf, 240u);
+    q6_audio_push(buf, 240u);
+    if (!any && !s_q6_alarm_live) { s_q6_ding_live = false; break; }
+  }
+}
+
+#elif !BOARD_HAS_AUDIO_ES8311 && !BOARD_HAS_AUDIO_PWM && !BOARD_HAS_AUDIO_TUYA
 /* No codec/speaker on this board — same API, all no-ops (the timer/alarm paths
  * still vibrate via haptics where available). */
 static void audio_alarm_init(void) {}

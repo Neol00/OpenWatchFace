@@ -73,10 +73,61 @@ int cpu_volt_mv(void);   /* cpu_volt_a7.c */
 #define STEP_USB      (1u << 5)   /* PHY low-power + l13 off, only with no cable */
 #define STEP_SMPS     (1u << 6)   /* bucks s1..s4 read MODE_CTL 0x80 = forced PWM: vote AUTO, direct write if we own them */
 #define STEP_RAILS    (1u << 7)   /* l9 (3.3 V PA) and s3 (RF) were still ON after wlan_power_off's swen-0 vote: re-vote, direct off if writable */
+#define STEP_ONE      (1u << 8)   /* -DSLEEP_RAILS_OFF=<mask>: probe rails, off at sleep entry, back on at wake */
 #define K_SSMD 0x646d7373u  /* "ssmd" smps mode: 0 auto, 1 ipeak, 2 pwm */
-#ifndef SLEEP_FLOOR_SKIP
-#define SLEEP_FLOOR_SKIP 0u
+
+/* ---- CUMULATIVE RAIL PROBE (2026-09-13, owner's request) -----------------
+ * The goal is to match the stock C2+'s set of OFF rails exactly. Rails are
+ * qualified ONE AT A TIME, but once a rail passes it stays in the set for every
+ * later test -- so each image is "everything proven so far, plus one". That is
+ * what -DSLEEP_RAILS_OFF=<mask> is: bit N = pm8916 LDO N, voted off after the
+ * census and voted back on FIRST in sleep_floor_exit, before anything else
+ * re-enables (a display rail has to be up before plat_display_on runs).
+ *
+ * Qualified so far, on the C2:
+ *   l6  (v310) - DSI/panel vddio. Works, but the DDIC loses its state and comes
+ *                back at POR: suspend_msm.c re-sends MADCTL. See finding 109.
+ *   l12 (v311) - sdhci vdd-io + tpiu. Uneventful, as expected.
+ * Target list still open: l11, l17, l18. s3 is NOT reachable by vote (Pronto
+ * holds it as iris-vddrfa for the resident WCNSS) and needs the radio actually
+ * powered off, which is a different change.
+ *
+ * RESTORE VOLTAGES ARE DECODED FROM THE HARDWARE, not guessed. pm8916's ULT
+ * PLDO has a single range: base 1750000 uV, step 12500 uV (see
+ * kernels/skipjack-3.18/skipjack-kernel/drivers/regulator/qpnp-regulator.c,
+ * ult_pldo_ranges[]), so uV = 1750000 + 12500 * VSET where VSET is the second
+ * byte of the r/v=RANGE/VSET pair this file's own census prints. An earlier
+ * table had l18 at 2800000 from a bad dtb parse and would have restored it
+ * 100 mV high. Decode the census byte; do not trust regulator-min-microvolt.
+ * NOTE l1 is ULT NLDO (base 375000, same step) -- different formula, not here.
+ *
+ * FAILURE MODE, so it is not a surprise: a rail that turns out to be load
+ * bearing for the panel wakes the watch to a dark screen and needs a power
+ * cycle. Not a brick, and the USB log still comes out. */
+#ifndef SLEEP_RAILS_OFF
+#define SLEEP_RAILS_OFF 0u
 #endif
+#define RAIL_BIT(n) (1u << (n))
+/* id -> restore uV, from the VSET decode above. `smps` selects the RPM resource
+ * (smpa vs ldoa) and the SPMI register block, so bucks can be probed too.
+ *
+ * s3 IS A BUCK, which is why the mask could not reach it before: every entry
+ * voted T_LDOA. It is bit 3 of the SMPS half of the mask (SMPS_BIT(3)), not
+ * bit 3 of the LDO half -- l3 and s3 are different rails. s3 reads ON from the
+ * bootloader on this watch, not from our radio vote: with both radios disabled
+ * wlan_up() never runs (nothing turns it on) and wlan_idle() returns at its
+ * first line (nothing turns it off), and the census still shows s3:ON. */
+static const struct { uint8_t id; uint8_t smps; uint32_t uv; } k_probe_uv[] = {
+    {  6u, 0u, 1800000u },   /* l6  VSET 0x04 */
+    { 11u, 0u, 2950000u },   /* l11 VSET 0x60 */
+    { 12u, 0u, 1800000u },   /* l12 VSET 0x04 */
+    { 17u, 0u, 2850000u },   /* l17 VSET 0x58 */
+    { 18u, 0u, 2700000u },   /* l18 VSET 0x4c */
+    {  3u, 1u, 1300000u },   /* s3  iris vddrfa; wcnss.c:846 votes this uV */
+};
+/* The mask is split: bits 0-23 are LDOs, bits 24-31 are SMPS. */
+#define SMPS_BIT(n) (1u << (24u + (n)))
+static uint32_t s_probe_off;    /* rails this sleep actually switched off */
 
 static uint32_t s_gpll_vote0, s_branch_vote0, s_applied;
 static uint8_t  s_smps_mode0[5], s_smps_direct;      /* direct MODE_CTL writes to undo */
@@ -135,7 +186,15 @@ void sleep_floor_census(const char *tag)
 static int vote(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t bytes)
 {
     int rc = rpm_smd_request(0u, type, id, kv, bytes);
-    con_puts("floor:   "); con_puts(what); con_puts(" rc "); con_putdec((uint32_t)(rc < 0 ? -rc : rc)); con_puts(rc ? " (neg)\n" : "\n");
+    con_puts("floor:   "); con_puts(what); con_puts(" rc "); con_putdec((uint32_t)(rc < 0 ? -rc : rc));
+    /* -1 is ambiguous and one of its two causes is SILENT: rpm_smd_request()
+     * returns it both for a transport failure (which prints an "rpm:" line of
+     * its own) and for "the channel was never open" (which prints nothing).
+     * On the C2+ every vote came back -1 with no rpm: line and it read as the
+     * RPM refusing us; it was the channel. Say which. */
+    if (rc == -1) con_puts(rpm_smd_is_open() ? " (neg: transport)" : " (neg: RPM CHANNEL NOT OPEN - no vote was sent)");
+    else if (rc) con_puts(" (neg)");
+    con_puts("\n");
     con_flush(); usb_poll();
     return rc;
 }
@@ -201,8 +260,11 @@ static void measure(const char *what)
  * collapse. cable = a USB host is attached and listening. */
 void sleep_floor_enter(int cable)
 {
-    static int inited;
-    if (!inited) { inited = 1; if (rpm_smd_init() < 0) { con_puts("floor: no RPM channel\n"); return; } }
+    /* Re-check EVERY sleep, not once ever: rpm_smd_init() is idempotent
+     * (smd.c returns 0 when already open), and a one-shot `static int inited`
+     * meant a channel that was not up at the first sleep was never retried --
+     * every later vote then failed with a silent -1. */
+    if (rpm_smd_init() < 0) { con_puts("floor: no RPM channel\n"); return; }
     s_applied = 0;
 #ifndef SLEEP_FLOOR_STEP_MS
 #define SLEEP_FLOOR_STEP_MS 6000u
@@ -293,6 +355,55 @@ void sleep_floor_enter(int cable)
         s_applied |= STEP_RAILS;
         measure("+l9/s3 off");
     }
+    s_probe_off = 0u;
+    if (SLEEP_RAILS_OFF) {
+        /* After the census, so s_ldo_was_on is populated. */
+        for (unsigned i = 0; i < sizeof k_probe_uv / sizeof k_probe_uv[0]; i++) {
+            uint32_t id = k_probe_uv[i].id;
+            int      sm = k_probe_uv[i].smps;
+            const char *pfx = sm ? "s" : "l";
+            if (!(SLEEP_RAILS_OFF & (sm ? SMPS_BIT(id) : RAIL_BIT(id)))) continue;
+            { uint8_t en0 = 0xFF;
+              (void)spmi_read8(REG_SID, reg_base(sm, id) + 0x46u, &en0);
+              if (!(en0 & 0x80u)) {
+                  con_puts("floor:   "); con_puts(pfx); con_putdec(id);
+                  con_puts(" already off at entry\n"); continue;
+              } }
+            uint32_t kv[9] = { K_SWEN, 4u, 0u, K_UV, 4u, k_probe_uv[i].uv, K_MA, 4u, 0u };
+            vote("rail off", sm ? T_SMPA : T_LDOA, id, kv, sizeof kv);
+            if (sm) {   /* 2026-09-13: the active set loses while awake; the sleep set is what the RPM applies in the collapse */
+                int rs = rpm_smd_request(1u /* sleep set */, T_SMPA, id, kv, sizeof kv);
+                con_puts("floor:   s"); con_putdec(id); con_puts(" sleep-set off rc "); con_putdec((uint32_t)(rs < 0 ? -rs : rs)); con_puts("\n");
+                /* 2026-09-13 holder probe: is the buck on by PIN CONTROL (EN
+                 * follows a PMIC pin, +0x47) rather than by votes? Dump the
+                 * control block, then vote "pcen" 0 (rpm-smd-regulator.c
+                 * PIN_CTRL_ENABLE) in both sets and read EN/PIN_CTL again. */
+                uint16_t b = reg_base(1, id);
+                con_puts("floor:   s"); con_putdec(id); con_puts(" ctl 0x40..0x4f:");
+                for (unsigned o = 0x40u; o <= 0x4fu; o++) { uint8_t v = 0xFF; (void)spmi_read8(REG_SID, (uint16_t)(b + o), &v); con_puts(" "); con_puthex(v); }
+                con_puts("\nfloor:   l2 pinctl="); { uint8_t v = 0xFF; (void)spmi_read8(REG_SID, 0x4147u, &v); con_puthex(v); }
+                con_puts(" l3 pinctl="); { uint8_t v = 0xFF; (void)spmi_read8(REG_SID, 0x4247u, &v); con_puthex(v); }
+                con_puts("\n");
+                { uint32_t pk[6] = { 0x6e656370u /* "pcen" */, 4u, 0u, K_SWEN, 4u, 0u };
+                  int p0 = rpm_smd_request(0u, T_SMPA, id, pk, sizeof pk);
+                  int p1 = rpm_smd_request(1u, T_SMPA, id, pk, sizeof pk);
+                  timer_delay_ms(5u);
+                  uint8_t e = 0xFF, pc = 0xFF;
+                  (void)spmi_read8(REG_SID, (uint16_t)(b + 0x46u), &e); (void)spmi_read8(REG_SID, (uint16_t)(b + 0x47u), &pc);
+                  con_puts("floor:   s"); con_putdec(id); con_puts(" pcen 0 rc active "); con_putdec((uint32_t)(p0 < 0 ? -p0 : p0));
+                  con_puts(" sleep "); con_putdec((uint32_t)(p1 < 0 ? -p1 : p1));
+                  con_puts(" -> en="); con_puthex(e); con_puts(" pinctl="); con_puthex(pc);
+                  con_puts((e & 0x80u) ? " (still on)\n" : " (OFF)\n"); }
+            }
+            timer_delay_ms(5u);
+            uint8_t en = 0xFF;
+            (void)spmi_read8(REG_SID, reg_base(sm, id) + 0x46u, &en);
+            con_puts("floor:   "); con_puts(pfx); con_putdec(id); con_puts(" after vote en="); con_puthex(en);
+            if (en & 0x80u) con_puts(" (STILL ON: the vote lost, another master holds it)\n");
+            else { con_puts(" (off)\n"); s_probe_off |= (sm ? SMPS_BIT(id) : RAIL_BIT(id)); }
+        }
+        if (s_probe_off) { s_applied |= STEP_ONE; measure("+probe rails off"); }
+    }
     if (!(SLEEP_FLOOR_SKIP & STEP_USB) && !cable && chg_usb_present() != 1) {
         usb_phy_lowpower(1);
         vote_kv("l13 off (USB 3.3 V, no cable)", T_LDOA, 13u, K_SWEN, 0u);
@@ -305,6 +416,19 @@ void sleep_floor_enter(int cable)
 void sleep_floor_exit(void)
 {
     if (!s_applied) return;
+    /* FIRST, before anything else re-enables: a display rail has to be back
+     * before plat_display_on() runs. */
+    if (s_applied & STEP_ONE) {
+        for (unsigned i = 0; i < sizeof k_probe_uv / sizeof k_probe_uv[0]; i++) {
+            uint32_t id = k_probe_uv[i].id;
+            int      sm = k_probe_uv[i].smps;
+            if (!(s_probe_off & (sm ? SMPS_BIT(id) : RAIL_BIT(id)))) continue;
+            if (sm) { uint32_t kv[9] = { K_SWEN, 4u, 1u, K_UV, 4u, k_probe_uv[i].uv, K_MA, 4u, 100u };
+                      vote("rail on", T_SMPA, id, kv, sizeof kv); }
+            else      vote_ldo_on("rail on", id, k_probe_uv[i].uv);
+        }
+        timer_delay_ms(2u);
+    }
     if (s_applied & STEP_USB) {
         vote_ldo_on("l13 on 3.075 V", 13u, 3075000u);
         usb_phy_lowpower(0);
@@ -351,3 +475,73 @@ void sleep_floor_exit(void)
 }
 
 #endif /* PLAT_SOC_MSM8909 && SLEEP_FLOOR */
+
+/* ---- release builds: the rail switching alone, without the ladder ----------
+ * -DSLEEP_FLOOR carries the rail probe above but also its measurement ladder
+ * (~50 s awake before every collapse). The rails that have passed the probe
+ * belong in every sleep, so without SLEEP_FLOOR this is just that part: the
+ * same SLEEP_RAILS_OFF mask and restore voltages, the same votes, silent
+ * unless a vote fails. Called from the same two places as sleep_floor_*. */
+#if defined(PLAT_SOC_MSM8909) && !defined(SLEEP_FLOOR)
+#ifndef SLEEP_RAILS_OFF
+#define SLEEP_RAILS_OFF 0u
+#endif
+#if SLEEP_RAILS_OFF
+#define SR_SWEN 0x6e657773u  /* "swen" */
+#define SR_UV   0x00007675u  /* "uv"   */
+#define SR_MA   0x0000616du  /* "ma"   */
+#define SR_LDOA 0x616f646cu  /* "ldoa" */
+#define SR_SMPA 0x61706d73u  /* "smpa" */
+#define SR_SID  1u
+#define SR_BIT(id, sm) ((sm) ? (1u << (24u + (id))) : (1u << (id)))
+/* Keep in step with k_probe_uv[] above (restore uV decoded from VSET). */
+static const struct { uint8_t id; uint8_t smps; uint32_t uv; } k_rail[] = {
+    {  6u, 0u, 1800000u }, { 11u, 0u, 2950000u }, { 12u, 0u, 1800000u },
+    { 17u, 0u, 2850000u }, { 18u, 0u, 2700000u }, {  3u, 1u, 1300000u },
+};
+static uint32_t s_rails_off;
+static uint16_t sr_base(int sm, unsigned n)
+{
+    return sm ? (uint16_t)(0x1400u + (n - 1u) * 0x300u) : (uint16_t)(0x4000u + (n - 1u) * 0x100u);
+}
+static void sr_fail(const char *what, int sm, uint32_t id)
+{
+    con_puts("rails: "); con_puts(sm ? "s" : "l"); con_putdec(id); con_puts(what);
+}
+void sleep_rails_enter(void)
+{
+    s_rails_off = 0u;
+    if (rpm_smd_init() < 0) { con_puts("rails: no RPM channel, rails left on\n"); return; }
+    for (unsigned i = 0; i < sizeof k_rail / sizeof k_rail[0]; i++) {
+        uint32_t id = k_rail[i].id; int sm = k_rail[i].smps;
+        if (!(SLEEP_RAILS_OFF & SR_BIT(id, sm))) continue;
+        uint8_t en = 0xFF;
+        (void)spmi_read8(SR_SID, sr_base(sm, id) + 0x46u, &en);
+        if (!(en & 0x80u)) continue;                       /* already off: nothing to restore */
+        uint32_t kv[9] = { SR_SWEN, 4u, 0u, SR_UV, 4u, k_rail[i].uv, SR_MA, 4u, 0u };
+        int rc = rpm_smd_request(0u, sm ? SR_SMPA : SR_LDOA, id, kv, sizeof kv);
+        if (sm) (void)rpm_smd_request(1u, SR_SMPA, id, kv, sizeof kv);   /* sleep set too */
+        timer_delay_ms(5u);
+        en = 0xFF;
+        (void)spmi_read8(SR_SID, sr_base(sm, id) + 0x46u, &en);
+        if (!(en & 0x80u)) s_rails_off |= SR_BIT(id, sm);
+        else if (rc) sr_fail(" off vote failed\n", sm, id);
+        else         sr_fail(" still on (another master holds it)\n", sm, id);
+    }
+}
+void sleep_rails_exit(void)
+{
+    if (!s_rails_off) return;
+    for (unsigned i = 0; i < sizeof k_rail / sizeof k_rail[0]; i++) {
+        uint32_t id = k_rail[i].id; int sm = k_rail[i].smps;
+        if (!(s_rails_off & SR_BIT(id, sm))) continue;
+        uint32_t kv[9] = { SR_SWEN, 4u, 1u, SR_UV, 4u, k_rail[i].uv, SR_MA, 4u, sm ? 100u : 10u };
+        if (rpm_smd_request(0u, sm ? SR_SMPA : SR_LDOA, id, kv, sizeof kv))
+            sr_fail(" ON vote failed\n", sm, id);
+        if (sm) (void)rpm_smd_request(1u, SR_SMPA, id, kv, sizeof kv);
+    }
+    timer_delay_ms(2u);
+    s_rails_off = 0u;
+}
+#endif /* SLEEP_RAILS_OFF */
+#endif /* PLAT_SOC_MSM8909 && !SLEEP_FLOOR */

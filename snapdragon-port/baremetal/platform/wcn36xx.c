@@ -299,13 +299,57 @@ static uint32_t rx_poll_ring(struct dxe_desc *d, uint32_t n, uint32_t *head, uin
     return got;
 }
 
+#if defined(PLAT_WCNSS_RX_DESC_POLL)
+/* HEAD RESYNC (2026-09-10). Read off the Gen 5 after a failed connect: RX-high
+ * ring 15 of 16 descriptors consumed and channel 3 DISABLED by the engine
+ * (ch_en 0x02), i.e. the ring filled and stalled. The engine fills VLD=1
+ * descriptors in ring order and clears VLD; with 15 filled, exactly one was
+ * still valid -- and our head index pointed at it, so "head still valid" read
+ * as "nothing to drain" while every filled frame sat behind it. With no
+ * mgmt/beacon RX the next auth got "no response" and every later scan got 0.
+ * So never trust the head alone: if it is still valid but anything else in
+ * the ring is consumed, move the head to the OLDEST consumed descriptor (the
+ * first consumed one after a valid one, in ring order) and drain from there. */
+static uint32_t s_rx_resync;
+static int rx_head_ready(struct dxe_desc *d, uint32_t n, uint32_t *head)
+{
+    uint32_t i;
+    dc_inval(d, n * sizeof *d);
+    if (!(d[*head].ctrl & C_VLD)) return 1;
+    for (i = 1; i < n; i++) {
+        uint32_t idx = (*head + i) % n, prev = (idx + n - 1u) % n;
+        if (!(d[idx].ctrl & C_VLD) && (d[prev].ctrl & C_VLD)) {
+            *head = idx; s_rx_resync++;
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
 uint32_t wcn36xx_rx_poll(void)
 {
     uint32_t src, got = 0;
+    int l, h;
     if (!s_dxe_up) return 0;
     src = DXE_R(DXE_INT_SRC_RAW_REG);
-    if (src & INT_CH1) got += rx_poll_ring(s_rx_l_desc, N_RX_L, &s_rx_l_head, s_rx_l_buf, CTRL_RX_L, INT_CH1, RX_L_OFF + CH_STATUS);
-    if (src & INT_CH3) got += rx_poll_ring(s_rx_h_desc, N_RX_H, &s_rx_h_head, s_rx_h_buf, CTRL_RX_H, INT_CH3, RX_H_OFF + CH_STATUS);
+    l = (src & INT_CH1) != 0;
+    h = (src & INT_CH3) != 0;
+#if defined(PLAT_WCNSS_RX_DESC_POLL)
+    /* DRAIN ON DESCRIPTOR STATE, NOT ONLY ON THE RAW INTERRUPT (2026-09-10).
+     * Read off the Gen 5 after a scan: int_src_raw 0x00000000, yet the RX-high
+     * ring had 10 of 16 descriptors CONSUMED (VLD cleared by the engine), and
+     * the engine's own dest/next registers held buf0 / desc1 -- i.e. it had
+     * loaded our ring out of DDR and delivered frames into it. This firmware
+     * (CNSS.PR.4.0.4) does not raise the raw CH1/CH3 bit the way the Gen 4's
+     * does, so the INT_SRC_RAW gate alone left every frame uncollected and the
+     * scan counted zero. The head descriptor's VLD bit is what the engine
+     * actually changes; check it too. One cache refresh per ring, and the drain
+     * loop exits at once when the head is still valid. */
+    if (!l) l = rx_head_ready(s_rx_l_desc, N_RX_L, &s_rx_l_head);
+    if (!h) h = rx_head_ready(s_rx_h_desc, N_RX_H, &s_rx_h_head);
+#endif
+    if (l) got += rx_poll_ring(s_rx_l_desc, N_RX_L, &s_rx_l_head, s_rx_l_buf, CTRL_RX_L, INT_CH1, RX_L_OFF + CH_STATUS);
+    if (h) got += rx_poll_ring(s_rx_h_desc, N_RX_H, &s_rx_h_head, s_rx_h_buf, CTRL_RX_H, INT_CH3, RX_H_OFF + CH_STATUS);
     return got;
 }
 
@@ -413,6 +457,7 @@ int wcn36xx_scan_ch(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_n
     s_nres = s_nframes = s_nbeacon = 0;
     if (!s_dxe_up && wcn36xx_dxe_init() < 0) return -1;
 
+
     /* INIT_SCAN: mode SCAN, no BSS to notify (we are not associated) */
     memset(s_buf, 0, 48);
     s_buf[0] = HAL_INIT_SCAN_REQ; s_buf[1] = 48u; s_buf[2] = HAL_SYS_MODE_SCAN;
@@ -443,7 +488,15 @@ int wcn36xx_scan_ch(struct smd_chan *wlan, uint32_t dwell_ms, struct wlan_scan_n
     got = hal_xfer(wlan, 53u, HAL_FINISH_SCAN_RSP);
     say(got >= 12 && s_buf[2] == 0u ? "ok\n" : "FAILED\n");
 
-    vsay_dec("wcn36xx: RX frames ", s_nframes); vsay_dec(", beacons ", s_nbeacon); vsay_dec(", networks ", s_nres); vsay("\n");
+    /* ALWAYS printed, not verbose-only (2026-09-10): the only line that says
+     * WHERE an empty scan comes from -- 0 frames = the DXE receive path is dead,
+     * frames but 0 beacons = RF/tuning or parsing, networks = fine. */
+    say_dec("wcn36xx: scan ch ", ch_lo); say_dec("..", ch_hi);
+    say_dec(": RX frames ", s_nframes); say_dec(", beacons ", s_nbeacon); say_dec(", networks ", s_nres);
+#if defined(PLAT_WCNSS_RX_DESC_POLL)
+    say_dec(", rx head resyncs ", s_rx_resync);
+#endif
+    say("\n");
     for (i = 0; i < s_nres; i++) {
         uint32_t k;
         con_dbg("  ch "); if (s_res[i].chan < 10u) con_dbg_c(' '); con_dbg_dec(s_res[i].chan);

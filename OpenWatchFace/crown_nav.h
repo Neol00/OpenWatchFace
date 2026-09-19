@@ -34,6 +34,10 @@
 
 #if BOARD_HAS_CROWN
 
+/* Less than this much scroll room does not make an object a crown target. */
+#ifndef CROWN_MIN_SCROLL_PX
+#define CROWN_MIN_SCROLL_PX 8
+#endif
 #ifndef CROWN_SCROLL_PX_PER_CNT
 #define CROWN_SCROLL_PX_PER_CNT 6
 #endif
@@ -75,8 +79,21 @@ static lv_obj_t *cn_find_scrollable(lv_obj_t *o) {
     lv_obj_t *r = cn_find_scrollable(lv_obj_get_child(o, i));
     if (r) return r;
   }
-  if (lv_obj_has_flag(o, LV_OBJ_FLAG_SCROLLABLE) &&
-      (lv_obj_get_scroll_top(o) > 0 || lv_obj_get_scroll_bottom(o) > 0))
+  /* Real target = scrollable, VISIBLE on the glass (not clipped away by a parent
+   * or parked off-screen) and with more than a rounding error of room. A one or
+   * two pixel overflow inside a row (a label a hair taller than its box) used to
+   * qualify here and won over the page that actually needed scrolling, which is
+   * what made the crown look dead in the WiFi & BLE app while every other app
+   * scrolled. */
+  /* Childless objects are never targets. LVGL labels keep the default
+   * SCROLLABLE flag, and a dot-truncated label (ui_label_single_line) whose
+   * text is wider than its box computes its self size as the WRAPPED text, so a
+   * long SSID in a WiFi scan row reported lines of scroll room inside a one-line
+   * label and the crown scrolled that instead of the list. */
+  if (lv_obj_get_child_count(o) > 0 &&
+      lv_obj_has_flag(o, LV_OBJ_FLAG_SCROLLABLE) && lv_obj_is_visible(o) &&
+      (lv_obj_get_scroll_top(o) >= CROWN_MIN_SCROLL_PX ||
+       lv_obj_get_scroll_bottom(o) >= CROWN_MIN_SCROLL_PX))
     return o;
   return nullptr;
 }
@@ -93,6 +110,13 @@ static lv_obj_t *cn_find_scrollable(lv_obj_t *o) {
  * active screen is the fallback for a board or a future view that puts
  * scrollable content there instead. */
 static lv_obj_t *cn_scroll_target(void) {
+  /* The room checks below read child coordinates, and a screen that was built
+   * (or rebuilt, as WiFi & BLE does on scan/bond events) since the last refresh
+   * has none yet: every container reports zero scroll room and the crown does
+   * nothing until the next frame. Seen as "the crown works only on the second
+   * try" in that app. Laying out first is cheap when nothing is dirty. */
+  lv_obj_update_layout(lv_layer_top());
+  lv_obj_update_layout(lv_screen_active());
   lv_obj_t *t = cn_find_scrollable(lv_layer_top());
   if (!t) t = cn_find_scrollable(lv_screen_active());
   return t;
@@ -148,6 +172,19 @@ static bool crown_nav_poll(uint32_t ms) {
   /* In the launcher or an app: scroll whatever can scroll. */
   cn_gesture = 0;
   lv_obj_t *tgt = cn_scroll_target();
+  /* One line per target change so a "crown does nothing here" report can say
+   * WHAT it was scrolling (or that it found nothing), without spamming. */
+  static lv_obj_t *s_last_tgt = (lv_obj_t *)1;
+  if (tgt != s_last_tgt) {
+    s_last_tgt = tgt;
+    if (tgt)
+      USBSerial.printf("crown: target %ux%u top=%d bottom=%d children=%u\n",
+                       (unsigned)lv_obj_get_width(tgt), (unsigned)lv_obj_get_height(tgt),
+                       (int)lv_obj_get_scroll_top(tgt), (int)lv_obj_get_scroll_bottom(tgt),
+                       (unsigned)lv_obj_get_child_count(tgt));
+    else
+      USBSerial.printf("crown: no scroll target on this screen\n");
+  }
   if (!tgt) return false;
 
   /* Scrolling DOWN means the content moves UP, hence the negation.

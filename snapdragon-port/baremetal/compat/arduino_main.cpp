@@ -8,11 +8,11 @@
  *
  * The runtime's main() creates this via owf_app_task when built with -DOWF_APP.
  */
+#include <stdio.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #if defined(GLASS_DIAG)
 #include <cstdio>
-extern "C" void fb_text_dump(const char *s);
 extern "C" int  touch_read(unsigned short *x, unsigned short *y);
 extern "C" void usb_diag(unsigned int *pc, unsigned int *st,
                          unsigned int *vid, int *cfg);
@@ -32,7 +32,33 @@ extern "C" void kf_tz_ring_dump(void);
 extern "C" void kmsg_forensics_report(void);
 extern "C" void deadman_kick(void);
 extern "C" int  recovery_gate(void);
+extern "C" int  ramlog_had_previous(void);
+extern "C" unsigned int ramlog_prev_tail_buf(char *out, unsigned int max);
+extern "C" unsigned int ramlog_tail_buf(char *out, unsigned int max);
+extern "C" void fb_text_dump(const char *s);   /* gfx_text.c (also declared under the diag builds) */
+extern "C" int  touch_read(unsigned short *x, unsigned short *y);
 extern "C" int  smem_init(void);       /* platform/smem.c — WiFi foundation */
+extern "C" void bg_probe_report(void); /* platform/bg_probe.c — QCC1110 co-processor (Gen 5) */
+extern "C" void qsee_report(void);     /* platform/qseecom.c — TrustZone app service (Gen 5) */
+extern "C" void bg_load_report(void);  /* platform/bg_load.c — load bgapp, authenticate bg-wear */
+extern "C" int  rpm_smd_init(void);
+extern "C" void mss_boot_start(void);
+extern "C" uint32_t mss_iter(void);
+extern "C" int mss_task_done(void);
+extern "C" int mss_ready(void);
+extern "C" uint32_t mss_release_ms(void);
+extern "C" int pon_kpdpwr_pressed(void);
+static volatile int s_gate_done;
+extern "C" int usb_reenum_allowed(void) { return s_gate_done; }   /* v447: overrides the weak default in usb_ci.c */
+extern "C" int mss_gate_done(void) { return s_gate_done; }        /* chime45: the loading screen has handed over */
+extern "C" void reboot_to_bootloader(void);
+extern "C" void con_flush(void);
+extern "C" void *fb_init(uint32_t w, uint32_t h);
+extern "C" void fb_spinner_frame(uint32_t ms);
+extern "C" void fb_text_dump(const char *s);
+extern "C" void fb_flush_all(void);
+extern "C" const char *mss_where(void);
+extern "C" void bg_boot_start(void);   /* platform/bg_load.c — the whole BG bring-up in its own task (v277) */
 extern "C" uint32_t ddr_size_detect(void); /* platform/ddr_size.c */
 extern "C" int  smem_ok(void);
 extern "C" void smem_diag_dump(void);
@@ -51,12 +77,14 @@ extern "C" void pwr_diag_poll(unsigned int body_ms);
 extern "C" void sleep_stats_report(void);
 extern "C" void psci_report(void);
 extern "C" int  pmic_irq_init(void);
+extern "C" void stem_keys_arm_irq(void) __attribute__((weak));   /* Wear 2100 gpio_keys pushers */
 extern "C" void sensor_scan(void);
 extern "C" void cpu_pc8909_init(void);
 extern "C" void smp_cpu1_test_poll(void);
 extern "C" void touch_ft_arm_irq(void);
 extern "C" void cpu_pc8909_prev_report(void);
 extern "C" void rtc_probe_report(void);
+extern "C" int  rtc_alarm_writable(void);
 extern "C" void bt_wcn3990_probe(void);   /* Gen 6 BLE bring-up probe */
 extern "C" int  bt_probe_step(void);      /* ...stepped: one slice per loop */
 extern "C" int  pmic_irq_alarm_init(void);
@@ -75,6 +103,25 @@ extern "C" int  usb_dev_init(void);    /* CDC-ACM log console over USB */
 extern "C" void usb_poll(void);
 extern "C" int  usb_is_configured(void);
 extern "C" void con_flush(void);   /* commit an unterminated log line */
+extern "C" void fault_record_report(void);   /* previous-life CPU fault record (irq.c) */
+extern "C" void rodata_verify(const char *where);
+extern "C" void wdog_extend(uint32_t sec);
+extern "C" void q6_audio_service(void) __attribute__((weak));
+extern "C" void q6_audio_probe(uint32_t hz, const char *where);   /* mss_apr.c, stubbed when no Q6 */   /* mss_apr.c; absent on boards without the Q6 speaker path */
+/* Gen 5 / 5E OWF_STAGE(n) lands here (board_fossil_gen5*.h). setup() on this watch runs
+ * ~1 s at the highest task priority after an 85 s modem gate, and nothing in setup() used
+ * to pump the USB console or the DSP write queue: the log of a boot that died in setup()
+ * ended wherever the LAST pump before it had left the cursor, and the modem monitor task,
+ * which normally feeds the speaker, is starved for the whole of setup(). Each marker now
+ * widens the watchdog window, pushes the log down the cable and tops the DSP up. */
+extern "C" void owf_stage_mark(void)
+{
+    wdog_extend(120u);
+    rodata_verify("setup stage");
+    con_flush();
+    usb_poll();
+    if (q6_audio_service) q6_audio_service();
+}
 extern "C" void con_puts(const char *);
 extern "C" void con_putdec(unsigned int);
 extern "C" int  storage_init(void);
@@ -200,12 +247,83 @@ extern "C" void owf_app_task(void *arg)
      * it once and carry on exactly as before. */
     usb_dev_init();
 
-#if defined(SMEM_DIAG)
-    /* SMEM header probe -- the first step of the WiFi stack (platform/smem.c).
-     * v83 (2026-09-06): back to EXACTLY the v77 form. ddr_size_detect() is
-     * not called at boot until the v79+ boot failure is understood; the
-     * About screen falls back to the board header's DDR size. */
+    /* SMEM AT BOOT, UNCONDITIONALLY (2026-09-13).
+     *
+     * This used to be behind -DSMEM_DIAG, which is not in the release flag set,
+     * and the only other non-diagnostic caller of smem_init() is inside
+     * wlan_up() (wcnss.c:1236). SMEM therefore came up only as a SIDE EFFECT of
+     * bringing the radio up -- so with BLE and WiFi both disabled, SMEM was
+     * never initialised, smd_open() failed, rpm_smd_init() returned -1, and
+     * sys_pc8909 printed "sys-pc: no RPM channel": no RPM sleep set, no XO
+     * shutdown, the ~37 mA fallback. Deep sleep must not depend on the radio.
+     *
+     * Non-fatal by construction: smem_init() returns -1 and changes nothing if
+     * the header is not valid, exactly as before. Only the CALL moves.
+     * ddr_size_detect() deliberately stays out of the boot path -- that is the
+     * unexplained v79+ boot failure and is a separate question. */
     if (smem_init() == 0) con_puts("smem: header valid\n");
+    else                  con_puts("smem: init FAILED - no RPM, no deep sleep\n");
+    /* 2026-09-18: say NOW whether the previous boot died of a CPU fault, a stack overflow, a
+     * heap failure or the dead-man. This used to be printed from loop() only, so a build that
+     * never reached loop() (gen5-modem-19..28) could not report its own death. */
+    fault_record_report();
+    rodata_verify("pre-gate");
+#if defined(MSS_BOOT)
+    /* v386: the modem task used to be started from sys_pc8909_init() (SYS_PC_8909 builds only), so
+     * plain builds v382-v385 never ran it. Start it here, after SMEM, with the RPM channel opened. */
+    con_puts(rpm_smd_init() == 0 ? "rpm: channel open (for mss-boot)\n" : "rpm: channel NOT open (mss-boot votes will fail)\n");
+    mss_boot_start();
+    /* v396: MODEM LOADING SCREEN (user, 2026-09-14): the app must not run while the modem is
+     * starting -- no WiFi/BLE bring-up racing the PAS loader (v394: MBA segment reject), no sleep,
+     * no app-side surprises. The display is brought up here (fb_init is guarded so setup()'s
+     * call becomes a no-op), the hardware watchdog is petted, USB/console/blackbox keep flowing.
+     * Hand-over: 8 s after the modem reported err_ready (EFS reads + service announcements
+     * have happened by then), or at once if the loader gave up, or after 180 s at most. */
+    {
+        uint32_t t0 = timer_ms(), last_paint = 0, ready_at = 0;
+        const char *why = "timeout";
+        /* v443 (user): FASTBOOT FALLBACK FROM THE LOADING SCREEN -- press the crown 5 times
+         * quickly (within 3 s) while the spinner runs and the watch reboots to the bootloader. */
+        int key_prev = 0; unsigned key_n = 0; uint32_t key_t0 = 0;
+        fb_init(0u, 0u);                          /* args are a fallback hint only */
+        for (;;) {
+            uint32_t now = timer_ms();
+#if defined(PLAT_BOARD_FOSSIL_GEN5) && defined(HAVE_BG_FW) && !defined(PLAT_NO_BG_COPROC)
+            /* v470: BG -> modem -> WiFi/app. The BG task (bg_load.c) waits for CPU1 (25 s cap), so
+             * CPU1 is brought up from here as loop() would; the modem task waits for bg2ap-status. */
+#if !defined(NO_SMP_CPU1)
+            if (now >= 8000u) smp_cpu1_test_poll();
+#endif
+            bg_boot_start();
+#endif
+            { int k = pon_kpdpwr_pressed();
+              if (k == 1 && !key_prev) {
+                  if (!key_n || (uint32_t)(now - key_t0) > 3000u) { key_n = 0; key_t0 = now; }
+                  if (++key_n >= 5u) { con_puts("mss-gate: crown x5 -> rebooting to the bootloader\n"); con_flush(); timer_delay_ms(50); reboot_to_bootloader(); }
+              }
+              if (k >= 0) key_prev = (k == 1); }
+            usb_poll(); wdog_pet(); deadman_kick(); blackbox_flush(); logfile_flush();   /* v420: the dead-man (main.c, 30 s) is only kicked from loop(); a gate longer than 30 s (Gen 5) rebooted to fastboot */
+            if (mss_ready() && !ready_at) ready_at = now;
+            if (ready_at && (uint32_t)(now - ready_at) >= 8000u) { why = "modem ready"; break; }
+            if (mss_task_done() && !mss_ready()) { why = "loader finished without a ready modem"; break; }
+            /* v472: the 180 s cap counts from the MODEM'S RELEASE, not from the gate's start -- since v470
+             * the modem waits for the BG (~+90 s) and the old cap let WiFi/app in while it was still booting.
+             * Hard cap 300 s from the gate's start in case the modem is never released. */
+            { uint32_t rel = mss_release_ms();
+              if (rel && (uint32_t)(now - rel) >= 180000u) break;
+              if ((uint32_t)(now - t0) >= 300000u) break; }
+            if ((uint32_t)(now - last_paint) >= 40u) {   /* v398: spinner, ~25 fps, no text */
+                fb_spinner_frame(now - t0);
+                last_paint = now;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        con_puts("mss-gate: app starts ("); con_puts(why); con_puts(") at +"); con_putdec(timer_ms()); con_puts(" ms\n");
+        q6_audio_probe(750u, "P2 app start (before setup)");
+        s_gate_done = 1;
+    }
+#endif
+#if defined(SMEM_DIAG)
     smem_diag_dump();
 #endif
 
@@ -222,6 +340,47 @@ extern "C" void owf_app_task(void *arg)
      * that is going to be FLASHED — without it, a working flashed image can
      * never be replaced. */
     recovery_gate();
+
+#if defined(SHOW_PREV_LOG)
+    /* PREVIOUS-BOOT LOG ON THE GLASS. These watches have no UART, so a hang
+     * normally takes its explanation with it. It does not: .ramlog is NOLOAD
+     * at ~0x814ab000, DDR keeps its contents across a forced reboot, and that
+     * address is ~18 MB above where aboot loads a boot image -- so the image
+     * booted to LOOK at the log does not overwrite it.
+     *
+     * Boot this build straight after a hang and the last thing the firmware
+     * managed to say is on the screen. Held until the screen is touched, or
+     * 60 s, so it can be read and photographed without racing a timer. */
+    {
+        static char prevbuf[1024];
+        /* Screen 1: THIS boot so far. usb_dev_init() has already run by here,
+         * so if the CDC console did not come up its reason ("usb: clocks
+         * failed", "usb: controller not responding") is in these lines -- the
+         * one message you cannot read over the console that failed. */
+        if (ramlog_tail_buf(prevbuf, sizeof prevbuf) > 0) {
+            fb_text_dump(prevbuf);
+            uint32_t t0 = timer_ms();
+            for (;;) {
+                uint16_t tx, ty;
+                if (touch_read(&tx, &ty) == 1) break;
+                if ((uint32_t)(timer_ms() - t0) >= 60000u) break;
+                timer_delay_ms(50);
+            }
+            timer_delay_ms(400);          /* let the finger lift before screen 2 */
+        }
+        /* Screen 2: the PREVIOUS boot, i.e. the one that hung. */
+        if (ramlog_had_previous() && ramlog_prev_tail_buf(prevbuf, sizeof prevbuf) > 0) {
+            fb_text_dump(prevbuf);
+            uint32_t t0 = timer_ms();
+            for (;;) {
+                uint16_t tx, ty;
+                if (touch_read(&tx, &ty) == 1) break;
+                if ((uint32_t)(timer_ms() - t0) >= 60000u) break;
+                timer_delay_ms(50);
+            }
+        }
+    }
+#endif
 
 #if defined(BL_TEST)
     /* Brightness sweep on a white screen, independent of the UI. See
@@ -435,6 +594,7 @@ extern "C" void owf_app_task(void *arg)
                     s_once = true;
                     pmic_irq_init();
                     touch_ft_arm_irq();     /* gpio13 edge latch: no more blind touch reads */
+                    if (stem_keys_arm_irq) stem_keys_arm_irq();   /* STEM pushers wake a suspended watch */
                     rtc_probe_report();     /* deep-sleep gate: can EE0 arm the PMIC RTC alarm? (read-only) */
                     pmic_irq_alarm_init();  /* RTC alarm IRQ routed; the self-test that armed it is retired (proven v110) */
 #if defined(USE_CPU_PC_8909)
@@ -448,6 +608,71 @@ extern "C" void owf_app_task(void *arg)
 #if !defined(NO_SMP_CPU1)
                 if (s_once) smp_cpu1_test_poll();   /* platform/smp_8909.c: boots CPU1 (proven v72), keeps it parked with idle accounting */
 #endif
+            }
+#elif defined(PLAT_BOARD_FOSSIL_GEN5)
+            /* Gen 5 (2026-09-10): CPU1 bring-up only. Same APQ8009W cluster as
+             * the Gen 4, so smp_8909.c applies unchanged -- this watch was
+             * simply never listed in the block above, which is why it ran
+             * single-core. The Gen 4's other one-shots are deliberately NOT
+             * copied here: pmic_irq_init/rtc_probe/cpu_pc8909 each need their
+             * own check against this board's PM660 and its disabled RTC write
+             * path, and bundling them into an SMP change would make a failure
+             * impossible to attribute. They are separate jobs.
+             *
+             * Bringing CPU1 up also hands it the FRAME PUSH: fb_flush_buf()
+             * calls smp_flush_available(), so once the core is parked and
+             * serving, core 0 stops blocking on the DMA_P transfer. That is
+             * the same division of labour the Wear 2100 watches already run. */
+            {
+                static bool s_smp_started = false;
+                if (!s_smp_started && timer_ms() >= 8000u) s_smp_started = true;
+#if !defined(NO_SMP_CPU1)
+                if (s_smp_started) smp_cpu1_test_poll();
+#endif
+            }
+            /* NOTE: this file does NOT include platform.h, so board-header
+             * defines (PLAT_HAS_BG_QCC1110) are NOT visible here -- only the
+             * -D flags from the build script are. Guarding on the board name
+             * is what works in this file; v251 guarded on the board define and
+             * silently compiled the probe call out. */
+            /* BG co-processor first contact (2026-09-11): is the QCC1110 already
+             * running when our image boots? Read-only unless it says so. */
+            /* v277: the whole co-processor bring-up (TZ load, bgcom, GLINK,
+             * RSB = the crown) runs in its own task, started once here; it
+             * waits for SMEM + the RPM channel by itself. Nothing blocks the UI. */
+#if defined(PLAT_NO_BG_COPROC)
+            /* v451: Gen 5E "sole" has no rotating crown and its co-processor did not answer the Gen 5
+             * bring-up (bg2ap-status 0, then a crash at the pre-load reset pulse when flashed). Left
+             * alone on that board until its role there is known. */
+            con_puts("bg-boot: skipped on this board (PLAT_NO_BG_COPROC)\n");
+#else
+            bg_boot_start();
+#endif
+            /* DEEP SLEEP one-shot (2026-09-10), the Gen 4's list checked item by
+             * item against this watch's PM660:
+             *   pmic_irq_init   PON at SID 0 / 0x0800 and the SPMI arbiter IRQ
+             *                   (GIC SPI 190) are the same on PM660 + msm8909w
+             *   rtc_probe_report  READ-ONLY ownership report
+             *   pmic_irq_alarm_init  ONLY if EE0 owns the alarm peripheral: this
+             *                   is the PM660 whose RTC_CTRL write hard-reset the
+             *                   Gen 6, so nothing touches the RTC blind
+             *   cpu_pc8909_init  CPU0 SAW sequences are byte-identical to the
+             *                   Gen 4's in triggerfish's DT
+             * touch_ft_arm_irq is FocalTech (C2) and is skipped: the Gen 5 has the
+             * Raydium, and plat_suspend masks the TLMM summary IRQ itself. */
+            {
+                static bool s_sleep_once = false;
+                if (!s_sleep_once && timer_ms() >= 20000u) {
+                    s_sleep_once = true;
+                    pmic_irq_init();
+                    rtc_probe_report();
+                    if (rtc_alarm_writable() == 1) pmic_irq_alarm_init();
+                    else con_puts("sleep: RTC alarm not owned by EE0 -- timer wake falls back to the QTimer/MPM deadline\n");
+#if defined(USE_CPU_PC_8909)
+                    cpu_pc8909_prev_report();
+                    cpu_pc8909_init();
+#endif
+                }
             }
 #endif
 #if defined(TOUCH_LOG)
@@ -469,6 +694,9 @@ extern "C" void owf_app_task(void *arg)
                     con_puts(" avgbody="); con_putdec(s_n ? s_sum / s_n : 0u);
                     con_puts(" maxbody="); con_putdec(s_max);
                     con_puts(" lastperiod="); con_putdec(period);
+#if defined(MSS_BOOT)
+                    con_puts(" mss-iter="); con_putdec(mss_iter()); con_puts(" mss-where="); con_puts(mss_where());
+#endif
                     con_puts("\n");
                     s_n = 0; s_sum = 0; s_max = 0; s_win = t;
                 }
@@ -506,14 +734,14 @@ extern "C" void owf_app_task(void *arg)
      * A healthy loop() must pet the dog. Hang recovery is not lost: a real
      * hang stops this pet AND deadman_kick() below, so both recovery paths
      * still fire. Bring-up builds that WANT the reboot use the wdog_stage()
-     * ladder, which reprograms the window from a known milestone, or
-     * -DNO_AUTO_REBOOT to disarm entirely. */
+     * ladder, which reprograms the window from a known milestone.
+     * (-DNO_AUTO_REBOOT now only disables the APPS hardware watchdog; the
+     * FreeRTOS dead-man is no longer armed on a normal boot -- see main.c.) */
         wdog_pet();
-        /* 2026-08-03, FIRMWARE PROVEN ALIVE: a healthy loop() must also kick
-         * the 30 s dead-man (bring-up left it un-kicked BY DESIGN so every
-         * boot returned to the bootloader — that design phase is over). A
-         * real hang still stops both this kick and wdog_pet -> the watch
-         * self-recovers. */
+        /* No-op on a normal boot since 2026-09-18: nothing arms the dead-man
+         * any more (main.c). Kept for the SAFETY_TEST image, which does arm it
+         * on purpose, and harmless otherwise -- deadman_kick() checks for a
+         * live timer. Hang recovery on a normal boot is wdog_pet() above. */
         deadman_kick();
         /* Anti-drift: the DDIC walks its addressing when left frame-less
          * (see fb_idle_refresh) — keep it fed at >= 2 Hz.
@@ -538,6 +766,10 @@ extern "C" void owf_app_task(void *arg)
          * a host that is not listening. */
         usb_poll();
         con_flush();   /* so a hang mid-line still leaves that line behind */
+        /* Keep the DSP fed from the app too: an LVGL render can hold the CPU longer than the
+         * 150 ms the modem monitor task has in flight (WRITE_BUFS x 50 ms, mss_apr.c). */
+        if (q6_audio_service) q6_audio_service();
+        { static uint32_t s_rv; uint32_t now_rv = timer_ms(); if ((uint32_t)(now_rv - s_rv) >= 10000u) { s_rv = now_rv; rodata_verify("loop"); } }
 #if defined(SMEM_SCAN)
         /* The risky SMEM probe runs HERE, once, and never earlier.
          * usb_is_configured() means a host has enumerated us and is reading,

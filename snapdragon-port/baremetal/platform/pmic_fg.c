@@ -30,7 +30,21 @@
 #include <stdio.h>
 #if defined(PLAT_SOC_MSM)
 
-#if defined(PLAT_BOARD_FOSSIL_GEN6)
+/* WHICH POWER STACK — asked as a capability, not as "which watch".
+ *
+ * This used to select the FG-GEN3 + SMB2 path on PLAT_BOARD_FOSSIL_GEN6, which
+ * silently assumed that watch was the only PM660 in the tree. The Fossil Gen 5
+ * (triggerfish) is an msm8909 with a PM660 carrying the SAME fuel gauge at the
+ * SAME addresses -- its DTB has qcom,fg-gen3 with fg-batt-soc@4000 /
+ * fg-batt-info@4100 on pm660@0, and qcom,qpnp-smb2 with chgr@1000 and
+ * usb-chgpth@1300 -- so it took the Gen 4's VM-BMS branch instead and read a
+ * PM8916 fuel gauge that does not exist on it. The Gen 6 keeps working through
+ * the compatibility shim below. */
+#if defined(PLAT_BOARD_FOSSIL_GEN6) && !defined(PLAT_FG_GEN3)
+#define PLAT_FG_GEN3 1
+#endif
+
+#if defined(PLAT_FG_GEN3)
 
 #define FG_SID              0u
 #define FG_MSOC             0x4009u
@@ -64,8 +78,8 @@ static int fg_read16_cp(uint16_t addr, uint16_t addr_cp, uint16_t *out)
     return -1;
 }
 
-/* Monotonic state-of-charge, 0-100. -1 on error. */
-int fg_batt_percent(void)
+/* Raw monotonic state-of-charge, 0-100. -1 on error. */
+static int fg_msoc_percent(void)
 {
     uint8_t cap[2];
     for (unsigned t = 0; t < FG_READ_TRIES; t++) {
@@ -76,7 +90,131 @@ int fg_batt_percent(void)
     return -1;
 }
 
-/* Battery voltage in mV. -1 on error. */
+/* Open-circuit-voltage to state-of-charge, the sanity net under the FG's own
+ * answer (see fg_batt_percent below for why there has to be one).
+ *
+ * SCALED TO THE DISPLAYED FULL POINT, NOT TO THE CELL'S CHEMISTRY. These
+ * watches carry 4.4 V-class cells -- from their own qcom,battery-data nodes,
+ * Gen 5 (triggerfish_310mah_jan4th2019) floats at 4385 mV and Gen 6
+ * (4917649_300mah_jan5th2021) at 4440 mV -- and they are MEANT to charge that
+ * far. What the watch REPORTS is a deliberate policy decision (2026-09-12):
+ * anything at or above PLAT_BATT_FULL_MV is 100%, so the top of the cell's
+ * range is headroom that shows as a long flat 100% rather than as a number
+ * that creeps up past it. This curve is therefore a conventional 4.2 V-class
+ * one that reaches 100% at the same place the clamp does -- the two must
+ * agree, or the reading jumps at the boundary.
+ *
+ * FG-GEN3 keeps its profile as an opaque qcom,fg-profile-data blob -- unlike
+ * the Gen 4's VM-BMS, there is no pc-temp-ocv-lut in the tree to lift -- so
+ * this is a generic curve rather than this exact cell's. It is only ever
+ * consulted when the FG's own number is not believable, so a couple of
+ * percent of curve error costs nothing. */
+static const struct { uint8_t soc; uint16_t ocv_mv; } k_hv_ocv_lut[] = {
+    { 100, 4150 }, {  95, 4110 }, {  90, 4076 }, {  85, 4044 }, {  80, 4008 },
+    {  75, 3969 }, {  70, 3933 }, {  65, 3900 }, {  60, 3871 }, {  55, 3846 },
+    {  50, 3824 }, {  45, 3806 }, {  40, 3790 }, {  35, 3776 }, {  30, 3764 },
+    {  25, 3752 }, {  20, 3738 }, {  15, 3720 }, {  10, 3698 }, {   7, 3676 },
+    {   5, 3650 }, {   3, 3590 }, {   1, 3480 }, {   0, 3300 },
+};
+
+static int fg_ocv_percent(int mv)
+{
+    const unsigned n = sizeof k_hv_ocv_lut / sizeof k_hv_ocv_lut[0];
+    if (mv <= 0) return -1;
+    if (mv >= k_hv_ocv_lut[0].ocv_mv)     return 100;
+    if (mv <= k_hv_ocv_lut[n - 1].ocv_mv) return 0;
+
+    for (unsigned i = 1; i < n; i++) {
+        if (mv >= k_hv_ocv_lut[i].ocv_mv) {
+            int v_hi = k_hv_ocv_lut[i - 1].ocv_mv, s_hi = k_hv_ocv_lut[i - 1].soc;
+            int v_lo = k_hv_ocv_lut[i].ocv_mv,     s_lo = k_hv_ocv_lut[i].soc;
+            int span = v_hi - v_lo;
+            if (span <= 0) return s_lo;
+            return s_lo + ((mv - v_lo) * (s_hi - s_lo) + span / 2) / span;
+        }
+    }
+    return 0;
+}
+
+/* Cell voltage at/above which the pack READS as full, whatever the gauge's
+ * learned capacity says. INTENTIONALLY 4150 mV and intentionally BELOW what
+ * these 4.4 V cells actually charge to: the watch should take the whole charge
+ * the cell can hold, and report the top of that range as a flat 100%. Do not
+ * "correct" this to the cell's float voltage -- that was tried on 2026-09-12
+ * and it is not what this number is for. */
+#ifndef PLAT_BATT_FULL_MV
+#define PLAT_BATT_FULL_MV 4150
+#endif
+
+/* ...and the voltage it has to fall BELOW before it stops reading full. The
+ * hysteresis is not cosmetic (2026-09-12): a charged watch left on the cable
+ * sits in the charger's terminate/recharge sawtooth, and on this watch that
+ * sawtooth hovers right around 4150 mV -- the cell relaxes after termination,
+ * the charger tops it back up, repeat. A bare threshold there would flick the
+ * display between 100% and the gauge's number every time the voltage crossed
+ * it by a millivolt. */
+#ifndef PLAT_BATT_FULL_RELEASE_MV
+#define PLAT_BATT_FULL_RELEASE_MV 4100
+#endif
+
+/* Monotonic state-of-charge, 0-100. -1 on error.
+ *
+ * WHY THIS IS NOT JUST THE MSOC REGISTER (2026-09-12, "the gen 5 sometimes
+ * reads 0% with the cell at 4.14 V"). Two separate faults produced that:
+ *
+ *  1. MSOC READS A HARD ZERO. The gauge's algorithm is the stock OS's, and we
+ *     never load a profile or restore a SOC -- we only read its output. When
+ *     the FG restarts its estimate (it does around charge termination) the
+ *     monotonic SOC register reads 0 until the first new estimate lands, and
+ *     a zeroed SPMI read is indistinguishable from that: the shadow-copy
+ *     agreement test above passes trivially for 0 == 0. Either way the watch
+ *     showed a flat battery while holding 4.14 V.
+ *
+ *  2. IT FLIP-FLOPPED WITH 100%. The full-clamp at >= 4150 mV (deliberate --
+ *     see PLAT_BATT_FULL_MV) meant a watch resting near that boundary
+ *     alternated between the clamp's 100 and the gauge's 0 as the voltage
+ *     wandered a few mV. The clamp is right; the zero underneath it was the
+ *     bug, and fixing (1) is what stops the oscillation.
+ *
+ * So: trust MSOC, but only where it is believable. A zero is believable only
+ * if the voltage agrees the cell is nearly empty -- and the voltage test is
+ * the OCV curve, not a fixed threshold, so it self-disables on a genuinely
+ * flat battery (there the estimate is ~0 too and MSOC's 0 stands). */
+int fg_batt_percent(void)
+{
+    static int s_full_latched = 0;
+    int msoc = fg_msoc_percent();
+    int mv   = fg_batt_mv();
+    int est  = fg_ocv_percent(mv);
+
+    if (mv >= PLAT_BATT_FULL_MV)             s_full_latched = 1;
+    else if (mv > 0 &&
+             mv < PLAT_BATT_FULL_RELEASE_MV) s_full_latched = 0;
+    if (s_full_latched) return 100;            /* reads full at 4150 by policy */
+    if (msoc < 0)  return est;                 /* gauge unreadable: voltage only */
+    if (est  < 0)  return msoc;                /* voltage unreadable: gauge only */
+    if (msoc == 0 && est > 5) return est;      /* implausible empty: override */
+    return msoc;
+}
+
+/* Battery voltage in mV. -1 on error.
+ *
+ * NO MASK ON THE TOP BIT, and here is the arithmetic that settles it
+ * (2026-09-12, after a masked build read 0 V). The LSB is 122070 nV =
+ * 0.12207 mV, so the full unsigned 16-bit range is 65535 * 0.12207 = 8.0 V.
+ * A single li-ion cell therefore lands in the UPPER half of the range:
+ *
+ *     3700 mV -> raw 30310 = 0x7666      (bit 15 clear)
+ *     4000 mV -> raw 32768 = 0x8000      (bit 15 SET)
+ *     4200 mV -> raw 34405 = 0x8665      (bit 15 SET)
+ *
+ * Bit 15 is a VALUE bit at this scale, and it is set for most of a charged
+ * cell's range. A previous revision ANDed with 0x7FFF on the strength of
+ * qpnp-fg-gen3's VOLTAGE_15BIT_MASK -- that mask belongs to the 15-bit SRAM
+ * voltage parameters, which have a different scale, NOT to this BATT_INFO
+ * register. Masking turned 4200 mV into 0x0665 = 199 mV, which the caller's
+ * "< 2500 mV is junk" fail-safe then reported as 0 V. Do not reintroduce it.
+ */
 int fg_batt_mv(void)
 {
     uint16_t raw;
@@ -112,16 +250,38 @@ int chg_usb_present(void)
     return (v & USBIN_PLUGIN_BIT) ? 1 : 0;
 }
 
-/* Actively charging? 1/0, -1 on error. Status 0..4 = trickle/pre/fast/fullon/
- * taper are all "charging"; 5..7 = terminate/inhibit/disable are not. */
+/* Actively charging? 1/0, -1 on error.
+ *
+ * BATTERY_CHARGER_STATUS_1 [2:0]: 0 trickle, 1 pre, 2 fast, 3 fullon,
+ * 4 taper, 5 terminate, 6 inhibit, 7 disable.
+ *
+ * WHY 5 AND 6 COUNT AS CHARGING HERE (2026-09-12, "it does not know it is
+ * charging" on the Gen 5 with a soldered cable). Reporting only 0..4 is the
+ * literal reading of the register, and it is the wrong answer to the question
+ * the UI is asking. TERMINATE means the charger finished and is holding the
+ * cell at float; INHIBIT means it is full enough that charging is suppressed.
+ * Both happen with the cable in and the watch sitting on power -- and on a
+ * watch that is usually left on the charger, terminate is the state it spends
+ * most of its time in. The recorded Gen 6 census sample is exactly this case:
+ *   soc=87 vb=4190 ib=-3 chg=0x45 usb=0x10
+ * chg=0x45 -> status 5 (terminate) with USB plugged in, which the old test
+ * reported as NOT CHARGING.
+ *
+ * So terminate/inhibit are only reported as charging when USB is actually
+ * present -- without a cable they mean "idle on battery" and must stay 0.
+ * Status 7 (disable) is never charging. */
 int chg_charging(void)
 {
     uint8_t v;
     if (spmi_read8(FG_SID, CHG_STATUS_1, &v) < 0) return -1;
-    return ((v & CHG_STATUS_MASK) <= 4u) ? 1 : 0;
+    unsigned st = v & CHG_STATUS_MASK;
+    if (st <= 4u) return 1;                      /* actively pushing current */
+    if (st <= 6u) return (chg_usb_present() == 1) ? 1 : 0;   /* terminate/inhibit */
+    return 0;                                    /* 7 = disabled */
 }
 
-#else /* Gen 4: PM8916 VM-BMS + linear charger */
+
+#else /* PM8916 VM-BMS + linear charger (Fossil Gen 4, TicWatch C2/S2) */
 /* THE GEN 4 IS A COMPLETELY DIFFERENT POWER STACK, which is why the Gen 6's
  * code above reported 0 V here rather than a wrong number: none of it runs.
  * From this watch's own DTB:

@@ -97,6 +97,7 @@ static void alarm_sound_stop(void)  { audio_alarm_stop(); }
 
 static void alarm_dismiss(void) {
   if (!g_alarm_active) return;
+  Serial.println("[alarm] dismiss");
   haptics_stop();
   alarm_sound_stop();
   bool fired_timer = s_alarm_from_timer;

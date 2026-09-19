@@ -59,6 +59,16 @@ void bootmark(uint32_t stage)
 #endif
 }
 
+uint32_t bootmark_aux_get(unsigned idx)
+{
+#if defined(USE_IMEM_MARKS)
+    if (idx > 3) return 0u;
+    return mmio_read(BM_BASE + 0x08 + 4u * idx);
+#else
+    (void)idx; return 0u;
+#endif
+}
+
 void bootmark_aux(unsigned idx, uint32_t val)
 {
 #if defined(USE_IMEM_MARKS)

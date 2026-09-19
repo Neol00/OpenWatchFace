@@ -23,9 +23,8 @@
 >
 > The charger's pogo pads carry USB D+/D−, but unlike the Gen 6 they are **not
 > exposed in a way a stock charger can use.** Getting a data link to this watch
-> means building or buying a **DIY pogo-USB cable** (the AsteroidOS community
-> documents the pinout), and on the unit this port was developed on the D+/D−
-> lines are **hand-soldered taps**. Without that link there is no `fastboot`, no
+> means soldering four wires to the main board; the pads and colours are shown
+> under [How to wire USB to the Gen 4](#1-connect-the-watch-how-to-wire-usb-to-the-gen-4). Without that link there is no `fastboot`, no
 > `adb`, and therefore no way to install anything.
 >
 > This is the single biggest practical difference from the Gen 6, and it is
@@ -34,7 +33,7 @@
 > **You do not have to overwrite Wear OS.** Unlike the Gen 6, **`fastboot boot`
 > works on this watch** it loads the firmware into RAM and runs it, writing
 > nothing. A power cycle returns you to stock. See
-> [RAM boot](#option-a--ram-boot-recommended-nothing-is-written).
+> [RAM boot](#option-a-ram-boot-recommended-nothing-is-written).
 
 ---
 
@@ -93,14 +92,14 @@ fastboot --version
 
 ---
 
-## Part 1 Getting an image
+## Part 1: Getting an image
 
-### Option A download a prebuilt image (recommended)
+### Option A: download a prebuilt image (recommended)
 
 Grab the Fossil Gen 4 `.img` from the [GitHub releases page](../../../../releases)
-and skip to [Part 2 Flashing](#part-2--flashing).
+and skip to [Part 2: Flashing](#part-2-flashing).
 
-### Option B build it yourself
+### Option B: build it yourself
 
 #### Prerequisites
 
@@ -119,7 +118,7 @@ Two commands, and the second one's DTB argument is **not** optional:
 cd snapdragon-port/baremetal
 
 # 1. compile + link
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN" sh build-owf-image-gen4.sh
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES" sh build-owf-image-gen4.sh
 
 # 2. pack into an Android boot image, WITH the stock DTB appended
 sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../dtbs/firefish-stock.dtb
@@ -143,8 +142,9 @@ ls build/gen4/       # result: build/gen4/owf-boot.img
 
 > **The flag set above is the release set.** `-DWDOG_TRACE` alone still boots
 > and runs, but sleeps at ~45 mA with the core merely clock-gated; the five
-> sleep flags are what turn that into the ~6 mA cluster collapse. They are
-> explained one by one under [Build flags](#build-flags).
+> sleep flags are what turn that into the ~6 mA cluster collapse, and the two
+> `MSS_*` flags load the modem. They are explained one by one under
+> [Build flags](#build-flags).
 
 #### Publishing an image: strip your MAC first
 
@@ -184,13 +184,37 @@ Full build reference: [`snapdragon-port/BUILD-GEN4.md`](../../snapdragon-port/BU
 
 ---
 
-## Part 2 Flashing
+## Part 2: Flashing
 
-### 1. Connect the watch
+### 1. Connect the watch: how to wire USB to the Gen 4
 
-Attach your pogo-USB cable / soldered tap (see the warning at the top of this
-page). If the watch does not enumerate, clean the charger pads and the contacts
-on the watch back with isopropyl alcohol.
+The Gen 4 has no USB connector. The four pads next to the display connector on
+the back of the main board are the USB link, and they are where this port's
+cable is soldered:
+
+<p align="center">
+  <img src="../../WatchFace-Screenshots/firefish_usb.jpg" width="535" alt="Fossil Gen 4 main board with the four USB pads labelled GND, 5V, D+ and D-">
+</p>
+
+| Pad | Wire |
+|---|---|
+| 5V | red |
+| GND | black |
+| D+ | green |
+| D− | white |
+
+The two pads left of the connector are power (GND above, 5V below), the two
+to its right are data (D+ above, D− below). Take the back cover off, solder the
+four leads, route the cable out past the case edge and close the watch loosely
+around it. If the watch does not enumerate, clean the joints with isopropyl
+alcohol and recheck D+/D−.
+
+> Standard USB colours are used throughout: **red = 5 V (VBUS)**, **black = GND**,
+> **white = D−**, **green = D+**. A plain USB 2.0 cable with the device end cut
+> off is all it takes; keep the D+/D− leads short and twisted. The pads are
+> small: a fine tip, thin solder and flux, and check every joint for bridges
+> with a multimeter before plugging in. Swapped D+/D− shows as the watch never
+> enumerating; swapped power will destroy the watch.
 
 ### 2. Enter fastboot
 
@@ -216,7 +240,7 @@ fastboot oem unlock
 > no benefit for this use case. I take no responsibility if you brick your
 > hardware or lose data.
 
-### 4. Optional: back up your original Wear OS installation
+### 4. Back up your original installation
 
 Wear OS is **not rooted**, so `adb shell` cannot read the raw block devices and
 `dd` on a partition fails there is no way around that from inside Wear OS.
@@ -252,7 +276,7 @@ trusting them. Restore later with `fastboot flash boot boot.img`.
 
 ### 5. Run it
 
-#### Option A RAM boot (recommended, nothing is written)
+#### Option A: RAM boot (recommended, nothing is written)
 
 ```sh
 fastboot boot owf-fossil-gen4.img
@@ -263,7 +287,7 @@ power cycle returns the watch to stock, Wear OS untouched. This is the normal
 way to use this port, and it is why Gen 4 development iterates faster than the
 Gen 6.
 
-#### Option B permanent install (`boot` partition)
+#### Option B: permanent install (`boot` partition)
 
 Only when you want the firmware to survive a reboot. **This replaces Wear OS.**
 
@@ -351,7 +375,7 @@ failures always print.
 ### Recommended (what the release images are built with)
 
 ```
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN"
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES"
 ```
 
 | Flag | What it does |
@@ -362,6 +386,33 @@ CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_S
 | `-DSYS_PC_STAGE=6` | The cluster level to use: 6 = the kernel's `l2-pc` (RPM handshake, sleep set applied). 7 = `l2-gdhs` (cluster off, no RPM handshake, ~37 mA) is the fallback if 6 ever misbehaves on a unit. |
 | `-DL2_SAW_AP_ENABLE` | Leaves the L2 SAW in its retention mode while awake, as the shipped kernel does between sleeps. Saves a few mA of awake-idle current. |
 | `-DSYS_PC_XO_SHUTDOWN` | Drops the crystal vote from the sleep set so the RPM can enter XO shutdown / Vdd-min. Measured on the C2: 37 mA without it, **about 6 mA** with it. |
+| `-DMSS_BOOT` | Loads and authenticates the modem image from the `modem` partition behind the loading screen, and runs the host services it needs (rmtfs, RFSA, memshare, sensor registry). The modem loads before WiFi and the rest of the app. |
+| `-DMSS_PROXY_VOTES` | Holds the modem's CX/MX and bus votes through the RPM during the load and releases them afterwards. Without the release the RPM keeps those rails and bus clocks up through every collapse, which costs ~15 mA asleep. |
+
+**`MSS_OPEN_MASK` is not passed on this watch** — `boards/fossil_gen4.h`
+defaults it to `0x6D` and you should leave it alone. It selects which SMD
+channels are opened towards the modem, and the two bits it clears out of the
+`0x7F` default are the expensive ones: bit 1 starts the fastrpc listener and
+bit 4 (`DIAG_CNTL`) compiles in `mss_diag.c`, which answers the modem's SSID
+range report by enabling **every** F3 debug level on every range and then
+receives the resulting message stream for as long as the watch runs. That
+machinery exists for the Wear 3100 modem stall and diagnoses nothing here; it
+was linked into Wear 2100 images by accident in v473 and cost real current
+until v484. `0x6D` opens the same channels as before and asks the modem for
+nothing.
+
+**WiFi RX polling is on by default** — `boards/fossil_gen4.h` defines
+`PLAT_WCNSS_RX_DESC_POLL`, so it is not in the flag set above. Some Gen 4 units
+never raise the DXE interrupt bit the receive path used to wait for: the radio
+comes up (`wlan: radio UP`), Bluetooth pairs, but every scan prints
+`wcn36xx: scan ch 1..13: RX frames 0, beacons 0, networks 0`. Frames *are*
+delivered into memory; they were just never collected. With the flag the driver
+checks the receive descriptors directly, and the scan line ends with
+`rx head resyncs N`. Found on unit `C0F8413D3327` (2026-09-19), whose firmware
+and NV are byte-identical to a Gen 4 that scanned without it; the Gen 5 has
+needed the same flag since 2026-09-10. It costs nothing on units that do raise
+the bit, so leave it on. If you see `RX frames 0` on an image built before
+this, rebuild — or pass `-DPLAT_WCNSS_RX_DESC_POLL=1` in `CFLAGS_EXTRA`.
 
 Since v199 all three Wear 2100 watches run **dual core** by default (core 1
 renders and idles in WFI; it is handed to TrustZone with the hotplug flag
@@ -378,6 +429,9 @@ before every collapse). `-DNO_SMP_CPU1` builds the single-core variant.
 | Flag | Why not |
 |---|---|
 | `-DDISPLAY_BISECT` | Its stage table maps stages 2–8 to "already proven, leave the watchdog alone" proven on the **Gen 6**. On the Gen 4 it silently disables exactly the part of the staircase you would need. |
+| `-DTSENS_ENABLE` | The die-temperature block is opt-in because enabling it **hard-crashes the Power app** on this SoC (found on the C2, same APQ8009W). |
+| `-DWCNSS_CORNER_VOTES` | The RPM "corner" votes reset the SoC on the PM8916 (found on the C2). The radio comes up fine without them. |
+| `-DSLEEP_BATT_DIAG` | Suspends the C2/S2's SMB231 charger. The Gen 4 has no SMB231, so it does nothing here. |
 
 ### Experimental / measurement flags
 
@@ -390,7 +444,6 @@ measuring the sleep floor.
 | `-DSYS_PC_STAGE=7` | The `l2-gdhs` cluster level instead of `l2-pc`: no RPM handshake, ~37 mA asleep. Fallback only. |
 | `-DSYS_PC_XO_PARK` | Parks the CPU clock on the 19.2 MHz crystal before the collapse instead of staying at 400 MHz on GPLL0. The kernel stays at its 400 MHz safe rate; this was the old behaviour and it made TrustZone's wake time out. Keep off. |
 | `-DSLEEP_FLOOR` | The RPM active-set "ladder" (DDR/PLL/LDO/CX votes measured one by one on a cable). Costs ~50 s awake before every collapse and every one of its steps measured 0 mA, so it stays off. `-DSLEEP_FLOOR_SKIP=<mask>` skips steps. |
-| `-DSLEEP_BATT_DIAG` | On the C2/S2: suspends the charger input during sleep so the STC3117 reads the cell current with a cable attached. Measurement only. |
 | `-DSPM_NO_PMIC_DATA` | Skips programming the L2 SAW's PMIC_DATA words. The kernel writes them; the bootloader leaves them at zero and the pc/gdhs sequences then send zeros to the rail controller and the wake never returns. Bisect flag only. |
 | `-DSPM_NO_L2_VDD_INIT` | Skips the SAW voltage-control init (VCTL / PMIC_DATA_3 = the CPU rail's VSET). Same warning: this is what stock's spm-regulator does at probe and the wake needs it. |
 | `-DSMP_PARK_CPU23` | Tries to boot cores 2 and 3 into TrustZone power collapse. Resets the C2 on release. Do not pass. |
@@ -399,6 +452,23 @@ measuring the sleep floor.
 | `-DSLEEP_PAS_KILL_RADIO` | The old sleep path that shut Pronto down through PAS before sleeping. It leaves a ghost RPM master holding the 3.3 V PA rail; the radio now idles resident instead. Do not pass. |
 | `-DPC_TRACE` | One flash write per power-collapse breadcrumb during the first attempts of a boot. Bring-up only. |
 | `-DUSB_LOG_V2` / `-DUSB_IRQ_WAKE` | The reworked USB console (tail-first replay, host commands) and USB-as-wake-source. Both broke the live log when tried; off. |
+| `-DSLEEP_FLOOR_STEP_MS=<ms>` | How long each `-DSLEEP_FLOOR` step is held and measured. Default `6000`. |
+| `-DSLEEP_RAILS_OFF=<mask>` | PMIC rails switched off for each deep sleep and back on at wake (bit N = `lN`, bit 24+N = `sN`). **Default `0` on the Gen 4: untested here.** The mask and rail table are the C2's ([details](ticwatch-c2.md#switching-individual-rails-off--dsleep_rails_off)); do **not** include bit 6 (`l6`), because the panel re-init that makes it safe on the C2 only exists for the C2's panel. |
+| `-DNO_AUTO_REBOOT` | Disarms the APPS watchdog completely (only when `-DWDOG_TRACE` is **not** passed). For bench sessions where nothing should reset the watch; a hang then needs a forced power-off. |
+
+### Tunables
+
+Values with a default in the source; override with `-DNAME=<value>`.
+
+| Flag | Default | What it sets |
+|---|---|---|
+| `-DMSS_OPEN_MASK=<mask>` | `0x6D` (board header) | SMD channels opened to the modem; leave alone (see above) |
+| `-DFB_IDLE_MS=<ms>` | `500` | Idle frame refresh interval that keeps the display controller fed |
+| `-DUSB_LOG_TAIL=<bytes>` | `16384` | How much recent log a fresh USB console connection replays |
+| `-DUSB_IN_STUCK_MS=<ms>` | `5000` | After this long a stuck USB log transfer is flushed and re-sent |
+
+`-DUSE_SYS_SUSPEND` and `-DUSE_CPU_PC` have **no effect** on this build: the
+build script always passes `-DUSE_CPU_PC_8909`, which takes precedence.
 
 ### Diagnostics
 
@@ -409,15 +479,48 @@ failures and one-line milestones only (plus the sleep entry/exit census).
 |---|---|
 | `-DLOG_VERBOSE` | the step-by-step narration: WCNSS bring-up, SMEM/SCM probing, the WPA2 handshake, scan results, the 10 s load census, SMP and power-collapse dumps, each suspend cycle, BLE traces |
 | `-DBOOT_DIAG` | MDSS clock bring-up, the DMA_P splash probe, framebuffer geometry, TLMM mux, touch probe |
+| `-DSMEM_DIAG` | the SMEM table and RPM ping, the first things to read when the radio does not start |
+| `-DWIFI_DIAG` | every WCNSS bring-up step (PAS, SMD channels, NV download, HAL start) |
+| `-DBT_TRACE` | HCI-level tracing of the NimBLE transport |
+| `-DBT_DIAG` | a raw HCI reset / advertise test **instead of** the NimBLE host, never together with a build you want BLE from |
+| `-DSLEEP_DIAG` | the suspend/resume path and wake sources |
 | `-DCROWN_DIAG` | crown probe, an I²C bus scan, a PAT9126 register dump, and a 2 s heartbeat with live X/Y deltas use when the crown does nothing |
 | `-DUSB_DIAG` | the 5 s USB heartbeat (`portsc`, `ccs`, `spd`, …) use when enumeration itself is broken |
 | `-DTOUCH_DIAG` | paints a diagnostic colour **only if** the touch probe fails; inert when touch works |
 | `-DFB_COLORTEST` | a four-band R/G/B/W test pattern held for 5 s before LVGL starts; names the pack order and stride outright |
 | `-DLV_DIAG` | the per-10 s LVGL render / touch census |
+| `-DPLAT_STORAGE_NOWRITE` | read-only storage: nothing is formatted or written to `userdata` |
 
 > **Never add an unconditional print to a per-frame path.** It wraps the 64 KB
 > ramlog faster than the 1 Hz flush can drain it, and the log becomes one line
 > repeated forever.
+
+### What the script sets for you
+
+`CFLAGS_EXTRA` is *added to* a fixed set that `build-owf-image-gen4.sh` puts on every compile
+line. You never pass these and you cannot omit them:
+
+| Define | What it selects |
+|---|---|
+| `-DPLAT_BOARD_FOSSIL_GEN4` | Pulls in `baremetal/boards/fossil_gen4.h`: the PMIC blocks, panel, touch, rails and board defaults such as `MSS_OPEN_MASK`. |
+| `-DBOARD_SELECT=BOARD_ID_FOSSIL_GEN4` | Picks `OpenWatchFace/board_fossil_gen4.h` on the app side. The app never sees the `PLAT_` headers, so the board is named twice. |
+| `-DUSE_CPU_PC_8909` | Compiles the CPU power-collapse entry points. |
+| `-DLV_CONF_INCLUDE_SIMPLE` | LVGL takes its config from this repo's `lv_conf.h`. |
+| `-DOWF_APP` | `main.c` builds the real app entry instead of `ui_demo.c`. |
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OWF_PUBLIC` | unset (`0`) | `1` strips `wcnss_mac` from the NV object; see [Publishing](#publishing-an-image-strip-your-mac-first). Use it for anything you hand to someone else. |
+| `CFLAGS_EXTRA` | empty | The flag set above. **Empty means a watch that warm-resets every few seconds**: `-DWDOG_TRACE` lives here, not in the script. |
+| `OWF_GEN4_FW` | `../firmware/gen4`, else the first `../firmware/gen4-*` with a `wcnss_nv.c` | Which watch's NV blob to compile in. The build prints the directory it picked (`[owf] NV blob from ...`). |
+| `LVGL_DIR` | this repo's `libraries/lvgl`, else `~/Arduino/libraries/lvgl` | Where LVGL comes from. |
+| `CROSS` | `arm-none-eabi-` | Toolchain prefix. |
+
+> **LVGL is cached per build directory.** `liblvgl-owf.a` is built once and
+> reused; changing `LVGL_DIR` or an LVGL config afterwards has no effect until
+> you delete it.
 
 ---
 
@@ -430,6 +533,7 @@ failures and one-line milestones only (plus the sleep entry/exit census).
 | Watch resets into Wear OS a few seconds into every boot | You built without `-DWDOG_TRACE`. |
 | Screen stays black but the watch is clearly alive | aboot handed over a dark panel. The takeover path needs the bootloader's own display state; the blind DSI bring-up exists behind `-DGEN4_DSI_INIT` as a fallback. |
 | Colours are wrong (red renders as blue) | Wrong pack order for your panel variant. Rebuild with `-DMDP3_PACK_BGR`. The default (RGB) is the hardware-proven one on this unit. |
+| WiFi scans show `RX frames 0, beacons 0, networks 0` but Bluetooth pairs | The image predates the RX-polling default. Rebuild; `boards/fossil_gen4.h` now defines `PLAT_WCNSS_RX_DESC_POLL`. |
 | Crown does nothing | Build with `-DCROWN_DIAG` and read `/dev/ttyACM0`. `crown: pat9126 probe rc=0 id1=0x31` means the sensor is fine and the problem is above the driver; a NACK means it is unpowered. |
 | Every fastboot command hangs after you interrupted one | **Never kill `fastboot` mid-transfer.** It leaves stale bytes in the host USB buffer and desyncs the protocol. Unplug and replug to clear it. |
 | Watch seems dead / hung | Hold power to switch off, then re-enter fastboot. A RAM-booted image cannot brick anything. |
@@ -460,5 +564,4 @@ failures and one-line milestones only (plus the sleep entry/exit census).
   flag, votes the sleep set to the RPM (panel, touch, eMMC, USB and gauge
   rails kept in low-power mode, crystal released), then issues TERMINATE_PC
   with the GDHS flag from core 0. TrustZone warm-boots core 0 on the PMIC
-  interrupt. The reference for all of it was a rooted stock C2+; the notes are
-  in `snapdragon-port/notes/C2PLUS-FINDINGS.md`.
+  interrupt. The reference for all of it was a rooted stock C2+.

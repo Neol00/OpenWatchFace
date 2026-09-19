@@ -59,8 +59,15 @@ extern "C" int pwr_soc_temp_dc(void);
 
 #if BOARD_SOC_MSM8909
 extern "C" int cpu_volt_mv(void);   /* live VDD_APC in mV (cpu_volt_a7.c) */
+/* CPR fuse corner behind the current rail voltage: 1..3, 0 if the rail has
+ * not been set, negative if the die's fuse did not read and the DT ceiling is
+ * standing in for it. */
+extern "C" int      cpu_volt_corner(void);
 #endif
 
+#if BOARD_HAS_CPU_UNDERVOLT
+static lv_obj_t *pm_uv_lbl = nullptr;    // the "-12.5 mV" undervolt offset value
+#endif
 static lv_obj_t *pm_freq_btns[8];   // up to 8 freq buttons (we use CPU_FREQ_COUNT)
 
 static void app_open_power(void);   // fwd (rebuilt when frequency changes)
@@ -261,6 +268,13 @@ static void pm_header(lv_obj_t *parent, const char *text) {
  * update each card's big current-value. Called LESS often than the text refresh —
  * once every PM_GRAPH_EVERY text ticks (see pm_timer_cb) — so the charts span a
  * long window. Cheap; safe when the PMU is absent (it just skips the PMU graphs). */
+/* The one Draw sample per text tick, shared by the POWER text block and the
+ * Draw chart. Before this each path took its own reading at its own moment
+ * (the chart every PM_GRAPH_EVERY ticks), the chart's model figure used the
+ * nominal cell voltage while the text used the live one. On Fossil boards the
+ * sample is the measured cell current (charge into the cell while charging). */
+static uint16_t s_pm_draw_ma = 0;
+
 static void pm_update_graphs(void) {
   // Per-core CPU usage is independent of the PMU, so always latch + plot it.
   cpu_usage_sample();
@@ -281,20 +295,11 @@ static void pm_update_graphs(void) {
 #endif
   }
 
-  // Draw is a MODEL (CPU/screen/WiFi), independent of the PMU — plot it on every
-  // board, including the PMU-less C6.
-  uint16_t ma = power_estimate_ma();
-#if BOARD_PLATFORM_FOSSIL
-  // Fossil: plot the FG's MEASURED current when discharging (see the labels
-  // block for why charging falls back to the model).
-  { int iba = fg_batt_ma();
-    if (iba != -32768) ma = (uint16_t)(iba > 0 ? iba : -iba);   /* C2: STC3117 cell current, sign folded */
-  }
-#endif
-  if (pm_g_draw.ser) {
-    lv_chart_set_next_value(pm_g_draw.chart, pm_g_draw.ser, ma);
-    lv_label_set_text_fmt(pm_g_draw.val, "%u", ma);
-  }
+  // Draw: plot the SAME sample the POWER text block showed on this tick
+  // (pm_update_labels runs first in pm_timer_cb and on open), so the chart's
+  // point, the number above it and the "Draw:" line can never disagree.
+  if (pm_g_draw.ser)
+    lv_chart_set_next_value(pm_g_draw.chart, pm_g_draw.ser, s_pm_draw_ma);
 
   // Battery level needs the gauge -> only with a PMU.
   if (!board_power_ok()) return;
@@ -382,11 +387,32 @@ static void pm_update_labels(void) {
   // overestimate by ~15% and the shown value is already corrected.
   int m;
 #if BOARD_PLATFORM_FOSSIL
-  /* The PM660 FG has a REAL current ADC — show the measured draw instead of
-   * the model whenever the cell is discharging (ib > 0). While charging the
-   * battery current is the charger's, not the load's, so fall back to the
-   * model there (same reason the AXP boards always model). */
+  /* Once the gauge has given a current this boot, a single failed read keeps the last measured
+   * sample instead of dropping to the model for that tick. */
+  static bool s_pm_gauge_measures = false;
+  if (!s_pm_gauge_measures) s_pm_draw_ma = ma;
+#else
+  s_pm_draw_ma = ma;   // model at the live cell voltage
+#endif
+#if BOARD_PLATFORM_FOSSIL
+  /* Boards whose gauge measures current (C2/S2 STC3117, Gen 6 PM660 FG) show
+   * only measured figures; the model below is for boards that cannot measure. */
   int fossil_ib = fg_batt_ma();
+  /* Measured cell current in both directions: drain off the cable, the charge going INTO the
+   * cell on it (the "Charge:" line below). The model only when the gauge gives nothing. */
+  if (fossil_ib != -32768) { s_pm_gauge_measures = true; s_pm_draw_ma = (uint16_t)(fossil_ib > 0 ? fossil_ib : -fossil_ib); }
+#if defined(BOARD_TICWATCH_C2) || defined(BOARD_TICWATCH_S2)
+  s_pm_gauge_measures = true;   /* the STC3117 is always fitted: never the model on these boards */
+#endif
+  static int s_pm_last_ib = -32768;
+  if (fossil_ib != -32768) s_pm_last_ib = fossil_ib;
+  else if (s_pm_gauge_measures) fossil_ib = s_pm_last_ib;   /* one failed read: last measured value */
+  if (s_pm_gauge_measures && fossil_ib == -32768) {
+    static const char *const k_why[] = { "no value", "gauge not found", "MODE read failed",
+                                         "gauge stopped, restarting", "current read failed" };
+    int why = smb231_batt_ma_why ? smb231_batt_ma_why() : 0;
+    m = snprintf(pb, sizeof(pb), "Draw:    gauge: %s", (why >= 0 && why <= 4) ? k_why[why] : "no value");
+  } else
   if (fossil_ib != -32768 && fossil_ib > 0) {
     uint32_t fmw = (uint32_t)vbat * (uint32_t)fossil_ib / 1000u;
     m = snprintf(pb, sizeof(pb),
@@ -394,13 +420,14 @@ static void pm_update_labels(void) {
         "Power:   %u.%02u W  (measured)",
         fossil_ib, (unsigned)(fmw / 1000), (unsigned)((fmw % 1000) / 10));
   } else if (fossil_ib != -32768) {
-    /* On a cable the gauge sees the NET cell current (charger minus load), so
-     * the load itself cannot be measured; show the real charge current and the
-     * modelled draw side by side instead of hiding the measurement. */
+    /* On a cable the gauge measures the current going INTO the cell. A board
+     * that measures never shows the model: the model is only for boards whose
+     * gauge gives no current (fg_batt_ma() == -32768, e.g. the Gen 4). */
+    uint32_t cmw = (uint32_t)vbat * (uint32_t)(-fossil_ib) / 1000u;
     m = snprintf(pb, sizeof(pb),
         "Charge:  %d mA  (measured, into cell)\n"
-        "Draw:    %u mA  (model, on cable)",
-        -fossil_ib, ma);
+        "Power:   %u.%02u W  (measured, into cell)",
+        -fossil_ib, (unsigned)(cmw / 1000), (unsigned)((cmw % 1000) / 10));
   } else
 #endif
   if (calib_get_k_samples() > 0) {
@@ -416,6 +443,7 @@ static void pm_update_labels(void) {
         "Power:   %u.%02u W  (model)",
         ma, mw / 1000, (mw % 1000) / 10);
   }
+  if (pm_g_draw.val) lv_label_set_text_fmt(pm_g_draw.val, "%u", s_pm_draw_ma);
   // The Gauge/Runtime/Idle lines are all DERIVED from a fuel-gauge IC (coulomb
   // counter), so they only mean anything with the AXP2101. An ADC-only battery
   // (C6) has no gauge — they'd be stuck on "measuring"/"learning" forever, so omit
@@ -423,12 +451,18 @@ static void pm_update_labels(void) {
 #if PM_HAS_PMU
   if (have_pmu) {
   // REAL average current from the fuel gauge — the only hardware-grounded value.
+  // Omitted on Snapdragon watches whose gauge measures current: "Draw:" is already
+  // measured there, and this average is only right over a whole battery runtime.
+#if BOARD_PLATFORM_FOSSIL
+  if (!s_pm_gauge_measures && m > 0 && m < (int)sizeof(pb)) {
+#else
   if (m > 0 && m < (int)sizeof(pb)) {
+#endif
     if (real_ma > 0.0f)
       m += snprintf(pb + m, sizeof(pb) - m, "\nGauge:   %d.%02d mA  (REAL avg)",
                     (int)real_ma, (int)((real_ma - (int)real_ma) * 100 + 0.5f));
     else
-      m += snprintf(pb + m, sizeof(pb) - m, "\nGauge:   measuring (needs >=1%% drop)");
+      m += snprintf(pb + m, sizeof(pb) - m, "\nGauge:   measuring (needs >=20 mV drop)");
   }
   if (hlc > 0.0f && m > 0 && m < (int)sizeof(pb)) {
     int ch = (int)hlc, cm = (int)((hlc - (int)hlc) * 60.0f + 0.5f);
@@ -507,8 +541,18 @@ static void pm_update_labels(void) {
        * per-die voltage for whatever frequency is selected. Showing it makes
        * the undervolt visible instead of a claim. */
       int cmv = cpu_volt_mv();
-      if (cmv > 0) k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %d mV", cmv);
-      else         k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    n/a");
+      int cnr = cpu_volt_corner();
+      if (cmv <= 0)
+        k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    n/a");
+      else if (cnr > 0)
+        k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %d mV  (corner %d)", cmv, cnr);
+      else if (cnr < 0)
+        /* No fuse data — the DT ceiling is standing in, so say so rather than
+         * let the number look like this die's characterised voltage. */
+        k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %d mV  (corner %d, no fuse)",
+                      cmv, -cnr);
+      else
+        k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    %d mV", cmv);
 #else
       k += snprintf(cb + k, sizeof(cb) - k, "\nCore:    n/a  (SPMI rail)");
 #endif
@@ -605,6 +649,9 @@ static void pm_cleanup_cb(lv_event_t *e) {
   pm_dim_sw   = nullptr;
   pm_dimp_lbl = nullptr;
   pm_dimp_row = nullptr;
+#if BOARD_HAS_CPU_UNDERVOLT
+  pm_uv_lbl   = nullptr;
+#endif
   pm_dimusb_sw = nullptr;
 }
 
@@ -616,6 +663,37 @@ static void pm_refresh_freq_highlight(void) {
         sel ? lv_color_hex(ui_accent_hex()) : lv_color_hex(0x1A1A1A), 0);
   }
 }
+
+#if BOARD_HAS_CPU_UNDERVOLT
+/* Repaint the undervolt value. Shown as a signed millivolt offset because that is
+ * what the user is choosing; the absolute rail voltage is on the clock card above,
+ * and the two together are what makes a trial readable ("-50 mV -> 1000 mV, still
+ * up"). Tenths are carried through the integer maths so 12.5 mV prints exactly. */
+static void pm_refresh_uv(void) {
+  if (!pm_uv_lbl) return;
+  int t = (int)settings_get_uv_steps() * settings_uv_step_tenths();   // tenths of mV
+  if (t == 0) {
+    lv_label_set_text(pm_uv_lbl, "0 mV");
+  } else {
+    int a = t < 0 ? -t : t;
+    lv_label_set_text_fmt(pm_uv_lbl, "-%d.%d mV", a / 10, a % 10);
+  }
+  /* Red once we are past the point where the DT stops guaranteeing anything --
+   * i.e. as soon as any undervolt is dialled in. */
+  lv_obj_set_style_text_color(pm_uv_lbl,
+      lv_color_hex(t ? 0xFF6B4A : ui_accent_hex()), 0);
+}
+
+/* Step the undervolt by one regulator step. The port clamps to its own limit and
+ * re-programs the rail immediately, so the effect (and any instability) shows up
+ * at once rather than at the next speed change. */
+static void pm_uv_step_cb(lv_event_t *e) {
+  int d = (int)(intptr_t)lv_event_get_user_data(e);
+  settings_set_uv_steps((int)settings_get_uv_steps() + d);
+  pm_refresh_uv();
+  pm_update_labels();          // the clock card's "Core: N mV" reflects it at once
+}
+#endif  /* BOARD_HAS_CPU_UNDERVOLT */
 
 static void pm_freq_btn_cb(lv_event_t *e) {
   uint16_t mhz = (uint16_t)(uintptr_t)lv_event_get_user_data(e);
@@ -787,6 +865,9 @@ static void pm_off_confirm_cb(lv_event_t *e) {
     // reach the bootloader, so without a route from inside the firmware a
     // flashed build could never be replaced. This one is deliberately part of
     // the shipping UI, not a build-flag diagnostic. Does not return.
+#if BOARD_HAS_CPU_UNDERVOLT
+    settings_uv_clean_exit();          // a deliberate reboot keeps the undervolt
+#endif
     reboot_to_bootloader();
     return;
   }
@@ -946,8 +1027,14 @@ static void app_open_power(void) {
 
   // ---- POWER (draw is a model — shown on every board) ----
   pm_header(col, "POWER");
-#if defined(BOARD_TICWATCH_C2)
-  pm_make_graph(col, "Draw  (measured mA)", 0, 400, &pm_g_draw);   /* STC3117 coulomb counter on QUP4 */
+#if BOARD_PLATFORM_FOSSIL
+  /* Measured on every Fossil-platform board whose gauge gives a current (C2/S2 STC3117,
+   * Gen 6 PM660 FG); the model only where it gives none (-32768). */
+#if defined(PLAT_CHG_SMB231) || defined(BOARD_TICWATCH_C2) || defined(BOARD_TICWATCH_S2)
+  pm_make_graph(col, "Draw  (measured mA)", 0, 400, &pm_g_draw);   /* STC3117 on every C2/S2 */
+#else
+  pm_make_graph(col, fg_batt_ma() != -32768 ? "Draw  (measured mA)" : "Draw  (model mA)", 0, 400, &pm_g_draw);
+#endif
 #else
   pm_make_graph(col, "Draw  (model mA)", 0, 400, &pm_g_draw);
 #endif
@@ -1217,6 +1304,75 @@ static void app_open_power(void) {
   }
   pm_refresh_freq_highlight();
 #endif  /* !BOARD_PLATFORM_MAIX (CPU SPEED buttons) */
+
+#if BOARD_HAS_CPU_UNDERVOLT
+  // ---- CORE UNDERVOLT (bench) ----
+  // Steps the CPU rail below the voltage the die's CPR fuses were characterised at,
+  // in the regulator's own granularity. This is deliberately a manual control: the
+  // DT floor is a guarantee for the worst die that passes binning, at temperature
+  // extremes, and most parts run well under it -- but how far under is a property of
+  // the individual chip and the only way to find out is to try it and see whether the
+  // watch stays up. A setting that does NOT survive the next boot is discarded
+  // automatically (settings_store.h), so the worst case is one failed boot.
+  pm_header(col, "CORE UNDERVOLT");
+  pm_line(col, &FONT_SMALL, 0xAAAAAA,
+          "Below the datasheet floor. Back off\nfrom the first value that hangs.");
+  {
+    /* Name the voltage that failed, not just the fact of a failure -- that value
+     * is the edge the whole exercise is looking for. */
+    int h = (int)settings_uv_hung_steps() * settings_uv_step_tenths();
+    if (h) {
+      int a = h < 0 ? -h : h;
+      char hb[64];
+      snprintf(hb, sizeof hb, "-%d.%d mV did not survive.\nReset to 0.", a / 10, a % 10);
+      pm_line(col, &FONT_SMALL, 0xFF6B4A, hb);
+    } else if (settings_uv_was_reverted()) {
+      pm_line(col, &FONT_SMALL, 0xFF6B4A,
+              "Last setting did not survive a boot\nand was reset to 0.");
+    }
+  }
+
+  lv_obj_t *uvr = lv_obj_create(col);
+  lv_obj_set_width(uvr, LV_PCT(100));
+  lv_obj_set_height(uvr, UI_PX(56));
+  lv_obj_set_style_bg_opa(uvr, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(uvr, 0, 0);
+  lv_obj_set_style_pad_all(uvr, 0, 0);
+  lv_obj_clear_flag(uvr, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(uvr, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(uvr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  // MINUS lowers the rail, so it is the button that carries the risk: give it the
+  // warning colour rather than making both arrows look alike.
+  lv_obj_t *uvd = lv_btn_create(uvr);
+  lv_obj_set_size(uvd, UI_PX(64), UI_PX(52));
+  lv_obj_set_style_radius(uvd, UI_PX(12), 0);
+  lv_obj_set_style_bg_color(uvd, lv_color_hex(0x3A1F16), 0);
+  lv_obj_add_event_cb(uvd, pm_uv_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+  lv_obj_t *uvdl = lv_label_create(uvd);
+  lv_obj_set_style_text_font(uvdl, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(uvdl, lv_color_white(), 0);
+  lv_label_set_text(uvdl, LV_SYMBOL_MINUS);
+  lv_obj_center(uvdl);
+
+  pm_uv_lbl = lv_label_create(uvr);
+  lv_obj_set_style_text_font(pm_uv_lbl, &FONT_LABEL, 0);
+  lv_label_set_text(pm_uv_lbl, "0 mV");
+
+  lv_obj_t *uvu = lv_btn_create(uvr);
+  lv_obj_set_size(uvu, UI_PX(64), UI_PX(52));
+  lv_obj_set_style_radius(uvu, UI_PX(12), 0);
+  lv_obj_set_style_bg_color(uvu, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_add_event_cb(uvu, pm_uv_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
+  lv_obj_t *uvul = lv_label_create(uvu);
+  lv_obj_set_style_text_font(uvul, &FONT_LABEL, 0);
+  lv_obj_set_style_text_color(uvul, lv_color_white(), 0);
+  lv_label_set_text(uvul, LV_SYMBOL_PLUS);
+  lv_obj_center(uvul);
+
+  pm_refresh_uv();
+#endif  /* BOARD_HAS_CPU_UNDERVOLT */
 
   // NOTE: the T5 "OC TUNING (bench)" section (live core-voltage + DPLL-band steppers,
   // the one-tap 544 MHz save, and the DPLL sweep-to-serial button) was REMOVED from the

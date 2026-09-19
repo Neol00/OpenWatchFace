@@ -63,6 +63,9 @@
 #define BOARD_ID_TDECK_PRO 13   /* LilyGo T-Deck Pro (e-paper, QWERTY, LoRa, GNSS) */
 #define BOARD_ID_TICWATCH_C2 14 /* Mobvoi TicWatch C2 skipjack (Wear 2100, bare-metal A7) */
 #define BOARD_ID_TICWATCH_S2 15 /* Mobvoi TicWatch S2/E2 tunny (Wear 2100, bare-metal A7, 400x400) */
+#define BOARD_ID_FOSSIL_GEN5 16 /* Fossil Gen 5 Carlyle HR triggerfish (Wear 3100, bare-metal A7, 416x416) */
+#define BOARD_ID_FOSSIL_GEN5E 17 /* Fossil Gen 5E sole (Wear 3100, bare-metal A7, 390x390) */
+#define BOARD_ID_FOSSIL_DARTER 18 /* Fossil Sport darter (Wear 3100, bare-metal A7, 390x390, crown) */
 
 #ifndef BOARD_SELECT
 #define BOARD_SELECT  BOARD_ID_FOSSIL_GEN6         /* <-- change this line to pick the board */
@@ -90,6 +93,14 @@
 #define BOARD_TUYA_T5_AMOLED_175 1
 #elif BOARD_SELECT == BOARD_ID_FOSSIL_GEN4
 #define BOARD_FOSSIL_GEN4 1
+#elif BOARD_SELECT == BOARD_ID_FOSSIL_GEN5
+#define BOARD_FOSSIL_GEN5 1
+#elif BOARD_SELECT == BOARD_ID_FOSSIL_GEN5E
+#define BOARD_FOSSIL_GEN5 1
+#define BOARD_FOSSIL_GEN5E 1
+#elif BOARD_SELECT == BOARD_ID_FOSSIL_DARTER
+#define BOARD_FOSSIL_GEN5 1
+#define BOARD_FOSSIL_DARTER 1
 #elif BOARD_SELECT == BOARD_ID_FOSSIL_GEN6
 #define BOARD_FOSSIL_GEN6 1
 #elif BOARD_SELECT == BOARD_ID_TDECK_PRO
@@ -125,6 +136,12 @@
 #include "board_tuya_t5_amoled_175.h"
 #elif defined(BOARD_FOSSIL_GEN4)
 #include "board_fossil_gen4.h"
+#elif defined(BOARD_FOSSIL_DARTER)
+#include "board_fossil_darter.h"
+#elif defined(BOARD_FOSSIL_GEN5E)
+#include "board_fossil_gen5e.h"
+#elif defined(BOARD_FOSSIL_GEN5)
+#include "board_fossil_gen5.h"
 #elif defined(BOARD_FOSSIL_GEN6)
 #include "board_fossil_gen6.h"
 #elif defined(BOARD_LILYGO_TDECK_PRO)
@@ -149,7 +166,16 @@
  * Mirrors PLAT_SOC_MSM8909 in snapdragon-port/baremetal/platform/platform.h; keep
  * the two in step when a third Wear 2100 watch arrives (the TicWatch S2/E2,
  * codename tunny, is the likely next one). */
-#if BOARD_SELECT == BOARD_ID_FOSSIL_GEN4 || BOARD_SELECT == BOARD_ID_TICWATCH_C2 || BOARD_SELECT == BOARD_ID_TICWATCH_S2
+/* The Fossil Gen 5 (triggerfish) belongs here too: the Snapdragon Wear 3100 is
+ * the Wear 2100 AP plus an always-on co-processor, so the CPU frequency ladder
+ * and the A7 clock RCG are the same silicon. Leaving it out is exactly the
+ * failure this block was created to prevent -- it fell through to the Gen 6
+ * branch and was offered a Wear 4100 ladder up to 1306 MHz that its RCG cannot
+ * reach from GPLL0. (Its core RAIL is a different PMIC's, which is handled in
+ * the runtime header, not here.) */
+#if BOARD_SELECT == BOARD_ID_FOSSIL_GEN4 || BOARD_SELECT == BOARD_ID_TICWATCH_C2 || \
+    BOARD_SELECT == BOARD_ID_TICWATCH_S2 || BOARD_SELECT == BOARD_ID_FOSSIL_GEN5 || BOARD_SELECT == BOARD_ID_FOSSIL_GEN5E || \
+    BOARD_SELECT == BOARD_ID_FOSSIL_DARTER
 #define BOARD_SOC_MSM8909 1
 #else
 #define BOARD_SOC_MSM8909 0
@@ -276,6 +302,9 @@
 #ifndef BOARD_HAS_AUDIO_PWM
 #define BOARD_HAS_AUDIO_PWM 0        /* LEDC PWM piezo/speaker beeper */
 #endif
+#ifndef BOARD_HAS_AUDIO_Q6
+#define BOARD_HAS_AUDIO_Q6 0         /* Wear 3100: BG amp + modem audio DSP (snapdragon-port) */
+#endif
 #ifndef BOARD_HAS_AUDIO_TUYA
 #define BOARD_HAS_AUDIO_TUYA 0       /* T5 internal codec via tdl_audio */
 #endif
@@ -314,6 +343,11 @@
 #endif
 
 /* -- misc peripherals ---------------------------------------------------------- */
+#ifndef BOARD_HAS_CPU_UNDERVOLT
+/* Manual CPU-rail undervolt stepper in the Power app. Only on boards whose
+ * core rail this port can actually write, and whose step size is known. */
+#define BOARD_HAS_CPU_UNDERVOLT 0
+#endif
 #ifndef BOARD_HAS_HAPTICS
 #define BOARD_HAS_HAPTICS 0          /* vibration motor */
 #endif
@@ -529,7 +563,7 @@
 #error "board config: exactly one input source (BOARD_TOUCH_* / BOARD_TOUCH_BUTTONS) must be 1"
 #endif
 /* At most one backend each; ZERO is valid (audio -> silent stub, SD -> FFat only). */
-#if (BOARD_HAS_AUDIO_ES8311 + BOARD_HAS_AUDIO_PWM + BOARD_HAS_AUDIO_TUYA) > 1
+#if (BOARD_HAS_AUDIO_ES8311 + BOARD_HAS_AUDIO_PWM + BOARD_HAS_AUDIO_TUYA + BOARD_HAS_AUDIO_Q6) > 1
 #error "board config: at most one BOARD_HAS_AUDIO_* backend may be 1"
 #endif
 #if (BOARD_HAS_SD_MMC + BOARD_HAS_SD_SPI + BOARD_HAS_SD_TUYA) > 1

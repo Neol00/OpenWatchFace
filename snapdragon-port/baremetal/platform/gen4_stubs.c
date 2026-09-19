@@ -65,6 +65,11 @@ static uint32_t s_pwr_win_start;
 static uint32_t s_pwr_sleep_base;
 static uint32_t s_pwr_wait_base;
 static uint32_t s_pwr_last_pct;
+/* Attribution of that busy%, same window and same denominator. The census
+ * below already computes these for the log, but there is no UART on the Gen 4
+ * or the Gen 5, so they are latched for the Power app to display. */
+static uint32_t s_pct_touch, s_pct_spmi, s_pct_cache;
+static uint32_t s_last_loops, s_last_touch_n;
 
 void pwr_diag_poll(uint32_t body_ms)
 {
@@ -100,7 +105,27 @@ void pwr_diag_poll(uint32_t body_ms)
             extern volatile uint64_t g_spmi_ticks;
             static uint32_t acc_win, acc_busy, acc_slept, acc_loops, n_win;
             static uint32_t t_us0, t_n0, sp_n0; static uint64_t sp_t0;
+            extern volatile uint32_t g_fb_cache_us;
+            static uint32_t cw_t_us0, cw_n0, cw_sp_n0, cw_cache0; static uint64_t cw_sp_t0;
             acc_win += win; acc_busy += busy; acc_slept += slept; acc_loops += s_pwr_loops; n_win++;
+
+            /* Per-WINDOW attribution for the UI (the log accumulates five
+             * windows before printing; the app wants the latest one). */
+            {
+                uint32_t f = timer_freq_hz() / 1000000u; if (!f) f = 1u;
+                uint32_t t_ms = (g_touch_us   - cw_t_us0)  / 1000u;
+                uint32_t c_ms = (g_fb_cache_us - cw_cache0) / 1000u;
+                uint32_t s_ms = (uint32_t)((g_spmi_ticks - cw_sp_t0) / f / 1000u);
+                s_pct_touch    = win ? t_ms * 100u / win : 0u;
+                s_pct_cache    = win ? c_ms * 100u / win : 0u;
+                s_pct_spmi     = win ? s_ms * 100u / win : 0u;
+                s_last_touch_n = g_touch_n - cw_n0;
+                s_last_loops   = s_pwr_loops;
+                cw_t_us0 = g_touch_us; cw_n0 = g_touch_n;
+                cw_sp_n0 = g_spmi_n;   cw_sp_t0 = g_spmi_ticks;
+                cw_cache0 = g_fb_cache_us;
+                (void)cw_sp_n0;
+            }
             if (n_win >= 5u) {
 #if defined(LOG_VERBOSE)
                 uint32_t f = timer_freq_hz() / 1000000u; if (!f) f = 1u;
@@ -125,6 +150,13 @@ void pwr_diag_poll(uint32_t body_ms)
 }
 
 int pwr_cpu_pct(void)     { return (int)s_pwr_last_pct; }
+/* Attribution of the busy%, as whole percents of the same wall-clock window. */
+int pwr_touch_pct(void)   { return (int)s_pct_touch; }
+int pwr_spmi_pct(void)    { return (int)s_pct_spmi; }
+int pwr_cache_pct(void)   { return (int)s_pct_cache; }
+int pwr_refr_pct(void)    { return -1; }   /* Gen 6's pwr_diag.c owns this one */
+int pwr_loops_win(void)   { return (int)s_last_loops; }
+int pwr_touch_n_win(void) { return (int)s_last_touch_n; }
 /* pwr_soc_temp_dc() is REAL on this SoC now — platform/tsens_8909.c. */
 /* pwr_cpu_mhz / cpu_clk_set_mhz are REAL on this watch — platform/cpu_clk_a7.c. */
 

@@ -12,8 +12,8 @@
    * verifies this against the hardware at boot). */
   #define configUNIQUE_INTERRUPT_PRIORITIES        256
   #define configMAX_API_CALL_INTERRUPT_PRIORITY    144
-#elif defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6) || \
-      defined(PLAT_BOARD_TICWATCH_C2)
+#elif defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5) || \
+      defined(PLAT_BOARD_FOSSIL_GEN6) || defined(PLAT_BOARD_TICWATCH_C2)
   /* Every MSM watch here uses qcom,msm-qgic2 at the SAME addresses — the Gen 6
    * DTB's interrupt-controller@b000000 reg is byte-identical to the Gen 4's,
    * and the TicWatch C2 is the Gen 4's SoC outright. This block cannot use

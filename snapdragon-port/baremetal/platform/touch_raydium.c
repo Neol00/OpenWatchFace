@@ -28,7 +28,8 @@
  * from the LVGL input read callback; INT-GPIO wiring is a later refinement.
  */
 #include "platform.h"
-#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN6)
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5) || \
+    defined(PLAT_BOARD_FOSSIL_GEN6)
 
 #include <string.h>
 
@@ -67,7 +68,12 @@
 #define MAX_TOUCH_NUM    2
 #define MAX_TCH_STATUS_PAKAGE_SIZE 2   /* kernel name kept for greppability */
 
-#if defined(PLAT_BOARD_FOSSIL_GEN4)
+/* The Gen 5 (triggerfish) carries the SAME raydium@39 on the SAME i2c@78b9000
+ * as the Gen 4 — its DTB's compatible string is even the same
+ * "raydium,raydium-ts-ub128blx01" family — so it takes this branch verbatim.
+ * What differs is only the two GPIOs (reset 12 -> 16, IRQ 13 -> 98) and the
+ * panel size, and all three already come from the board header. */
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5)
 /* 3.18 raydium_i2c_ts: known bus + address.
  * RAD_ACK_SEQ selects the Gen 6's queue-DRAINING reader, not "does this chip
  * need acking" — both do; see raydium_ack_report() and the note on touch_read
@@ -185,6 +191,9 @@ static int raydium_probe_here(void)
 #define RAYDIUM_DISPLAY_ACTIVE_MODE   0x0000u
 static int raydium_notify_display_mode(uint16_t mode)
 {
+#if defined(PLAT_TOUCH_NO_DISPLAY_MODE_CMD)
+    (void)mode; return -1;                 /* v449: no such host command in the 390p firmware (all call sites) */
+#endif
     uint8_t buf[4];
     buf[0] = RAYDIUM_HOST_CMD_DISPLAY_MODE;
     buf[1] = 0x00;
@@ -252,7 +261,14 @@ static void touch_activate(void)
             con_puts("touch: IC FW version read FAILED\n");
         }
     }
+#if defined(PLAT_TOUCH_NO_DISPLAY_MODE_CMD)
+    /* v449 (Gen 5E): the 390p vendor driver has NO host command 0x33 (only NO_OP, PWR_SLEEP 0x30,
+     * CALIBRATION 0x5C, TP_MODE 0x60, FT_MODE 0x61); sending it to that firmware is undefined and
+     * is the prime suspect for the frame flipping between boots and the creeping phantom. */
+    if (0) {
+#else
     if (raydium_notify_display_mode(RAYDIUM_DISPLAY_ACTIVE_MODE) == 0) {
+#endif
         /* WRITE-LANDED PROOF (2026-08-06). "hostcmd readback=0x00" has been
          * read as "the chip consumed the command", but 0x00 is ALSO what an
          * untouched HOST_CMD register reads — the two are indistinguishable
@@ -303,7 +319,13 @@ static void touch_activate(void)
 
 int touch_init(void)
 {
-#if defined(PLAT_BOARD_FOSSIL_GEN4)
+/* The Gen 5 takes the Gen 4's KNOWN-BUS path, not the Gen 6's probe-every-QUP
+ * fallback: triggerfish's DTB names the bus (i2c@78b9000) and the address
+ * (raydium@39) outright, so scanning for it would be slower and would poke
+ * seven buses this watch has other devices on — including the NFC controller.
+ * (The fallback also references PLAT_I2C_BLSP*_QUP* macros that only the Gen 6
+ * header defines, so falling through to it does not even compile here.) */
+#if defined(PLAT_BOARD_FOSSIL_GEN4) || defined(PLAT_BOARD_FOSSIL_GEN5)
     s_bus  = PLAT_I2C_TOUCH_BASE;
     s_addr = PLAT_TOUCH_I2C_ADDR;
     /* Route SDA/SCL to blsp_i2c5 and give the reset and INT lines a defined
@@ -788,12 +810,39 @@ int touch_read(uint16_t *x, uint16_t *y)
 
         uint16_t px = 0, py = 0;
         if (npts && npts <= MAX_TOUCH_NUM) {
-            px = (uint16_t)(rpt[POS_X_L] | ((uint16_t)rpt[POS_X_H] << 8));
-            py = (uint16_t)(rpt[POS_Y_L] | ((uint16_t)rpt[POS_Y_H] << 8));
+            /* v446 (Gen 5E: phantom point 0 on the right, real finger as point 1): the 390p vendor
+             * driver tracks points by id/slot and never assumes point 0 is the finger. Take the
+             * point with the highest pressure (bytes 5-6); fall back to point 0 if none reports any. */
+            unsigned best = 0; uint16_t bestp = 0;
+            for (unsigned k = 0; k < npts; k++) {
+                uint16_t pr = (uint16_t)(rpt[k * LENGTH_PT + 5] | ((uint16_t)rpt[k * LENGTH_PT + 6] << 8));
+                if (pr > bestp) { bestp = pr; best = k; }
+            }
+            px = (uint16_t)(rpt[best * LENGTH_PT + POS_X_L] | ((uint16_t)rpt[best * LENGTH_PT + POS_X_H] << 8));
+            py = (uint16_t)(rpt[best * LENGTH_PT + POS_Y_L] | ((uint16_t)rpt[best * LENGTH_PT + POS_Y_H] << 8));
+            { static unsigned s_rawdbg; if (s_rawdbg < 12u) { s_rawdbg++; con_puts("touch: report npts "); con_putdec(npts); con_puts(" pick "); con_putdec(best); con_puts(":");
+              for (unsigned b = 0; b < npts * LENGTH_PT && b < 22u; b++) { static const char hx[] = "0123456789abcdef"; char c2[4] = { ' ', hx[rpt[b] >> 4], hx[rpt[b] & 15], 0 }; con_puts(c2); } con_puts("\n"); } }
         }
 #if defined(TOUCH_LOG)
         s_tap_rpts++;
         ev_push('r', 0, status, px, py);
+#endif
+#if defined(PLAT_TOUCH_SETTLE_MS)
+        /* v448 (Gen 5E): the chip reports during its own settling after reset (a creeping point at
+         * the top centre with no finger). Drop everything reported in the first PLAT_TOUCH_SETTLE_MS. */
+        { static uint32_t s_act_t; if (!s_act_t) s_act_t = timer_ms();
+          if ((uint32_t)(timer_ms() - s_act_t) < PLAT_TOUCH_SETTLE_MS) { npts = 0; } }
+#endif
+#if defined(PLAT_TOUCH_STUCK_MS)
+        /* v448: a point that sits within 4 px of the same spot for PLAT_TOUCH_STUCK_MS without a
+         * release is a phantom, never a finger. Drop it until the chip reports a release. */
+        { static uint16_t sx, sy; static uint32_t st0; static int s_stuck;
+          if (npts && npts <= MAX_TOUCH_NUM) {
+              int near = (px > sx ? px - sx : sx - px) <= 4 && (py > sy ? py - sy : sy - py) <= 4;
+              if (!near) { sx = px; sy = py; st0 = timer_ms(); s_stuck = 0; }
+              else if (!s_stuck && (uint32_t)(timer_ms() - st0) > PLAT_TOUCH_STUCK_MS) { s_stuck = 1; con_puts("touch: point stuck at "); con_putdec(px); con_puts(","); con_putdec(py); con_puts(" -> ignored as a phantom\n"); }
+              if (s_stuck) npts = 0;
+          } else { s_stuck = 0; st0 = 0; } }
 #endif
         if (npts == 0 || npts > MAX_TOUCH_NUM) {
             if (s_down) g_touch_last_rpts = s_cur_rpts;
@@ -980,6 +1029,38 @@ int touch_read(uint16_t *x, uint16_t *y)
     uint8_t npts;
 
     if (!s_ready) return -1;
+
+#if defined(PLAT_TOUCH_INT_GATED)
+    /* INT GATE (2026-09-10), ported from the Gen 6 branch above because the
+     * on-watch load census attributed the Gen 5's entire idle CPU -- touch 5%,
+     * spmi 0%, cache 0% -- to this one function. LVGL's indev callback runs on
+     * its own period whether or not anything is being drawn, so without a gate
+     * every single poll pays a full PDA2 status read. It is worst on the Gen 5,
+     * whose DTB clocks this bus at 100 kHz against the Gen 4's 400 kHz.
+     *
+     * The gate is a FAST-PATH HINT, never an authority, and the three
+     * conditions below are what make that safe -- they are the Gen 6's, kept
+     * verbatim in spirit because each one is a bug that was already paid for:
+     *   - it never engages until the line has been SEEN to assert, so a wrong
+     *     pin or polarity costs nothing but the old behaviour;
+     *   - it never skips while a press is in flight (s_down), because a missed
+     *     release is the ghost-hold bug;
+     *   - it forces a real status read at least every 100 ms, because the
+     *     kernel arms this IRQ as FALLING and the line may only PULSE per
+     *     report; a missed pulse then costs one poll interval, not the tap. */
+    {
+        static uint32_t s_int_seen_ok;     /* line has proven it asserts */
+        static uint32_t s_last_bus_t;
+        int intr = (tlmm_in(PLAT_TOUCH_IRQ_GPIO) == 0);   /* active low */
+        if (intr) s_int_seen_ok = 1u;
+        if (s_int_seen_ok && !intr && !s_down &&
+            (uint32_t)(timer_ms() - s_last_bus_t) < 100u) {
+            *x = s_last_x; *y = s_last_y;
+            return s_down;                 /* bus untouched: the whole point */
+        }
+        s_last_bus_t = timer_ms();
+    }
+#endif
 
     if (raydium_pda2_read(RAYDIUM_PDA2_TCH_RPT_STATUS_ADDR, status,
                           MAX_TCH_STATUS_PAKAGE_SIZE) < 0)

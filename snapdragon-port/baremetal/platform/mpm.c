@@ -151,6 +151,20 @@ static void mpm_ring_doorbell(void)
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* A gpio_keys pusher (2026-09-15): active low with a pull-up, so wake on the
+ * FALLING edge (vendor msm_mpm_set_irq_type: falling detect bit, polarity 0).
+ * An edge, not level-low, so a button held into the sleep cannot wake the core
+ * over and over. Pin numbers from the stock qcom,gpio-map (board header). */
+#if defined(PLAT_BTN_STEM1_MPM) || defined(PLAT_BTN_STEM2_MPM)
+static void mpm_arm_key(unsigned pin)
+{
+    mpm_rmw(MPM_RISING,   pin, 0);
+    mpm_rmw(MPM_FALLING,  pin, 1);
+    mpm_rmw(MPM_POLARITY, pin, 0);
+    mpm_rmw(MPM_ENABLE,   pin, 1);
+}
+#endif
+
 /* Arm the PMIC wake pin, level-high. Returns 1 if the enable read back set —
  * checked rather than assumed, because arming the wrong thing is
  * indistinguishable from arming nothing once the core is down, and the caller
@@ -181,6 +195,12 @@ int mpm_arm_pmic_wake(uint64_t wake_cntpct)
     mpm_rmw(MPM_FALLING,  MPM_PIN_PMIC, 0);
     mpm_rmw(MPM_POLARITY, MPM_PIN_PMIC, 1);   /* wake while the line is HIGH  */
     mpm_rmw(MPM_ENABLE,   MPM_PIN_PMIC, 1);
+#if defined(PLAT_BTN_STEM1_MPM)
+    mpm_arm_key(PLAT_BTN_STEM1_MPM);
+#endif
+#if defined(PLAT_BTN_STEM2_MPM)
+    mpm_arm_key(PLAT_BTN_STEM2_MPM);
+#endif
     __asm__ volatile("dsb sy" ::: "memory");
 
     mpm_ring_doorbell();
@@ -190,6 +210,12 @@ int mpm_arm_pmic_wake(uint64_t wake_cntpct)
 void mpm_disarm_pmic_wake(void)
 {
     mpm_rmw(MPM_ENABLE, MPM_PIN_PMIC, 0);
+#if defined(PLAT_BTN_STEM1_MPM)
+    mpm_rmw(MPM_ENABLE, PLAT_BTN_STEM1_MPM, 0);
+#endif
+#if defined(PLAT_BTN_STEM2_MPM)
+    mpm_rmw(MPM_ENABLE, PLAT_BTN_STEM2_MPM, 0);
+#endif
     __asm__ volatile("dsb sy" ::: "memory");
     mpm_ring_doorbell();
 }

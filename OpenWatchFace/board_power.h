@@ -550,6 +550,9 @@ extern "C" int fg_batt_ma(void);      /* + = discharging; -32768 on error */
 extern "C" int fg_batt_temp_dc(void);
 extern "C" int chg_usb_present(void);
 extern "C" int chg_charging(void);
+/* SMB231 extras (TicWatch C2/S2 only; chg_smb231.c is not linked on the Fossils,
+ * hence weak -- the Power app tests the symbol before calling). */
+extern "C" int smb231_batt_ma_why(void) __attribute__((weak));   /* why fg_batt_ma gave no value */
 /* FG/CHARGER RE-ENABLED (2026-08-07) — VALIDATED ON HARDWARE. The 2026-08-03
  * disable ("plausible junk" + suspected TZ/XPU reset) predated the SPMI
  * arbiter v2 APID-table fix (snapdragon-port spmi_arb.c): reads through channel 0
@@ -566,15 +569,12 @@ extern "C" int chg_charging(void);
  *   - a voltage below any boot-capable level (< 2500 mV) reports 0 (INVALID),
  *     which the cutoff logic already ignores;
  *   - an ERRORED usb-present read (-1) counts as PRESENT, never absent. */
-static int      board_batt_percent(void)
-{
-    /* Full-clamp: this cell sits at/above 4.15 V only when charge-terminated,
-     * but the FG's learned capacity can lag and report 9x% there. Anything
-     * >= 4150 mV is a full battery — report 100. */
-    int pct = fg_batt_percent();
-    if (pct >= 0 && fg_batt_mv() >= 4150) return 100;
-    return pct;
-}
+/* The 4150 mV full-clamp and the "is this percentage believable at this
+ * voltage" sanity net both live in pmic_fg.c now (2026-09-12, PLAT_BATT_FULL_MV
+ * — the clamp is UNCHANGED and deliberate; see the comment on
+ * fg_batt_percent() for the 0%-at-4.14 V bug underneath it). Keeping both in
+ * one place is the point: they have to agree on where 100% starts. */
+static int      board_batt_percent(void)         { return fg_batt_percent(); }
 static bool     board_power_ok(void)             { return fg_batt_percent() >= 0; }
 static bool     board_power_begin(void)          { return board_power_ok(); }
 static void     board_power_full_init(void)      {}   /* gauge runs autonomously */
@@ -696,7 +696,8 @@ static bool     board_power_acks(void)           { return false; }
  * rails off, wake by the power key or USB insertion, straight into aboot.
  * Returns true because it DID issue the shutdown; it does not return. */
 extern "C" void poweroff_now(void);
-static bool     board_power_off(void)            { poweroff_now(); return true; }
+static void     settings_uv_clean_exit_if_any(void);   /* settings_store.h (included later in the TU) */
+static bool     board_power_off(void)            { settings_uv_clean_exit_if_any(); poweroff_now(); return true; }
 #else
 static bool     board_power_off(void)            { return false; }
 #endif

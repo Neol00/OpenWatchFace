@@ -360,6 +360,10 @@ static inline void ui_label_single_line(lv_obj_t *lbl) {
   const lv_font_t *f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
   lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
   lv_obj_set_height(lbl, lv_font_get_line_height(f));
+  /* Text wider than the box makes the label's self size the WRAPPED text, so a
+   * one-line label suddenly has "scroll room" and, being SCROLLABLE by default,
+   * swallows a crown turn or a finger drag over it. It is a label: never scroll it. */
+  lv_obj_clear_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 /* ---- Shared MDI icon fonts at the UI's three glyph sizes ----
@@ -382,6 +386,16 @@ LV_FONT_DECLARE(icons88);   // big current-conditions weather icon (Weather app)
 #define MDI_RUN_FAST        0xF111F   // running figure — Fitness app tile
 #define MDI_SLEEP           0xF0594   // moon (sleep) — Sleep app tile + face DND badge
 #define MDI_HEART_PULSE     0xF05F6   // heart-pulse — Heart (heart-rate) app tile (icons34)
+/* Buttons app (button_actions.h). Each is drawn only if the glyph is really in
+ * the font (lv_font_get_glyph_dsc), else a built-in LV_SYMBOL stands in, so the
+ * app works before the icons*.c ranges are regenerated with these. */
+#ifndef MDI_BELL
+#define MDI_BELL                 0xF009A   // bell                 — Notifications (icons22)
+#endif
+#define MDI_FLASHLIGHT           0xF0244   // flashlight           — Flashlight (icons22)
+#define MDI_CHEVRON_DOUBLE_DOWN  0xF013C   // chevron-double-down  — Quick shade (icons22)
+#define MDI_CLOSE_CIRCLE_OUTLINE 0xF015A   // close-circle-outline — None (icons22)
+#define MDI_GESTURE_TAP_BUTTON   0xF12A8   // gesture-tap-button   — Buttons app tile (icons34)
 
 /* ---- Weather glyphs (in icons22 + icons34; see weather_store.h / app_weather.h) ----
  * The Weather app draws these in a single tint each. The MAIN-DIAL "partly cloudy"

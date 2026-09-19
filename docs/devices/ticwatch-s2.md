@@ -23,7 +23,7 @@
 > **You do not have to overwrite Wear OS.** **`fastboot boot` works on this
 > watch** it loads the firmware into RAM and runs it, writing nothing to the
 > boot partition. A power cycle returns you to stock. See
-> [RAM boot](#option-a--ram-boot-recommended-nothing-is-written). The one
+> [RAM boot](#option-a-ram-boot-recommended-nothing-is-written). The one
 > storage layer (since v87) sees that `userdata` still holds a Wear OS volume
 > and stays read-only, so nothing is written; settings just do not persist
 > across a RAM boot.
@@ -102,19 +102,19 @@ fastboot --version
 
 ---
 
-## Part 1 Getting an image
+## Part 1: Getting an image
 
-### Option A download a prebuilt image (recommended)
+### Option A: download a prebuilt image (recommended)
 
 Grab the TicWatch S2 `.img` from the [GitHub releases page](../../../../releases)
-and skip to [Part 2 Running it](#part-2--running-it).
+and skip to [Part 2: Flashing](#part-2-flashing).
 
 A prebuilt image has **no WiFi calibration blob and no MAC address** in it;
 WiFi will bring the radio up and then fail at `HAL_START`. That is expected,
 and the fix is a build of your own with your watch's blob embedded (see
 [WiFi needs your watch's NV blob](#wifi-needs-your-watchs-nv-blob)).
 
-### Option B build it yourself
+### Option B: build it yourself
 
 #### Prerequisites
 
@@ -133,7 +133,7 @@ cd snapdragon-port/baremetal
 export LVGL_DIR=$PWD/../../libraries/lvgl
 
 # 1. compile + link
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN" sh build-owf-image-s2.sh
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES" sh build-owf-image-s2.sh
 
 # 2. pack into an Android boot image (the DTB is appended automatically)
 sh tools/mk-bootimg-s2.sh build/s2-owf/owf.bin
@@ -151,10 +151,10 @@ ls build/s2/         # result: build/s2/owf-boot.img
 > main loop. Without it the watch warm-resets a few seconds into every boot,
 > which looks exactly like "the image never ran".
 
-> **The other five flags are the sleep.** `-DWDOG_TRACE` alone boots and runs
-> but sleeps at ~45 mA with the core merely clock-gated. The full set above is
-> what the release images use; each flag is explained under
-> [Build flags](#build-flags).
+> **The next five flags are the sleep, and the two `MSS_*` ones load the
+> modem.** `-DWDOG_TRACE` alone boots and runs but sleeps at ~45 mA with the
+> core merely clock-gated. The full set above is what the release images use;
+> each flag is explained under [Build flags](#build-flags).
 
 > **Where the S2's device tree came from.** Unlike the C2's, which was compiled
 > from Mobvoi's kernel source, the tunny tree is the real one: extracted from
@@ -182,7 +182,7 @@ networks, and two of them on one network fight over ARP and DHCP.
 Build release images with `OWF_PUBLIC=1`:
 
 ```sh
-OWF_PUBLIC=1 CFLAGS_EXTRA="..." sh build-owf-image-c2.sh
+OWF_PUBLIC=1 CFLAGS_EXTRA="..." sh build-owf-image-s2.sh
 ```
 
 That removes the `wcnss_mac` symbol from the object entirely — not merely
@@ -210,7 +210,7 @@ and kept in NVS, so it is already per device.
 The WCN3620 will not start its WLAN HAL without the radio's NV calibration
 table, and the MAC address lives next to it. Both are in the watch's `persist`
 partition and are pulled from the root shell you get in
-[step 4](#4-strongly-recommended-back-up-the-stock-partitions-first):
+[step 4](#4-back-up-your-original-installation):
 
 ```sh
 adb pull /persist/WCNSS_qcom_wlan_nv.bin
@@ -228,7 +228,7 @@ your own MAC works too.)
 
 ---
 
-## Part 2 Running it
+## Part 2: Flashing
 
 ### 1. Connect the watch
 
@@ -268,7 +268,7 @@ fastboot flashing unlock
 > to boot an unsigned image and you lose the ability to flash a fix. I take no
 > responsibility if you brick your hardware or lose data.
 
-### 4. Strongly recommended: back up the stock partitions first
+### 4. Back up your original installation
 
 **Do this before you flash anything.** Stock images for this watch are hard to
 come by, and once `boot` is overwritten the original is gone for good. This
@@ -322,7 +322,7 @@ and touches them; every other partition should match exactly. Do not mount
 
 ### 5. Run it
 
-#### Option A RAM boot (recommended, nothing is written)
+#### Option A: RAM boot (recommended, nothing is written)
 
 ```sh
 fastboot boot owf-ticwatch-s2.img
@@ -331,7 +331,7 @@ fastboot boot owf-ticwatch-s2.img
 The firmware runs immediately. The boot partition is untouched and a power
 cycle returns the watch to Wear OS.
 
-#### Option B permanent install (`boot` partition)
+#### Option B: permanent install (`boot` partition)
 
 Only when you want the firmware to survive a reboot. **This replaces Wear OS.**
 Either from fastboot:
@@ -446,7 +446,7 @@ Everything is **silent by default**; failures always print.
 ### Recommended (what the release images are built with)
 
 ```
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN"
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES"
 ```
 
 | Flag | What it does |
@@ -457,6 +457,20 @@ CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_S
 | `-DSYS_PC_STAGE=6` | The cluster level to use: 6 = the kernel's `l2-pc` (RPM handshake, sleep set applied). 7 = `l2-gdhs` (cluster off, no RPM handshake, ~37 mA) is the fallback if 6 ever misbehaves on a unit. |
 | `-DL2_SAW_AP_ENABLE` | Leaves the L2 SAW in its retention mode while awake, as the shipped kernel does between sleeps. Saves a few mA of awake-idle current. |
 | `-DSYS_PC_XO_SHUTDOWN` | Drops the crystal vote from the sleep set so the RPM can enter XO shutdown / Vdd-min. Measured on the C2: 37 mA without it, **about 6 mA** with it. |
+| `-DMSS_BOOT` | Loads and authenticates the modem image from the `modem` partition behind the loading screen, and runs the host services it needs (rmtfs, RFSA, memshare, sensor registry). The modem loads before WiFi and the rest of the app. |
+| `-DMSS_PROXY_VOTES` | Holds the modem's CX/MX and bus votes through the RPM during the load and releases them afterwards. Without the release the RPM keeps those rails and bus clocks up through every collapse, which costs ~15 mA asleep. |
+
+**`MSS_OPEN_MASK` is not passed on this watch** — the S2 inherits `0x6D` from
+`boards/ticwatch_c2.h` and you should leave it alone. It selects which SMD
+channels are opened towards the modem, and the two bits it clears out of the
+`0x7F` default are the expensive ones: bit 1 starts the fastrpc listener and
+bit 4 (`DIAG_CNTL`) compiles in `mss_diag.c`, which answers the modem's SSID
+range report by enabling **every** F3 debug level on every range and then
+receives the resulting message stream for as long as the watch runs. That
+machinery exists for the Wear 3100 modem stall and diagnoses nothing here; it
+was linked into Wear 2100 images by accident in v473 and cost real current
+until v484. `0x6D` opens the same channels as before and asks the modem for
+nothing.
 
 Since v199 all three Wear 2100 watches run **dual core** by default (core 1
 renders and idles in WFI; it is handed to TrustZone with the hotplug flag
@@ -487,7 +501,6 @@ measuring the sleep floor.
 | `-DSYS_PC_STAGE=7` | The `l2-gdhs` cluster level instead of `l2-pc`: no RPM handshake, ~37 mA asleep. Fallback only. |
 | `-DSYS_PC_XO_PARK` | Parks the CPU clock on the 19.2 MHz crystal before the collapse instead of staying at 400 MHz on GPLL0. The kernel stays at its 400 MHz safe rate; this was the old behaviour and it made TrustZone's wake time out. Keep off. |
 | `-DSLEEP_FLOOR` | The RPM active-set "ladder" (DDR/PLL/LDO/CX votes measured one by one on a cable). Costs ~50 s awake before every collapse and every one of its steps measured 0 mA, so it stays off. `-DSLEEP_FLOOR_SKIP=<mask>` skips steps. |
-| `-DSLEEP_BATT_DIAG` | On the C2/S2: suspends the charger input during sleep so the STC3117 reads the cell current with a cable attached. Measurement only. |
 | `-DSPM_NO_PMIC_DATA` | Skips programming the L2 SAW's PMIC_DATA words. The kernel writes them; the bootloader leaves them at zero and the pc/gdhs sequences then send zeros to the rail controller and the wake never returns. Bisect flag only. |
 | `-DSPM_NO_L2_VDD_INIT` | Skips the SAW voltage-control init (VCTL / PMIC_DATA_3 = the CPU rail's VSET). Same warning: this is what stock's spm-regulator does at probe and the wake needs it. |
 | `-DSMP_PARK_CPU23` | Tries to boot cores 2 and 3 into TrustZone power collapse. Resets the C2 on release. Do not pass. |
@@ -496,6 +509,85 @@ measuring the sleep floor.
 | `-DSLEEP_PAS_KILL_RADIO` | The old sleep path that shut Pronto down through PAS before sleeping. It leaves a ghost RPM master holding the 3.3 V PA rail; the radio now idles resident instead. Do not pass. |
 | `-DPC_TRACE` | One flash write per power-collapse breadcrumb during the first attempts of a boot. Bring-up only. |
 | `-DUSB_LOG_V2` / `-DUSB_IRQ_WAKE` | The reworked USB console (tail-first replay, host commands) and USB-as-wake-source. Both broke the live log when tried; off. |
+| `-DSLEEP_BATT_DIAG` | Suspends the charger input during sleep and logs cell voltage + STC3117 current every ~2 s of sleep. It used to be required (without it the watch rebooted entering deep sleep after the gauge-restart change); since the measurement rework the watch sleeps and wakes fine without it, so it is now a measurement flag only. Verified on both the C2 and the S2. |
+| `-DSLEEP_FLOOR_STEP_MS=<ms>` | How long each `-DSLEEP_FLOOR` step is held and measured. Default `6000`. |
+| `-DSLEEP_RAILS_OFF=<mask>` | Which PMIC rails are switched off for each deep sleep and back on first thing at wake. **Default `0x21840` (`l6` `l11` `l12` `l17`)**, inherited from `boards/ticwatch_c2.h`; `-DSLEEP_RAILS_OFF=0` keeps every rail on. See below. |
+| `-DPLAT_PANEL_MADCTL=<v>` | Panel orientation written after the wake-time panel re-init. **The S2 uses `0x00`** (`boards/ticwatch_s2.h`); the C2's `0xC0` turns the S2's picture upside down. |
+| `-DNO_AUTO_REBOOT` | Disarms the APPS watchdog completely (only when `-DWDOG_TRACE` is **not** passed). For bench sessions where nothing should reset the watch; a hang then needs a forced power-off. |
+
+#### Switching individual rails off: `-DSLEEP_RAILS_OFF`
+
+Release builds switch the rails in this mask off at sleep entry and vote them
+back on at wake before anything else starts (a display rail must be up before
+the panel is turned back on). **By default `l6`, `l11`, `l12` and `l17` are
+cut** (`0x21840`, confirmed on the C2 and the S2): `l6` is the panel DDIC's vddio and the
+wake path re-initialises the panel (reset pulse, stock on-command table,
+brightness and MADCTL; the S2 restores MADCTL `0x00`, not the C2's `0xC0`, see
+below) whenever bit 6 is set; `l11` is the touch controller's
+supply, which the wake reset pulse brings back from power-on. The goal is to
+end up with the same set of rails off as the stock C2+. The code is in
+`platform/sleep_floor.c`; without `-DSLEEP_FLOOR` only the rail switching
+runs, and it prints only when a vote fails.
+
+Rails not in the table: `l1`, `l4`, `l10` and `l14` have no consumer in the
+stock tree, identical on the C2 and S2 (the old measurement ladder found nothing to save on them), and
+`l15` is always-on. The IMU and heart-rate sensor are not in the tree, so which
+rail feeds them is unknown; steps kept counting with the default set cut.
+
+The mask is split: **bits 0–23 are LDOs** (bit N = `lN`), **bits 24–31 are
+SMPS bucks** (bit 24+N = `sN`). Only rails listed in the probe table can be
+switched, because each needs a known restore voltage:
+
+| Rail | Bit | Mask | Restore | Status |
+|---|---|---|---|---|
+| `l6`  | 6  | `0x40`       | 1.80 V | Works; **switched off by default**. It is the panel DDIC's vddio, so the panel returns at power-on defaults; wake runs the panel re-init + MADCTL restore (`0x00` on the S2) automatically when bit 6 is set. |
+| `l11` | 11 | `0x800`      | 2.95 V | Works; **switched off by default**. FocalTech touch vdd (+ tpiu/qpdi); touch returns via the wake reset pulse. |
+| `l12` | 12 | `0x1000`     | 1.80 V | Works; **switched off by default**. tpiu/qpdi vdd-io (the SD slot on it is disabled). |
+| `l17` | 17 | `0x20000`    | 2.85 V | Works; **switched off by default**. Only disabled touch nodes use it. |
+| `l18` | 18 | `0x40000`    | 2.70 V | Not tested. DSI controller vdd: the panel re-init does not cover the controller, so risky. |
+| `s3`  | 27 | `0x8000000`  | 1.30 V | Vote is lost: Pronto holds it for the resident radio |
+
+To change the set, pass the whole mask. Combine bits by adding them, e.g. the default plus `l18` = `0x61840`:
+
+```sh
+CFLAGS_EXTRA="<release flags> -DSLEEP_RAILS_OFF=0x61840" sh build-owf-image-s2.sh
+```
+
+**Orientation after the panel re-init.** The S2 uses the same panel and
+on-command table as the C2, but the panel is mounted the other way round. The
+C2 needs MADCTL `0xC0` (a 180° flip) to come back upright. With that value the
+S2 woke upside down, with touch unaffected, so the S2 header sets
+`PLAT_PANEL_MADCTL` to `0x00`. If a unit ever wakes mirrored rather than
+rotated, try `-DPLAT_PANEL_MADCTL=0x40` or `0x80`.
+
+If a vote fails, the log prints `rails: lN still on` or `off vote failed`. If
+a rail turns out to be needed by the panel, the watch wakes to a dark screen
+and needs a power cycle; that isn't a brick, and the USB log still comes out.
+In a `-DSLEEP_FLOOR` build the same mask is applied by the measurement ladder
+instead, which logs every rail (`after vote en=... (off)`) but keeps the watch
+awake about 50 s before each collapse; `-DSLEEP_FLOOR_SKIP=<mask>` skips its
+steps (bit 0 DDR, 1 PLL, 2 LDO group A, 3 LDO group B, 4 CX, 5 USB, 6 SMPS
+mode, 7 l9/s3) and `-DSLEEP_FLOOR_STEP_MS` shortens each one.
+
+### Tunables
+
+Values with a default in the source; override with `-DNAME=<value>`.
+
+| Flag | Default | What it sets |
+|---|---|---|
+| `-DMSS_OPEN_MASK=<mask>` | `0x6D` (inherited from `boards/ticwatch_c2.h`) | SMD channels opened to the modem; leave alone (see above) |
+| `-DFB_IDLE_MS=<ms>` | `500` | Idle frame refresh interval that keeps the display controller fed |
+| `-DHR_PAH_LED_DAC=<n>` | `0x36` | Starting green-LED drive of the PAH8011 heart-rate sensor |
+| `-DUSB_LOG_TAIL=<bytes>` | `16384` | How much recent log a fresh USB console connection replays |
+| `-DUSB_IN_STUCK_MS=<ms>` | `5000` | After this long a stuck USB log transfer is flushed and re-sent |
+
+`platform/mss_apr.c` also carries the modem-DSP audio flags (`AUDIO_*`, e.g.
+`AUDIO_DSP_AFTER_MODEM`, `AUDIO_DSP_PER_SOUND`, `AUDIO_TONE_GAIN`,
+`AUDIO_IDLE_MS`, `AUDIO_LEAD_MS`). They were developed for other watches and
+have not been tested on the S2.
+
+`-DUSE_SYS_SUSPEND` and `-DUSE_CPU_PC` have **no effect** on this build: the
+S2 build script always passes `-DUSE_CPU_PC_8909`, which takes precedence.
 
 ### Diagnostics
 
@@ -522,6 +614,33 @@ storage mounted, DDR size, the sleep entry/exit census, update progress).
 > **Never add an unconditional print to a per-frame path.** It wraps the 64 KB
 > ramlog faster than the 1 Hz flush can drain it, and the log becomes one line
 > repeated forever.
+
+### What the script sets for you
+
+`CFLAGS_EXTRA` is *added to* a fixed set that `build-owf-image-s2.sh` puts on every compile
+line. You never pass these and you cannot omit them:
+
+| Define | What it selects |
+|---|---|
+| `-DPLAT_BOARD_TICWATCH_C2 -DPLAT_BOARD_TICWATCH_S2` | Pulls in `baremetal/boards/ticwatch_s2.h`: the PMIC blocks, panel, touch, rails and board defaults such as `MSS_OPEN_MASK`. |
+| `-DBOARD_SELECT=BOARD_ID_TICWATCH_S2` | Picks `OpenWatchFace/board_ticwatch_s2.h` on the app side. The app never sees the `PLAT_` headers, so the board is named twice. |
+| `-DUSE_CPU_PC_8909` | Compiles the CPU power-collapse entry points. |
+| `-DLV_CONF_INCLUDE_SIMPLE` | LVGL takes its config from this repo's `lv_conf.h`. |
+| `-DOWF_APP` | `main.c` builds the real app entry instead of `ui_demo.c`. |
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OWF_PUBLIC` | unset (`0`) | `1` strips `wcnss_mac` from the NV object; see [Publishing](#publishing-an-image-strip-your-mac-first). Use it for anything you hand to someone else. |
+| `CFLAGS_EXTRA` | empty | The flag set above. **Empty means a watch that warm-resets every few seconds**: `-DWDOG_TRACE` lives here, not in the script. |
+| `OWF_S2_FW` | `../firmware/s2`, else the first `../firmware/s2-*` with a `wcnss_nv.c` | Which watch's NV blob to compile in. The build prints the directory it picked (`[owf] NV blob from ...`). |
+| `LVGL_DIR` | this repo's `libraries/lvgl`, else `~/Arduino/libraries/lvgl` | Where LVGL comes from. |
+| `CROSS` | `arm-none-eabi-` | Toolchain prefix. |
+
+> **LVGL is cached per build directory.** `liblvgl-owf.a` is built once and
+> reused; changing `LVGL_DIR` or an LVGL config afterwards has no effect until
+> you delete it.
 
 ---
 
@@ -570,7 +689,7 @@ storage mounted, DDR size, the sleep entry/exit census, update progress).
   gauge/charger rails kept in low-power mode, crystal released), then issues
   TERMINATE_PC with the GDHS flag from core 0. TrustZone warm-boots core 0 on
   the PMIC interrupt. The reference for all of it was a rooted stock C2+ over
-  adb; the findings are in `snapdragon-port/notes/C2PLUS-FINDINGS.md`.
+  adb.
 - **The pusher occasionally needs a second press to wake the C2**; the Gen 4
   never does. Open item, on the PMIC interrupt side.
 - **NFC is not touched.** The ST21NFC node exists in the tree and nothing in

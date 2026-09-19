@@ -663,6 +663,15 @@ static uint32_t lastMillis = 0;
 #include "notif_icons.h"        // per-category notification icons (MDI font; built-in fallback)
 #if BOARD_HAS_BLE
 #include "ble_provision.h"      // BLE peripheral: encrypted WiFi provisioning + find-phone (lazy; off in sleep)
+/* Radio hook for the snapdragon-port sleep path (suspend_msm.c, weak symbol): at sleep entry the
+ * platform powers the WCNSS off completely (WiFi + BLE share it) and asks us to take BLE down first;
+ * on wake it brings the radio back and asks us to restore BLE if it was up. WiFi reconnects on
+ * demand through the normal app path. Harmless on the ESP32 boards (nothing calls it). */
+extern "C" void owf_radio_sleep_hook(int entering) {
+  static bool ble_was_up = false;
+  if (entering) { ble_was_up = ble_is_up(); if (ble_was_up) ble_end(); }
+  else if (ble_was_up) { ble_was_up = false; ble_begin(); }
+}
 #elif BOARD_PLATFORM_TUYA
 #define BLE_TUYA_HAVE_ANCS 1    // Phase B: suppress ble_tuya.h/ble_notif_flags_tuya.h's inert ANCS
                                 // stubs; the real client (tuya/ble_ancs_tuya.h) is included after
@@ -712,6 +721,10 @@ static uint8_t      rails_cut_count(void);
 #include "crown_nav.h"          // rotating crown -> scroll / quick-shade (BOARD_HAS_CROWN only;
                                 // whole file preprocesses away without a crown). AFTER app_timer.h:
                                 // it reads g_alarm_active, and after quick_shade.h/app_menu.h.
+#include "button_actions.h"     // extra side pushers -> rebindable actions + flashlight
+                                // (BOARD_HAS_EXTRA_BUTTONS only; same include-order needs)
+#include "swipe_back.h"         // left-edge swipe = back (wraps the touch indev; after
+                                // app_menu.h/quick_shade.h/app_timer.h/button_actions.h)
 #include "app_find_phone.h"     // Find My Phone: ring the paired phone (uses ble_ping_phone)
 #include "app_files.h"          // Files: on-device browser for FFat + SD (view/delete/space)
 #include "app_gallery.h"        // Gallery: browse photos/videos on SD + FFat (any PSRAM board
@@ -789,6 +802,149 @@ static void notif_card_create(void) {
   lv_obj_add_flag(notif_card, LV_OBJ_FLAG_HIDDEN);  // hidden until a notif arrives
 }
 
+/* ===================== In-app notification badge + deferred card ============
+ * The popup card lives on lv_scr_act() (the watch face), while menus and apps are
+ * built on lv_layer_top() — so while an app is open the card would be BEHIND it and
+ * invisible even if we showed it. That is why it is suppressed there, and it is also
+ * why the in-app indicator cannot simply be the card: it has to live on
+ * lv_layer_sys(), the same layer the quick shade and alarm use, which is the only
+ * layer that is reliably above an open app.
+ *
+ * Behaviour: a notification arriving while an app is open RINGS this badge (a short
+ * shake, like a bell being struck) and is REMEMBERED. When you leave the app and get
+ * back to the watch face, the card you missed pops then — late, but not lost. */
+static lv_obj_t *notif_badge      = nullptr;
+static lv_obj_t *notif_badge_cnt  = nullptr;
+
+/* The notification that arrived while an app was open, waiting for the watch face. */
+static uint64_t s_defer_id = 0;
+static char     s_defer_title[NOTIF_TITLE_MAX];
+static char     s_defer_body[NOTIF_BODY_MAX];   /* s_pop_body isn't declared yet here
+                                                 * (notif_net.h comes later) — this is
+                                                 * the store's own bound, same size. */
+static bool     s_defer_have = false;
+
+/* Shake driver: LVGL animates this value, the callback applies it as a translate.
+ * A separate variable (not the object) so the anim can be cancelled by var. */
+static int32_t  s_badge_shake = 0;
+static void notif_badge_shake_cb(void *var, int32_t v) {
+  (void)var;
+  s_badge_shake = v;
+  if (notif_badge) lv_obj_set_style_translate_x(notif_badge, v, 0);
+}
+
+/* Build the badge, hidden. Round panels: the top-right corner is OFF GLASS, so the
+ * x offset is clamped against the circle at the badge's TOP edge — in the top half of
+ * a round display the top edge is the NARROWEST row the object covers, so that is the
+ * row that decides whether it is clipped. (Same geometry the on-screen keyboard's
+ * Cancel X needed; predicting a "safe-looking" inset does not work.) */
+static void notif_badge_create(void) {
+  const int bw = UI_PX(62), bh = UI_PX(30);
+  notif_badge = lv_obj_create(lv_layer_sys());
+  lv_obj_set_size(notif_badge, bw, bh);
+  lv_obj_set_style_bg_color(notif_badge, lv_color_hex(0x1A1A1A), 0);
+  lv_obj_set_style_bg_opa(notif_badge, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(notif_badge, lv_color_hex(WF_BELL_UNREAD), 0);
+  lv_obj_set_style_border_width(notif_badge, UI_PX(2), 0);
+  lv_obj_set_style_radius(notif_badge, bh / 2, 0);
+  lv_obj_set_style_pad_all(notif_badge, 0, 0);
+  lv_obj_clear_flag(notif_badge, LV_OBJ_FLAG_SCROLLABLE);
+  /* Not clickable: it floats over whatever app you are using, and swallowing a
+   * touch there would be worse than the badge is useful. */
+  lv_obj_clear_flag(notif_badge, LV_OBJ_FLAG_CLICKABLE);
+
+  const int top_y = UI_PX(34);
+  int dx = (int)screenWidth / 6;                 /* nominal top-right offset */
+#if BOARD_SCREEN_ROUND
+  {
+    const int R = (int)screenWidth / 2;
+    const int dy = R - top_y;                    /* top edge: the narrowest row */
+    int v = R * R - dy * dy, half = 0;
+    while ((half + 1) * (half + 1) <= v) half++; /* integer sqrt */
+    const int max_dx = half - bw / 2 - UI_PX(4); /* keep the whole badge inside */
+    if (dx > max_dx) dx = max_dx;
+    if (dx < 0) dx = 0;
+  }
+#endif
+  lv_obj_align(notif_badge, LV_ALIGN_TOP_MID, dx, top_y);
+
+  lv_obj_t *ic = lv_label_create(notif_badge);
+  lv_obj_set_style_text_font(ic, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ic, lv_color_hex(WF_BELL_UNREAD), 0);
+  lv_label_set_text(ic, LV_SYMBOL_BELL);
+  lv_obj_align(ic, LV_ALIGN_LEFT_MID, UI_PX(8), 0);
+
+  notif_badge_cnt = lv_label_create(notif_badge);
+  lv_obj_set_style_text_font(notif_badge_cnt, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(notif_badge_cnt, lv_color_white(), 0);
+  lv_label_set_text(notif_badge_cnt, "1");
+  lv_obj_align(notif_badge_cnt, LV_ALIGN_RIGHT_MID, -UI_PX(8), 0);
+
+  lv_obj_add_flag(notif_badge, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void notif_badge_hide(void) {
+  if (!notif_badge) return;
+  lv_anim_del(&s_badge_shake, nullptr);
+  s_badge_shake = 0;
+  lv_obj_set_style_translate_x(notif_badge, 0, 0);
+  lv_obj_add_flag(notif_badge, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Show the badge with the live unread count and ring it (shake left/right a few
+ * times). Called instead of the card while an app is open. */
+static void notif_badge_ring(void) {
+  if (!notif_badge) return;
+  store_lock();
+  uint32_t u = notif_unread();
+  store_unlock();
+  if (u > 999) lv_label_set_text(notif_badge_cnt, "999+");
+  else         lv_label_set_text_fmt(notif_badge_cnt, "%u", (unsigned)u);
+  lv_obj_clear_flag(notif_badge, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(notif_badge);
+
+  lv_anim_del(&s_badge_shake, nullptr);          // a second arrival restarts the ring
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, &s_badge_shake);
+  lv_anim_set_exec_cb(&a, notif_badge_shake_cb);
+  lv_anim_set_values(&a, -UI_PX(5), UI_PX(5));
+  lv_anim_set_duration(&a, 70);
+  lv_anim_set_reverse_duration(&a, 70);          // out and back = one wobble
+  lv_anim_set_repeat_count(&a, 4);               // ~560 ms of ringing, then it rests
+  lv_anim_start(&a);
+}
+
+/* Remember a notification that arrived while an app was open, and ring the badge.
+ * The newest one wins: if three land while you are in an app you get one card on
+ * return (the latest) plus a badge count showing the real unread total. */
+static void notif_defer(uint64_t id, const char *title, const char *body) {
+  /* IN THE NOTIFICATIONS APP: record it, but do not ring the badge. The badge
+   * announces something you cannot see from where you are; in this one app you
+   * are looking straight at the list, so it is noise. Every other app still
+   * gets it. (The card is still deferred: the list is built at open time, so an
+   * arrival while you are reading is not necessarily on screen, and the card on
+   * the way back to the face is what makes sure it is not missed.) */
+  const bool in_notif_app = notif_app_is_open();
+  s_defer_id = id;
+  strncpy(s_defer_title, title ? title : "", sizeof(s_defer_title) - 1);
+  s_defer_title[sizeof(s_defer_title) - 1] = '\0';
+  strncpy(s_defer_body, body ? body : "", sizeof(s_defer_body) - 1);
+  s_defer_body[sizeof(s_defer_body) - 1] = '\0';
+  s_defer_have = true;
+  if (!in_notif_app) notif_badge_ring();
+}
+
+/* Present a notification the right way for wherever the UI currently is: the card on
+ * the watch face, the ringing badge (card deferred) inside an app. Used by the wake
+ * paths, which can land with an app still open — on the Fossil watches a suspend
+ * resumes IN PLACE, so whatever was on screen before the sleep is still on screen. */
+static void notif_show(uint64_t id, const char *title, const char *body);  /* below */
+static void notif_present(uint64_t id, const char *title, const char *body) {
+  if (app_menu_is_open()) notif_defer(id, title, body);
+  else                    notif_show(id, title, body);
+}
+
 /* Id of the notification currently shown on the popup card (0 = none). A tap
  * dismiss removes that entry from the stored list too. */
 static uint64_t notif_card_id = 0;
@@ -810,6 +966,7 @@ static void notif_show(uint64_t id, const char *title, const char *body) {
   lv_obj_clear_flag(notif_card, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(notif_card);
   audio_notify_ding();   // single short note (mute-aware; silent while the alarm rings)
+  haptics_notify();      // buzz twice — on the Wear 2100 watches (no speaker) this IS the alert
 }
 
 /* Hide the pop-up card from the watch face. This ONLY dismisses the card off the
@@ -1693,6 +1850,13 @@ void setup() {
   core_selftest_capture_golden();
 #endif
   settings_apply_cpu_mhz(s_cpu_mhz);   // apply saved CPU speed early (affects all paths)
+#if BOARD_HAS_CPU_UNDERVOLT
+  // Manual core-rail undervolt, if the user set one. AFTER the clock, because the
+  // offset rides on the CPR corner the selected frequency picks. Gated by the same
+  // survived-boot flag the T5 overclock uses: an offset that hangs the watch is
+  // discarded on the next boot instead of hanging it again.
+  settings_uv_boot_apply();
+#endif
 #if BOARD_PLATFORM_TUYA
   // Persistent DPLL overclock, if enabled. Gated by a survived-boot flag: if the last
   // OC boot hung before settings_oc_boot_ok(), this auto-disables it. Applied AFTER the
@@ -2216,6 +2380,10 @@ void setup() {
   // bus healthy. Bringing the IMU up BEFORE touch (the earlier bug) corrupted the bus
   // and made FT3168->begin() fail with ESP_ERR_INVALID_STATE. Single-threaded here, so
   // no i2c_lock yet. Non-fatal: a missing IMU just disables the Fitness step count.
+  /* Marker index past every k_stage_sec table, so this is a no-op on the boards that still use
+   * the bisect ladder and a watchdog-window refresh on the Gen 5, where the sensor probes below
+   * are the longest un-petted stretch left in setup(). */
+  OWF_STAGE(90);
   i2c_lock();   // hold the shared bus across IMU bring-up so touch ISR reads can't interleave
   bool imu_ok = imu_steps_begin();
   i2c_unlock();
@@ -2223,6 +2391,7 @@ void setup() {
   else        USBSerial.println("[imu] IMU not found - step counting disabled");
   if (hr_sensor_begin()) USBSerial.println("[hr] heart-rate sensor ready");
   else                   USBSerial.println("[hr] no heart-rate sensor - Heart app disabled");
+  OWF_STAGE(91);   /* the probes are the slowest part of setup(); refresh before the rest */
 
   // Restore the persisted step total from NVS. RTC memory survives a deep-sleep TIMER wake,
   // but a full power-off (and on the C6, the RST-button wake) wipes it — NVS is the durable
@@ -2534,6 +2703,7 @@ void setup() {
 
   watchface_create();
   notif_card_create();
+  notif_badge_create();   // in-app indicator (lv_layer_sys, above open apps)
   // app_menu_init() is now LAZY — built on the first app_menu_open() (a BOOT press),
   // not at boot, so the watch face paints sooner. The quick shade stays eager: it's
   // opened by a pull-down drag on its own (top-parked) object, which must already
@@ -2555,7 +2725,7 @@ void setup() {
   // the UI exists. The fetch (during the light check) stashed the newest in
   // s_pop_* regardless of whether it went to flash or the SD archive.
   if (pending_notif && s_pop_have) {
-    notif_show(s_pop_id, s_pop_title, s_pop_body);
+    notif_present(s_pop_id, s_pop_title, s_pop_body);
     pending_notif = false;
   }
 
@@ -2748,6 +2918,20 @@ static int lastMinuteShown = -1;  // -1 = nothing drawn yet
 static uint32_t lastBattMs = 0;   // battery + voltage + bell poll timer (10s, partial redraw)
 static uint32_t lastNotifMs = 0;  // notification fetch timer
 
+/* ELAPSED SINCE, wrap-proof (2026-09-11). loop() samples `ms` once at the top,
+ * but lastActivityMs is also stamped with a LATER millis() inside the same
+ * iteration -- by touch handlers during the LVGL call, and above all by the
+ * resume-in-place wake on the Snapdragon and T5 watches, where
+ * enter_deep_sleep() RETURNS after the whole sleep. `ms - lastActivityMs` then
+ * wraps to ~4e9 and reads as "idle for 49 days": the dim fired and the idle
+ * check put the watch straight back to sleep. That was the "first press only
+ * flashes the screen on battery" bug on every non-ESP32 watch (on USB both the
+ * dim and the idle sleep are gated off, so it woke normally). A stamp newer than
+ * the sample means no time has passed. */
+static inline uint32_t elapsed_since(uint32_t now, uint32_t stamp) {
+  return (now >= stamp) ? (now - stamp) : 0u;
+}
+
 void loop() {
   uint32_t ms = millis();
   bool dirty = false;  // did anything visible change?
@@ -2777,6 +2961,12 @@ void loop() {
   #define LOOP_TRACE(tag) do {} while (0)
 #endif
   LOOP_TRACE("entered");
+#if BOARD_HAS_CPU_UNDERVOLT
+  // Survived-boot confirm for the manual undervolt: a few seconds of main loop is
+  // enough to call this boot healthy, so clear the arm and let the offset persist.
+  static bool s_uv_boot_confirmed = false;
+  if (!s_uv_boot_confirmed && ms > 5000) { settings_uv_boot_ok(); s_uv_boot_confirmed = true; }
+#endif
 #if BOARD_PLATFORM_TUYA
   // Survived-boot confirm for the persistent overclock: once we've run a few seconds in
   // the main loop, this boot is healthy -> clear the arm so the OC stays for next boot.
@@ -2845,12 +3035,16 @@ void loop() {
         s_woke_from_boot = true;
         bootLastTap = 0;
         bootDown = true;
+#if BOARD_HAS_EXTRA_BUTTONS
+        button_actions_after_wake();
+#endif
 #endif
 #if BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
         lastActivityMs = millis();        // woke: fresh stamp (millis, not stale ms) = fresh idle period
+        ms = lastActivityMs;              // and the rest of THIS iteration must not use the pre-sleep sample
         dirty = true;
         if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
-          notif_show(s_pop_id, s_pop_title, s_pop_body);
+          notif_present(s_pop_id, s_pop_title, s_pop_body);
           pending_notif = false;
         }
 #endif
@@ -2859,6 +3053,7 @@ void loop() {
         // open, BOOT just closes it; otherwise it does the usual one-level back.
         bootLastTap = ms;
         if (g_alarm_active)        alarm_dismiss();   // ringing -> BOOT silences it
+        else if (flashlight_is_on()) flashlight_off(); // lit flashlight -> BOOT turns it off
 #if BOARD_HAS_NAV_BUTTONS
         else if (button_nav_handle_boot()) {}         // slider edit mode -> BOOT only deselects
 #endif
@@ -2881,6 +3076,16 @@ void loop() {
   if (button_nav_poll(ms)) {
     lastActivityMs = ms;        // fresh idle/dim period
     s_boot_activity = true;     // force-undim on the idle->active edge (same heal as BOOT)
+    dirty = true;
+  }
+#endif
+
+#if BOARD_HAS_EXTRA_BUTTONS
+  // Extra side pushers (button_actions.h): short/long press -> the bound action.
+  // Polled with the other physical inputs; any edge is real user activity.
+  if (button_actions_poll(ms)) {
+    lastActivityMs = ms;
+    s_boot_activity = true;
     dirty = true;
   }
 #endif
@@ -2939,6 +3144,8 @@ void loop() {
   // (The old touch/activity screen-wake block is REMOVED with the panel-off light-sleep
   // state: while deep-asleep the chip is off — nothing runs, and waking is a reboot.)
 #endif
+
+  sb_install();   // edge-swipe back: wrap the touch indev once it exists (no-op after)
 
   // Service LVGL (timers, input) every loop — AFTER the BOOT check so the button
   // is always polled first and never delayed by render/touch work.
@@ -3162,6 +3369,25 @@ void loop() {
     }
   }
 
+  // Back on the watch face after being in an app: deliver the card that was deferred
+  // while the app had the screen. Late, but not lost — the badge rang at the time, this
+  // is the detail behind it. Edge-triggered on the app->face transition so it fires once.
+  {
+    static bool was_in_app = false;
+    const bool in_app = app_menu_is_open();
+    if (was_in_app && !in_app) {
+      notif_badge_hide();                 // the face has its own bell; the badge is done
+      if (s_defer_have && !sleep_track_active()) {
+        s_defer_have = false;
+        notif_show(s_defer_id, s_defer_title, s_defer_body);
+        lastActivityMs = ms;              // keep the screen up long enough to read it
+        dirty = true;
+      }
+      s_defer_have = false;               // dropped if DND: the bell count still has it
+    }
+    was_in_app = in_app;
+  }
+
   // Consume a finished fetch result (set by the network task). All LVGL happens
   // HERE on the loop/core-1 side — the task never touches the UI.
   if (s_net_result_ready) {
@@ -3177,9 +3403,19 @@ void loop() {
       store_unlock();
       // Sleep-mode DND: never pop a notification card or bump activity (that would keep
       // the screen lit while you sleep -> battery drain). The bell count still updates.
-      if (have && !app_menu_is_open() && !sleep_track_active()) {
-        notif_show(id, ct, cb);
-        lastActivityMs = ms;             // keep screen awake to read it
+      // The ALERT and the CARD have different gates. Sleep-mode DND suppresses both.
+      // A menu being open suppresses only the card (yanking the UI out from under you
+      // mid-app would be worse than the notification is urgent) — but the buzz still
+      // fires, because on a speakerless watch it is the only thing telling you anything
+      // arrived at all, and it costs the open app nothing.
+      if (have && !sleep_track_active()) {
+        if (app_menu_is_open()) {
+          haptics_notify();              // buzz + ring the badge; the card waits for
+          notif_defer(id, ct, cb);       // the watch face rather than being lost
+        } else {
+          notif_show(id, ct, cb);        // fires haptics_notify() itself
+          lastActivityMs = ms;           // keep screen awake to read it
+        }
       }
       watchface_refresh_bell();           // refresh unread count either way
       dirty = true;
@@ -3204,9 +3440,14 @@ void loop() {
     if (have) { strcpy(act, s_pop_title); strcpy(acb, s_pop_body); }
     store_unlock();
     // Sleep-mode DND: suppress the popup + activity bump (same as the fetch path above).
-    if (have && !app_menu_is_open() && !sleep_track_active()) {
-      notif_show(id, act, acb);
-      lastActivityMs = ms;                // wake the screen so it can be read
+    if (have && !sleep_track_active()) {
+      if (app_menu_is_open()) {
+        haptics_notify();
+        notif_defer(id, act, acb);        // ring the badge; card pops on the way back
+      } else {
+        notif_show(id, act, acb);
+        lastActivityMs = ms;              // wake the screen so it can be read
+      }
     }
     watchface_refresh_bell();
     dirty = true;
@@ -3338,7 +3579,7 @@ void loop() {
     static bool     s_undim_healing = false;   // re-asserting full brightness across a wake?
     static uint32_t s_undim_edge_ms = 0;       // ms of the idle->active edge being healed
     static uint32_t s_undim_last_ms = 0;       // last re-assert write (throttle)
-    bool idle_now = (ms - lastActivityMs) > (DIM_IDLE_MS / 2);   // "quiet" if past half the dim timer
+    bool idle_now = elapsed_since(ms, lastActivityMs) > (DIM_IDLE_MS / 2);   // "quiet" if past half the dim timer
     if (fresh_activity && s_was_idle) {        // woke from quiet (touch OR BOOT) -> open a heal window
       s_undim_healing = true;
       s_undim_edge_ms = ms;
@@ -3401,13 +3642,15 @@ void loop() {
   // back-to-back on each press, racing the brightness QSPI command against the LVGL flush and
   // occasionally dropping it (the "BOOT sometimes desyncs the dim" symptom). Idle dimming is for
   // the QUIET clock face only. (The idle-SLEEP timeout still applies; this only blocks the dim.)
-  if (app_menu_is_open() || quick_shade_is_open()) lastActivityMs = ms;
+  if (app_menu_is_open() || quick_shade_is_open() || flashlight_is_on()) lastActivityMs = ms;
 
   bool usb_blocks = usb_connected && !settings_get_dim_on_usb();
   bool dim_now = settings_get_autodim() && !usb_blocks && !s_caffeine &&
-                 !g_alarm_active && !ble_overlay &&
-                 (ms - lastActivityMs > DIM_IDLE_MS);
-  settings_dim_set(dim_now);              // panel brightness drop (any screen)
+                 !g_alarm_active && !ble_overlay && !flashlight_is_on() &&
+                 (elapsed_since(ms, lastActivityMs) > DIM_IDLE_MS);
+  if (!flashlight_is_on()) settings_dim_set(dim_now);   // panel brightness drop (any screen);
+                                          // skipped while lit: it would restore the user's level
+  flashlight_tick(ms);                    // keeps a lit flashlight at 255 + its auto-off
 
   // Deep-dim "minimal face": on top of the brightness drop, blank everything on
   // the WATCH FACE except the center clock — on AMOLED a black pixel is OFF, so
@@ -3436,19 +3679,23 @@ void loop() {
 
   if (s_caffeine) {                      // caffeine = stay awake, don't even count toward sleep
     lastActivityMs = ms;
-  } else if (!usb_connected && ms - lastActivityMs > IDLE_SLEEP_MS) {
+  } else if (!usb_connected && elapsed_since(ms, lastActivityMs) > IDLE_SLEEP_MS) {
     USBSerial.printf("[power] sleep reason: idle (ms=%lu lastActivity=%lu idle_ms=%lu millis=%lu)\n",
                      (unsigned long)ms, (unsigned long)lastActivityMs, (unsigned long)IDLE_SLEEP_MS, (unsigned long)millis());
     enter_deep_sleep();  // ESP/Maix: does not return. T5/Fossil: blocks in suspend, returns on button wake.
 #if BOARD_PLATFORM_FOSSIL
     s_woke_from_boot = true;   // swallow the still-held wake press (see the double-tap path)
+#if BOARD_HAS_EXTRA_BUTTONS
+    button_actions_after_wake();   // same for a side pusher that woke us
+#endif
     bootLastTap = 0;
     bootDown = true;
 #endif
 #if BOARD_PLATFORM_TUYA || BOARD_PLATFORM_FOSSIL
     lastActivityMs = millis(); // woke: fresh stamp (the block lasted the whole sleep) = fresh idle period
+    ms = lastActivityMs;       // rest of this iteration: post-wake time, not the pre-sleep sample
     if (pending_notif && s_pop_have) {   // dark background check woke us with a new item
-      notif_show(s_pop_id, s_pop_title, s_pop_body);
+      notif_present(s_pop_id, s_pop_title, s_pop_body);
       pending_notif = false;
     }
 #endif

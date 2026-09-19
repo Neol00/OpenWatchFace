@@ -95,6 +95,55 @@ uint32_t ramlog_written(void)
     return RL->wrapped ? (RL_CAP + RL->head) : RL->head;
 }
 
+/* Copy the last bytes of the CURRENT boot's log into `out` (NUL terminated).
+ * Same idea as the previous-boot version below, for the case where the thing
+ * you need to read happened THIS boot and the cable cannot tell you -- e.g.
+ * whether usb_dev_init() reported "clocks failed" or "controller not
+ * responding", which is unreadable over a console that did not come up. */
+uint32_t ramlog_tail_buf(char *out, uint32_t max)
+{
+    if (!out || max < 2u) return 0;
+    uint32_t n = max - 1u;
+    uint32_t have = RL->wrapped ? RL_CAP : RL->head;
+    if (n > have) n = have;
+    uint32_t pos = (RL->head + RL_CAP - n) % RL_CAP;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        char c = RL->buf[(pos + i) % RL_CAP];
+        if (c) out[k++] = c;
+    }
+    out[k] = 0;
+    return k;
+}
+
+/* Copy the last `n` bytes of the PREVIOUS boot's log into `out` (NUL
+ * terminated), returning the length. Same data as ramlog_prev_tail() below,
+ * but to a buffer instead of the console -- which is what makes it usable on
+ * the Gen 4 and Gen 5, where the console has nowhere to go and the only way
+ * to READ a log is to render it on the panel (gfx_text.c fb_text_dump).
+ *
+ * This is the readback the file header describes as "dumping the region around
+ * __ramlog_start", done from inside the firmware instead of over a debugger.
+ * It works across a forced reboot because .ramlog is NOLOAD at 0x814ab000,
+ * about 18 MB above where aboot loads a boot image -- so the next image booted
+ * to look at the log does not sit on top of it. */
+uint32_t ramlog_prev_tail_buf(char *out, uint32_t max)
+{
+    if (!out || max < 2u) return 0;
+    if (!s_had_previous) { out[0] = 0; return 0; }
+    uint32_t n = max - 1u;
+    if (n > RL_CAP) n = RL_CAP;
+    if (!RL->wrapped && n > s_prev_head) n = s_prev_head;
+    uint32_t pos = (s_prev_head + RL_CAP - n) % RL_CAP;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        char c = RL->buf[(pos + i) % RL_CAP];
+        if (c) out[k++] = c;
+    }
+    out[k] = 0;
+    return k;
+}
+
 /* Print the last `n` bytes the PREVIOUS boot logged (before this boot's
  * "--- reboot ---" marker). Only meaningful when ramlog_had_previous(). */
 void ramlog_prev_tail(uint32_t n)

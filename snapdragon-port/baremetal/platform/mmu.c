@@ -59,11 +59,25 @@ void mmu_enable_flat(void)
      * framebuffer lives, and the display path may legitimately read it. It
      * does sit inside the range our heap could reach, which is the reason
      * PLAT_DDR_SAFE_END exists — keep allocations below it. */
+    /* CORRECTION (2026-09-10): "a property of the SoC's memory map rather than
+     * of either watch" is WRONG. It held for the Gen 4 and the C2 because their
+     * trees happen to match; the Fossil Gen 5's own tree (triggerfish-stock.dts)
+     * puts every region somewhere else -- external_image 0x87A00000 + 6 MB,
+     * modem_adsp 0x88000000 + 0x2300000, pheripheral 0x8A300000 + 6 MB, and no
+     * ramoops. With this table the Gen 5's WCNSS region top (0x8A6-0x8A8) was
+     * mapped NORMAL: cached, executable. The firmware loader wrote it through
+     * the D-cache and TrustZone hashed physical DDR, so pas_auth_and_reset
+     * failed whenever those lines had not been flushed -- 4 attempts in 5 on
+     * hardware. A board whose tree differs supplies PLAT_MMU_HOLES_8909. */
     static const struct { uint32_t first_mb, last_mb; } k_msm8909_holes[] = {
+#if defined(PLAT_MMU_HOLES_8909)
+        PLAT_MMU_HOLES_8909
+#else
         { 0x87B, 0x87F },   /* external_image  */
         { 0x880, 0x8A0 },   /* modem + adsp    */
         { 0x8A1, 0x8A5 },   /* pheripheral     */
         { 0x9FF, 0x9FF },   /* ramoops         */
+#endif
     };
     for (uint32_t h = 0; h < sizeof k_msm8909_holes / sizeof k_msm8909_holes[0]; h++)
         for (uint32_t i = k_msm8909_holes[h].first_mb; i <= k_msm8909_holes[h].last_mb; i++)
@@ -89,6 +103,34 @@ void mmu_enable_flat(void)
     for (uint32_t h = 0; h < sizeof k_tz_holes / sizeof k_tz_holes[0]; h++)
         for (uint32_t i = k_tz_holes[h].first_mb; i <= k_tz_holes[h].last_mb; i++)
             s_l1[i] = (i << 20) | SECT_DEVICE;
+#endif
+#if defined(PLAT_SMEM_TARG_INFO_REG)
+    /* MAP SMEM WHEREVER IT ACTUALLY IS (2026-09-13).
+     *
+     * PLAT_DDR_SIZE is a compile-time 512 MB on the C2 board header, so the
+     * loop above maps 0x80000000..0xA0000000 and nothing more. The TicWatch C2+
+     * is a 1 GB part (its aboot DTB reports "ddr: 1024 MB") and its SBL can
+     * place SMEM above that line -- outside the map altogether. Every SMD
+     * channel lookup then fails and the RPM request channel never opens, which
+     * is the "sys-pc: no RPM channel" on that unit: no RPM sleep set, no XO
+     * shutdown, ~37 mA instead of ~6 mA. ddr_size_detect() cannot help, it is
+     * reporting-only by design (platform.h:910) and runs long after this.
+     *
+     * smem_targ_info is an MMIO register, readable with no MMU and no SMEM, so
+     * the one thing we need before mapping is available before mapping. Map
+     * SMEM's own window as Device: uncached is correct for shared memory the
+     * RPM writes behind our back, and it is what the 0x87B-0x87F carve-out
+     * already gives SMEM on the 512 MB parts. */
+    {
+        uint32_t id   = *(volatile uint32_t *)(PLAT_SMEM_TARG_INFO_REG);
+        uint32_t size = *(volatile uint32_t *)(PLAT_SMEM_TARG_INFO_REG + 4u);
+        uint32_t base = *(volatile uint32_t *)(PLAT_SMEM_TARG_INFO_REG + 8u);
+        if (id == 0x49494953u && size >= 0x1000u && size <= 0x00400000u) {
+            uint32_t f = base >> 20, l = (base + size - 1u) >> 20;
+            for (uint32_t i = f; i <= l && i < 4096u; i++)
+                s_l1[i] = (i << 20) | SECT_DEVICE;
+        }
+    }
 #endif
     dsb();
 #if defined(WDOG_TRACE) && defined(PLAT_SOC_MSM)
@@ -140,4 +182,22 @@ void mmu_enable_flat(void)
      * through the new translation — the single riskiest instant in the boot. */
     wdog_stage(3);
 #endif
+}
+
+/* 2026-09-18 (gen5-modem-36): .rodata is rewritten at runtime, repeatedly, in one 4 KB page.
+ * Mark every 1 MB section that holds only code and read-only data as privileged READ-ONLY
+ * (APX=1, AP=01). A CPU writer then takes a data abort: startup.S records lr/DFSR/DFAR and
+ * the next boot prints "!! FAULT in previous life: DATA ABORT ... far=". A bus master (DMA)
+ * is not subject to these bits, so a page that still changes with no fault names hardware. */
+extern char __rodata_end[];
+void mmu_protect_code_ro(void)
+{
+    uint32_t start = (0x80008000u + 0xFFFFFu) & ~0xFFFFFu;             /* first whole section past _start */
+    uint32_t end   = (uint32_t)(uintptr_t)__rodata_end & ~0xFFFFFu;     /* last whole section before .data */
+    uint32_t ro    = (SECT_NORMAL & ~(3u << 10)) | (1u << 10) | (1u << 15);
+    unsigned n = 0;
+    for (uint32_t a = start; a < end; a += 0x100000u) { s_l1[a >> 20] = a | ro; n++; }
+    for (uint32_t a = start; a < end; a += 0x100000u) { const void *e = &s_l1[a >> 20]; __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(e)); }
+    __asm__ volatile("dsb sy; mcr p15, 0, %0, c8, c7, 0; dsb sy; isb" :: "r"(0) : "memory");   /* TLBIALL */
+    con_puts("mmu: code+rodata read-only: "); con_puthex(start); con_puts(".."); con_puthex(end); con_puts(" ("); con_putdec(n); con_puts(" MB)\n");
 }

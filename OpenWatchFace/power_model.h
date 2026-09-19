@@ -456,6 +456,8 @@ static void calib_try_learn(uint32_t now, int pct) {
 RTC_DATA_ATTR static uint32_t drain_anchor_epoch = 0;
 RTC_DATA_ATTR static int8_t   drain_anchor_pct   = -1;
 RTC_DATA_ATTR static float    drain_pct_per_hour = 0.0f;
+RTC_DATA_ATTR static uint16_t drain_anchor_mv    = 0;      // cell mV at the anchor; 0 = none
+#define DRAIN_TRIGGER_MV 20u                               // cell drop that yields a new drain figure
 
 RTC_DATA_ATTR static float    cyc_mah_awake   = 0.0f;  // raw awake-model mAh this cycle
 RTC_DATA_ATTR static float    cyc_mah_sleep   = 0.0f;  // sleep-floor mAh this cycle
@@ -481,15 +483,28 @@ static void drain_update(int pct, bool charging, uint16_t vbat_mv) {
 
   // --- %/hour anchor (drives the %/hr, Gauge-avg, Runtime DISPLAY lines). Resets
   // on charge or when % rises. Independent of the calibration window below.
-  if (charging || drain_anchor_pct < 0 || pct > drain_anchor_pct) {
+  // With a cell voltage the rate is VOLTAGE-triggered: a new figure once the cell
+  // has dropped DRAIN_TRIGGER_MV since the anchor (SoC delta from the voltage curve),
+  // instead of waiting for a whole 1% step. Without a voltage: the old 1% rule.
+  if (charging || drain_anchor_pct < 0 || pct > drain_anchor_pct ||
+      (vbat_mv && drain_anchor_mv && vbat_mv > drain_anchor_mv + DRAIN_TRIGGER_MV)) {
     drain_anchor_epoch = now;
     drain_anchor_pct   = (int8_t)pct;
+    drain_anchor_mv    = charging ? 0 : vbat_mv;
     drain_pct_per_hour = 0.0f;
   } else {
     uint32_t dt = now - drain_anchor_epoch;
-    int      dp = drain_anchor_pct - pct;
-    if (dt >= 120 && dp >= 1)
-      drain_pct_per_hour = (float)dp * 3600.0f / (float)dt;
+    if (vbat_mv && !drain_anchor_mv) drain_anchor_mv = vbat_mv;   // anchor had no voltage yet
+    if (vbat_mv && drain_anchor_mv) {
+      if (dt >= 120 && vbat_mv + DRAIN_TRIGGER_MV <= drain_anchor_mv) {
+        float dsoc = volt_soc_pct(drain_anchor_mv) - volt_soc_pct(vbat_mv);
+        if (dsoc > 0.0f) drain_pct_per_hour = dsoc * 3600.0f / (float)dt;
+      }
+    } else {
+      int dp = drain_anchor_pct - pct;
+      if (dt >= 120 && dp >= 1)
+        drain_pct_per_hour = (float)dp * 3600.0f / (float)dt;
+    }
   }
 
   // --- sleep-floor calibration (its own window). Invalidated by charging.

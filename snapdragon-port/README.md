@@ -28,7 +28,7 @@ troubleshooting tables.
 | `baremetal/build-owf-image-<board>.sh` | compile + link the firmware for one board; `tools/mk-bootimg*.sh` packs the result into an Android boot image with the right DTB |
 | `dtbs/` | every device tree the build or the docs use, dumped from the watches ([README](dtbs/README.md)) |
 | `twrp/` | the TWRP recovery images used to back up the stock partitions before touching a watch |
-| `notes/` | working findings; `C2PLUS-FINDINGS.md` is the record of how the deep sleep was brought to parity with stock, read on a rooted C2+ |
+| `notes/` | working findings |
 | `BUILD-GEN4.md`, `BUILD-GEN6.md` | build references: flags, the watchdog staircase, memory maps, recovery |
 | `HARDWARE.md`, `HARDWARE-GEN6.md` | verified hardware and boot facts per SoC (panel, buses, PMIC, boot.img parameters) |
 
@@ -56,7 +56,7 @@ releases over HTTPS and are written to `boot` by the watch itself.
 ```sh
 cd snapdragon-port/baremetal
 export LVGL_DIR=$PWD/../../libraries/lvgl
-F="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN"
+F="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES"
 CFLAGS_EXTRA="$F" sh build-owf-image-c2.sh   && sh tools/mk-bootimg-c2.sh build/c2-owf/owf.bin
 CFLAGS_EXTRA="$F" sh build-owf-image-s2.sh   && sh tools/mk-bootimg-s2.sh build/s2-owf/owf.bin
 CFLAGS_EXTRA="$F" sh build-owf-image-gen4.sh && sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../dtbs/firefish-stock.dtb
@@ -64,4 +64,6 @@ CFLAGS_EXTRA="$F" sh build-owf-image-gen4.sh && sh tools/mk-bootimg.sh build/gen
 
 `fastboot boot build/<board>/owf-boot.img` runs it from RAM without writing
 anything (Wear 2100 only; the Gen 6 has to be flashed). The flags are explained
-in the install guides; `-DWDOG_TRACE` alone boots but sleeps at ~45 mA.
+in the install guides; `-DWDOG_TRACE` alone boots but sleeps at ~45 mA. Do not
+add `-DMSS_OPEN_MASK` on these three boards: their headers default it to `0x6D`,
+which keeps the Wear 3100's modem-diagnostic channels shut.

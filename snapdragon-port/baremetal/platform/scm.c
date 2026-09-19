@@ -45,6 +45,8 @@
 #if defined(PLAT_SMEM_BASE)
 
 #include <string.h>
+#include "FreeRTOS.h"
+#include "semphr.h"
 
 #define SCM_OWNER_SIP        0x02000000u
 #define SCM_STD_CALL         0x00000000u
@@ -71,6 +73,10 @@ static int s_conv = CONV_UNKNOWN;
 #endif
 
 /* ---- cache maintenance for buffers TZ reads/writes behind the MMU ------- */
+static void dc_clean(const void *p, uint32_t n);
+static void dc_inval(const void *p, uint32_t n);
+void scm_dcache_clean(const void *p, uint32_t n) { dc_clean(p, n); }
+void scm_dcache_inval(const void *p, uint32_t n) { dc_inval(p, n); }
 static void dc_clean(const void *p, uint32_t n)
 {
     uintptr_t a = (uintptr_t)p & ~31u, end = (uintptr_t)p + n;
@@ -89,7 +95,7 @@ static void dc_inval(const void *p, uint32_t n)
 
 /* ---- SMCCC convention --------------------------------------------------- */
 /* Up to 4 register args; result r1 returned through *r1. */
-static int32_t scm_smc(uint32_t fnid, uint32_t arginfo,
+static int32_t scm_smc_raw(uint32_t fnid, uint32_t arginfo,
                        uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                        uint32_t *r1_out)
 {
@@ -133,7 +139,7 @@ static uint32_t s_legacy_ctx __attribute__((aligned(64)));
 
 /* One legacy call: `nargs` u32 arguments in, one u32 TZ result out.
  * Returns the SMC status (0 ok, <0 transport/TZ error). */
-static int32_t scm_legacy(uint32_t svc, uint32_t cmd, const uint32_t *args, uint32_t nargs,
+static int32_t scm_legacy_raw(uint32_t svc, uint32_t cmd, const uint32_t *args, uint32_t nargs,
                           uint32_t *result)
 {
     struct legacy_cmd *c = (struct legacy_cmd *)s_legacy_buf;
@@ -210,7 +216,7 @@ static int32_t scm_legacy(uint32_t svc, uint32_t cmd, const uint32_t *args, uint
  * INFO/IS_CALL_AVAIL exactly as done here.
  *   r0 = (FNID << 12) | CLASS_REGISTER (0x2<<8) | MASK_IRQS (bit 5) | nargs
  *   r1 = &context_id, r2.. = args; returns r0 status, r1 result */
-static int32_t scm_legacy_atomic1(uint32_t svc, uint32_t cmd, uint32_t arg, uint32_t *result)
+static int32_t scm_legacy_atomic1_raw(uint32_t svc, uint32_t cmd, uint32_t arg, uint32_t *result)
 {
     uint32_t id = (SCM_LEGACY_FNID(svc, cmd) << 12) | (0x2u << 8) | (1u << 5) | 1u;
     register uint32_t r0 __asm__("r0") = id;
@@ -236,6 +242,38 @@ static int32_t scm_legacy_atomic1(uint32_t svc, uint32_t cmd, uint32_t arg, uint
 #define SCM_BOOT_ADDR          0x01u
 #define SCM_CMD_TERMINATE_PC   0x02u
 #define SCM_FLAG_WARMBOOT_CPU0 0x04u
+
+/* ---- ONE lock for every SMC (v278) -------------------------------------------
+ * The BG co-processor bring-up runs in its own task and holds TZ for up to
+ * ~1 s per command, while the UI task boots CPU1 through SCM (8-20 s) and the
+ * WiFi task authenticates WCNSS through PAS. v277 saw them collide: AUTH_MDT
+ * took 3.2 s and returned -110, and the watch died inside DLOAD_CONT as
+ * "smp: cpu1 up" printed. Recursive (scm_probe() nests), skipped when the
+ * scheduler is not running/suspended or IRQs are masked (the sleep path). */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+static SemaphoreHandle_t s_scm_lock;
+static int scm_lock_take(void)
+{
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+    if (cpsr & 0x80u) return 0;                                   /* IRQs off: never block here */
+    if (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING) return 0;
+    if (!s_scm_lock) s_scm_lock = xSemaphoreCreateRecursiveMutex();
+    if (!s_scm_lock) return 0;
+    return xSemaphoreTakeRecursive(s_scm_lock, portMAX_DELAY) == pdTRUE;
+}
+static void scm_lock_give(int held) { if (held) xSemaphoreGiveRecursive(s_scm_lock); }
+
+static int32_t scm_smc(uint32_t fnid, uint32_t arginfo,
+                       uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *r1_out)
+{ int h = scm_lock_take(); int32_t r = scm_smc_raw(fnid, arginfo, a0, a1, a2, a3, r1_out); scm_lock_give(h); return r; }
+static int32_t scm_legacy(uint32_t svc, uint32_t cmd, const uint32_t *args, uint32_t nargs, uint32_t *result)
+{ int h = scm_lock_take(); int32_t r = scm_legacy_raw(svc, cmd, args, nargs, result); scm_lock_give(h); return r; }
+static int32_t scm_legacy_atomic1(uint32_t svc, uint32_t cmd, uint32_t arg, uint32_t *result)
+{ int h = scm_lock_take(); int32_t r = scm_legacy_atomic1_raw(svc, cmd, arg, result); scm_lock_give(h); return r; }
+
 int scm_set_boot_addr(uint32_t addr, uint32_t flags)
 {
     uint32_t args[2] = { flags, addr }, res = 0;
@@ -267,6 +305,73 @@ int scm_terminate_pc(uint32_t l2_flag)
 {
     uint32_t res = 0;
     return (int)scm_legacy_atomic1(SCM_SVC_BOOT, SCM_CMD_TERMINATE_PC, l2_flag, &res);
+}
+
+static void scm_probe(void);
+
+/* ---- legacy BUFFER call (the shape QSEECOM uses) -------------------------
+ * The 3.18/4.9 kernel's scm_call(svc, cmd, cmd_buf, cmd_len, resp_buf,
+ * resp_len): the whole request STRUCT travels inside the command buffer and
+ * TZ writes a response struct back, instead of the register-style u32 args
+ * scm_legacy() above passes. QSEECOM needs this: its requests are 100+ byte
+ * structs (app names) and its answer is three words (result, resp_type,
+ * data). Same SMC, same re-entry rules, same cache maintenance. */
+static uint8_t s_qsee_buf[640] __attribute__((aligned(64)));
+
+static int scm_legacy_buf_raw(uint32_t svc, uint32_t cmd,
+                   const void *in, uint32_t in_len, void *out, uint32_t out_len)
+{
+    struct legacy_cmd *c = (struct legacy_cmd *)s_qsee_buf;
+    uint32_t rsp_off = (uint32_t)sizeof *c + in_len;
+    struct legacy_rsp *r;
+    uint32_t total = rsp_off + (uint32_t)sizeof *r + out_len, i, t0;
+    int32_t st;
+    int tries = 0;
+
+    if (total > sizeof s_qsee_buf) return -22;
+    scm_probe();
+    if (s_conv != CONV_LEGACY) return -95;      /* SMCCC form is a different encoding */
+
+    memset(s_qsee_buf, 0, sizeof s_qsee_buf);
+    r = (struct legacy_rsp *)(s_qsee_buf + rsp_off);
+    c->len = total;
+    c->buf_offset = sizeof *c;
+    c->resp_hdr_offset = rsp_off;
+    c->id = SCM_LEGACY_FNID(svc, cmd);
+    for (i = 0; i < in_len; i++) s_qsee_buf[sizeof *c + i] = ((const uint8_t *)in)[i];
+    s_legacy_ctx = 0;
+    dc_clean(s_qsee_buf, sizeof s_qsee_buf);
+    dc_clean(&s_legacy_ctx, sizeof s_legacy_ctx);
+
+    t0 = timer_ms();
+    do {
+        register uint32_t r0 __asm__("r0") = 1u;                                  /* SCM_LEGACY_CMD */
+        register uint32_t r1 __asm__("r1") = (uint32_t)(uintptr_t)&s_legacy_ctx;
+        register uint32_t r2 __asm__("r2") = (uint32_t)(uintptr_t)s_qsee_buf;     /* VA == PA */
+        __asm__ volatile(".arch_extension sec\n\tsmc #0"
+                         : "+r"(r0), "+r"(r1), "+r"(r2)
+                         :
+                         : "r3", "memory");
+        st = (int32_t)r0;
+        if (st == SCM_INTERRUPTED) { tries++; if ((tries & 0xFFu) == 0u) wdog_pet(); }
+    } while (st == SCM_INTERRUPTED && timer_ms() - t0 < 30000u);
+    if (tries) { con_dbg("[re-entered "); con_dbg_dec((uint32_t)tries); con_dbg("x] "); }
+    if (st < 0) return (int)st;
+    if (st == SCM_INTERRUPTED) return -110;
+
+    t0 = timer_ms();
+    for (;;) {
+        dc_inval(r, sizeof *r + out_len);
+        if (r->is_complete) break;
+        if (timer_ms() - t0 > 5000u) return -110;
+    }
+    if (out && out_len) {
+        uint32_t off = r->buf_offset;
+        if (off > sizeof s_qsee_buf - rsp_off - out_len) off = sizeof *r;
+        dc_inval(s_qsee_buf + rsp_off + off, out_len);
+        for (i = 0; i < out_len; i++) ((uint8_t *)out)[i] = s_qsee_buf[rsp_off + off + i];
+    }
+    return 0;
 }
 
 /* ---- convention probe --------------------------------------------------- */
@@ -537,3 +642,8 @@ int scm_terminate_pc(uint32_t a) { (void)a; return -1; }
 int scm_pas_is_supported(uint32_t a) { (void)a; return -1; }
 
 #endif /* PLAT_SMEM_BASE */
+
+
+int scm_legacy_buf(uint32_t svc, uint32_t cmd,
+                   const void *in, uint32_t in_len, void *out, uint32_t out_len)
+{ int h = scm_lock_take(); int r = scm_legacy_buf_raw(svc, cmd, in, in_len, out, out_len); scm_lock_give(h); return r; }

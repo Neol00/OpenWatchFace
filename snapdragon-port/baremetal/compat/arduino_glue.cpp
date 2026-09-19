@@ -30,6 +30,10 @@ extern "C" {
 #define FOSSIL_PIN_VIB     200
 #define FOSSIL_PIN_KPDPWR  201   /* power/crown button, reads LOW when held */
 #define FOSSIL_PIN_RESIN   202   /* second pusher, reads LOW when held */
+#define FOSSIL_PIN_STEM1   203   /* gpio_keys STEM_1 (TLMM), reads LOW when held */
+#define FOSSIL_PIN_STEM2   204   /* gpio_keys STEM_2 (TLMM), reads LOW when held */
+/* Weak: only the Wear 2100 images link platform/stem_keys.c. */
+extern "C" int stem_key_pressed(unsigned idx) __attribute__((weak));
 
 extern "C" unsigned long millis(void) { return timer_ms(); }
 
@@ -106,6 +110,9 @@ extern "C" PinStatus digitalRead(pin_size_t pin)
         held = pon_resin_pressed() == 1;
         return held ? LOW : HIGH;
     }
+    /* TLMM pushers: a plain MMIO level read, cheap enough to poll every pass. */
+    if (pin == FOSSIL_PIN_STEM1 || pin == FOSSIL_PIN_STEM2)
+        return (stem_key_pressed && stem_key_pressed((unsigned)(pin - FOSSIL_PIN_STEM1)) == 1) ? LOW : HIGH;
     return LOW;
 }
 extern "C" int       analogRead(pin_size_t)              { return 0; }

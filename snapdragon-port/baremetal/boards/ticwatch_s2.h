@@ -19,6 +19,15 @@
 #pragma once
 #include "ticwatch_c2.h"
 
+/* MADCTL written after the panel re-init on a wake with l6 cut. The C2's
+ * panel needs 0xC0 (MY|MX) to be the right way up; the S2 came back upside
+ * down with it (2026-09-18), so its panel sits the other way round and wants
+ * the power-on default 0x00. The sleep rail mask itself (l6 l11 l12 l17 =
+ * 0x21840) is inherited from the C2 header, confirmed on the S2 2026-09-18. */
+#ifndef PLAT_PANEL_MADCTL
+#define PLAT_PANEL_MADCTL   0x00u
+#endif
+
 #undef  PLAT_NAME
 #define PLAT_NAME           "ticwatch-s2"     /* tunny */
 
@@ -34,3 +43,10 @@
 #undef  PLAT_TOUCH_COORD_H
 #define PLAT_TOUCH_COORD_W  400u
 #define PLAT_TOUCH_COORD_H  400u
+
+/* ---- Buttons: NONE beyond power -------------------------------------------
+ * tunny's gpio_keys node is status "disabled" (its entries are leftover QRD
+ * camera/volume keys), unlike the C2's live STEM_1 on gpio91. The S2 has only
+ * the power button (PMIC kpdpwr), so the C2's pusher is removed here. */
+#undef PLAT_BTN_STEM1_GPIO
+#undef PLAT_BTN_STEM1_MPM

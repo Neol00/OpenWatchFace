@@ -1,6 +1,21 @@
 #!/bin/sh
 # build-owf-image.sh — link the REAL OpenWatchFace firmware into a Gen 6 boot
 # payload: snapdragon-port runtime + compat layer + app TU + LVGL (firmware lv_conf).
+
+# NV blob source. The per-watch backup directories are named after the watch's
+# fastboot serial (firmware/gen4-C0F8482D2529/...), because persist -- and the
+# MAC inside it -- is unique to each unit and a restore has to go back to the
+# watch it came from. The NV TABLE in them is board data, so any one of them
+# builds a working image; pick an explicit OWF_GEN4_FW if set, else the flat
+# legacy directory, else the first per-watch one, and SAY which was used.
+nv_dir_gen4() {
+  if [ -n "${OWF_GEN4_FW:-}" ]; then echo "$OWF_GEN4_FW"; return; fi
+  if [ -f ../firmware/gen4/wcnss_nv.c ]; then echo ../firmware/gen4; return; fi
+  for d in ../firmware/gen4-*; do
+    [ -f "$d/wcnss_nv.c" ] && { echo "$d"; return; }
+  done
+  echo ../firmware/gen4
+}
 set -e
 cd "$(dirname "$0")"
 CROSS="${CROSS:-arm-none-eabi-}"
@@ -48,8 +63,8 @@ fi
 CFLAGS="$CFLAGS $NIMBLE_INC"
 CXXFLAGS="$CXXFLAGS $NIMBLE_INC"
 OBJS=""
-cc_one()  { echo "CC  $1";  $CC  $CFLAGS   $2 -c "$1" -o "$3"; OBJS="$OBJS $3"; }
-cxx_one() { echo "CXX $1"; $CXX $CXXFLAGS $2 -c "$1" -o "$3"; OBJS="$OBJS $3"; }
+cc_one()  { echo "CC  $1";  $CC  $CFLAGS   $2 -c "$1" -o "$3" || exit 1; OBJS="$OBJS $3"; }
+cxx_one() { echo "CXX $1"; $CXX $CXXFLAGS $2 -c "$1" -o "$3" || exit 1; OBJS="$OBJS $3"; }
 
 # runtime (NO ui_demo.c; main.c gets -DOWF_APP)
 cc_one platform/startup.S "" "$B/startup.o"
@@ -61,7 +76,7 @@ for c in console ramlog timer uart_pl011 uart_msm gic irq fb_mdp3 gcc_mdss gcc_b
          smem scm smd wcnss wcn36xx wlan_crypto wlan_sta wlan_net bt_hci spmi_arb pmic_vib pmic_rtc pmic_fg pmic_pon psci pmic_irq msm_wdog bootmark \
          gfx_text recovery_gate cpu_clk_a7 cpu_volt_a7 tsens_8909 rot_pat9126 \
          gcc_usb usb_phy_msm usb_ci gen4_stubs \
-         sdhci_msm gcc_sdcc storage_gen6 nvs_store logfile suspend_msm sensor_scan imu_lsm6ds3 hr_pah8011 spm_8909 cpu_pc8909 smp_8909 tlmm_irq rng_msm bootimg_write ddr_size chg_smb231 mpm sys_pc8909 sleep_floor sleep_quiesce; do
+         sdhci_msm gcc_sdcc storage_gen6 nvs_store logfile suspend_msm sensor_scan imu_lsm6ds3 hr_pah8011 spm_8909 cpu_pc8909 smp_8909 tlmm_irq stem_keys rng_msm bootimg_write ddr_size chg_smb231 mpm sys_pc8909 sleep_floor sleep_quiesce mss_boot mss_rmtfs mss_fastrpc mss_apr mss_diag gfx_spinner; do
   cc_one platform/$c.c "" "$B/$c.o"
 done
 # WLAN NV blob (generated from the watch's /persist/WCNSS_qcom_wlan_nv.bin,
@@ -73,14 +88,16 @@ done
 # binary and extractable) leaves wlan_mac() to derive a locally-administered MAC
 # per device from the eMMC CID. The NV table itself stays: it is board data,
 # byte-identical across every unit compared so far, and contains no MAC.
-NVC=../firmware/gen4/wcnss_nv.c
+NVDIR=$(nv_dir_gen4)
+NVC="$NVDIR/wcnss_nv.c"
+[ -f "$NVC" ] && echo "[owf] NV blob from $NVDIR"
 if [ -f "$NVC" ] && [ "${OWF_PUBLIC:-0}" = 1 ]; then
   mkdir -p "$B"
   grep -v '^const uint8_t wcnss_mac\[6\]' "$NVC" > "$B/wcnss_nv_public.c"
   NVC="$B/wcnss_nv_public.c"
   echo "[owf] OWF_PUBLIC=1: MAC stripped from the NV object; each watch derives its own"
 fi
-if [ -f "$NVC" ]; then cc_one "$NVC" "" "$B/wcnss_nv.o"; else echo "[owf] no firmware/gen4/wcnss_nv.c - NV download will be skipped"; fi
+if [ -f "$NVC" ]; then cc_one "$NVC" "" "$B/wcnss_nv.o"; else echo "[owf] no wcnss_nv.c under firmware/gen4* - NV download will be skipped"; fi
 # lwIP 2.1.3 (third_party/lwip, NO_SYS; options in lwip_port/lwipopts.h)
 LW=third_party/lwip/src
 for c in core/init core/def core/dns core/inet_chksum core/ip core/mem core/memp core/netif core/pbuf core/stats core/sys core/tcp core/tcp_in core/tcp_out core/timeouts core/udp core/raw \

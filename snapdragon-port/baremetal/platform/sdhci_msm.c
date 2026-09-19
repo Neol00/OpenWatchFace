@@ -736,6 +736,23 @@ static uint32_t s_win_lba, s_win_n, s_win_state;   /* 0=unarmed 1=armed 2=locked
  * stay structurally unreachable. */
 static uint32_t s_bwin_lba, s_bwin_n, s_bwin_state;
 
+/* The modem's EFS partitions (modemst1/modemst2/fsg/fsc), written on the modem's behalf by
+ * the rmtfs server in mss_rmtfs.c: same once-per-boot rule, armed only there and only after
+ * owf_is_flashed() said OpenWatchFace owns `boot` (user rule 2026-09-13). */
+static uint32_t s_mwin_lba[4], s_mwin_n[4], s_mwin_cnt, s_mwin_state;
+int emmc_write_window_modem(const uint32_t *lba, const uint32_t *nblocks, uint32_t count)
+{
+    if (s_mwin_state != 0u || count == 0u || count > 4u) {
+        s_mwin_state = 2u;
+        bdiag_puts("emmc: modem write window LOCKED OUT\n");
+        return -1;
+    }
+    for (uint32_t i = 0; i < count; i++) { s_mwin_lba[i] = lba[i]; s_mwin_n[i] = nblocks[i]; }
+    s_mwin_cnt = count; s_mwin_state = 1u;
+    bdiag_puts("emmc: modem write window armed, ranges "); bdiag_putdec(count); bdiag_puts("\n");
+    return 0;
+}
+
 int emmc_write_window_boot(uint32_t lba, uint32_t nblocks)
 {
     if (s_bwin_state != 0u || nblocks == 0u) {
@@ -783,7 +800,11 @@ static int emmc_write_block_unlocked(uint32_t lba, const void *src)
     {
         int in_data = (s_win_state == 1u && lba >= s_win_lba && lba < s_win_lba + s_win_n);
         int in_boot = (s_bwin_state == 1u && lba >= s_bwin_lba && lba < s_bwin_lba + s_bwin_n);
-        if (!in_data && !in_boot) return -1;
+        int in_modem = 0;
+        if (s_mwin_state == 1u)
+            for (uint32_t i = 0; i < s_mwin_cnt; i++)
+                if (lba >= s_mwin_lba[i] && lba < s_mwin_lba[i] + s_mwin_n[i]) in_modem = 1;
+        if (!in_data && !in_boot && !in_modem) return -1;
     }
 
     t0 = timer_ms();
@@ -817,7 +838,47 @@ static int emmc_write_block_unlocked(uint32_t lba, const void *src)
         hc_w32(SDHCI_BUFFER, w);
     }
     /* card programs the block after the transfer: allow a generous wait */
-    return hc_wait(INT_XFER_COMPLETE, 500);
+    if (hc_wait(INT_XFER_COMPLETE, 500) < 0) return -1;
+
+    /* THEN WAIT FOR THE CARD TO LEAVE PROGRAMMING STATE (2026-09-12).
+     *
+     * XFER_COMPLETE is the end of the DATA PHASE, not the end of the write.
+     * The card latches the block and then programs it internally, holding DAT0
+     * low as busy the whole time -- typically well under a millisecond, but a
+     * block that triggers internal garbage collection or an erase can stay
+     * busy for tens of milliseconds. Returning at XFER_COMPLETE therefore told
+     * the caller "written" while the card was still working.
+     *
+     * That is harmless if the next thing we do is more eMMC traffic, because
+     * the CMD/DAT inhibit poll at the top of the next access waits anyway. It
+     * is NOT harmless if the next thing we do is RESET THE SOC, and that is
+     * exactly what reboot_to_bootloader() does on the Fossil Gen 5: it calls
+     * bcb_clear() (one block into `misc`) and then immediately drops PS_HOLD.
+     *
+     * The reset for a reboot-with-a-reason is a WARM reset, which by design
+     * leaves the rails UP -- so the eMMC is not power-cycled. A card interrupted
+     * mid-program comes out of it still busy or with an incomplete internal
+     * operation, aboot's eMMC init then hangs on it, and the watch sits black
+     * with nothing running. Holding KPDPWR is a real power cycle, which fully
+     * resets the card, which is why that always recovered it.
+     *
+     * Gen 5 ONLY, because PLAT_REBOOT_USE_BCB is defined only there: it is the
+     * only board that writes to eMMC on the way to fastboot. Intermittent,
+     * because it depended on whether the card happened to finish before the
+     * reset landed -- hence "four times out of five".
+     *
+     * DAT_INHIBIT is the standard-defined "a command using the DAT lines is
+     * still executing, INCLUDING write busy", so polling it clear is precisely
+     * "the card is done". 1000 ms is orders of magnitude beyond any legitimate
+     * single-block program time; reaching it means something is actually wrong. */
+    t0 = timer_ms();
+    while (hc_r32(SDHCI_PRESENT) & PRESENT_DAT_INHIBIT) {
+        if ((uint32_t)(timer_ms() - t0) > 1000u) {
+            con_puts("emmc: write busy timeout (card still programming)\n");
+            return -1;
+        }
+    }
+    return 0;
 #endif /* PLAT_STORAGE_NOWRITE */
 }
 

@@ -146,15 +146,76 @@ int panel_full_init(void)
     return 0;
 }
 
-#else  /* PLAT_BOARD_TICWATCH_C2: no panel command table for this panel */
-/* The C2's EDO E1392AMC on/off sequences have not been transcribed, and
- * inventing them is worse than not having them: the takeover path never needs
- * one, and a wrong sequence can leave a command-mode AMOLED in a state only a
- * power cycle clears. Refuse loudly instead. */
-int panel_on(void)        { con_puts("panel: no on-table for this panel\n");  return -1; }
-int panel_off(void)       { con_puts("panel: no off-table for this panel\n"); return -1; }
+#else  /* PLAT_BOARD_TICWATCH_C2 (and the S2, which passes the same define) */
+/* EDO E1392AMC, transcribed 2026-09-15 from qcom,mdss-dsi-on-command of the
+ * node both the skipjack and the tunny stock trees select (dsi-pref-prim-pan
+ * = "EDO E1392AMC AMOLED command mode dsi panel"), on-command-state
+ * dsi_hs_mode, reset-sequence <0 10 1 10>. The stock kernel replays exactly
+ * this after every unblank with the panel rails cycled, which is what makes
+ * it usable on OUR wake after l6 (the DDIC vddio) was cut for the sleep.
+ * The 0x29 (display on) that ends the stock table is deliberately left OUT:
+ * plat_display_on() sends it, so a keep-dark timer wake can re-init the DDIC
+ * without lighting the glass. Its missing 0x36 (MADCTL) is a stock omission
+ * too; suspend_msm.c puts 0xC0 back after this table. */
+static const struct panel_cmd panel_on_cmds[] = {
+    { DTYPE_DCS_WRITE1, 0,    2, { 0xFE, 0x0A } },  /* page 10 */
+    { DTYPE_DCS_WRITE1, 0,    2, { 0x29, 0x10 } },
+    { DTYPE_DCS_WRITE1, 0,    2, { 0xFE, 0x05 } },  /* page 5 */
+    { DTYPE_DCS_WRITE1, 0,    2, { 0x05, 0x00 } },
+    { DTYPE_DCS_WRITE1, 0,    2, { 0xFE, 0x00 } },  /* page 0 (user) */
+    { DTYPE_DCS_WRITE1, 0,    2, { 0x35, 0x00 } },  /* tear on */
+    { DTYPE_DCS_WRITE,  0x96, 2, { 0x11, 0x00 } },  /* exit sleep, wait 150ms */
+};
+/* qcom,mdss-dsi-off-command: 28, then 10 wait 150 ms (0x96). */
+static const struct panel_cmd panel_off_cmds[] = {
+    { DTYPE_DCS_WRITE, 0,    2, { 0x28, 0x00 } },
+    { DTYPE_DCS_WRITE, 0x96, 2, { 0x10, 0x00 } },
+};
+static int panel_send(const struct panel_cmd *cmds, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        const struct panel_cmd *c = &cmds[i];
+        if (dsi_dcs_write(c->payload[0], &c->payload[1], c->len - 1) < 0) {
+            con_puts("panel: cmd "); con_putdec(i); con_puts(" TIMEOUT\n");
+            return -1;
+        }
+        if (c->wait_ms) timer_delay_ms(c->wait_ms);
+    }
+    return 0;
+}
+int panel_on(void)
+{
+    con_puts("panel: E1392AMC on sequence (stock on-command, no 0x29)\n");
+    return panel_send(panel_on_cmds, sizeof panel_on_cmds / sizeof panel_on_cmds[0]);
+}
+int panel_off(void)
+{
+    return panel_send(panel_off_cmds, sizeof panel_off_cmds / sizeof panel_off_cmds[0]);
+}
+/* Blind bring-up from a dark aboot hand-over is still not offered here: the
+ * DSI host/PHY/PLL path was only ever validated by takeover on this board. */
 int panel_full_init(void) { con_puts("panel: blind init unsupported (takeover only)\n"); return -1; }
 #endif /* PLAT_BOARD_FOSSIL_GEN4 */
+
+/* Re-initialise a DDIC that lost its vddio (l6 cut for the sleep): the stock
+ * reset pulse on platform-reset-gpio (TLMM 25 on skipjack/tunny, <0 10 1 10>),
+ * then the on-command table. The host side (DSI/PHY/PLL) survived the sleep,
+ * only the panel chip is at POR. Brightness control (0x53) and the last 0x51
+ * level are re-sent because the chip forgot both. Returns 0 on success. */
+static uint8_t s_bl_last = 0xFF;
+static int s_bl_valid;
+int panel_reinit_after_rail(void)
+{
+#if defined(PLAT_PANEL_RESET_GPIO)
+    tlmm_out(PLAT_PANEL_RESET_GPIO, 0); timer_delay_ms(10u);
+    tlmm_out(PLAT_PANEL_RESET_GPIO, 1); timer_delay_ms(10u);
+#endif
+    if (panel_on() < 0) return -1;
+    dsi_dcs_ctrl_display_resend();
+    if (s_bl_valid) (void)dsi_dcs_set_brightness(s_bl_last);
+    con_puts("panel: re-initialised after the rail cut\n");
+    return 0;
+}
 
 /* --- panel brightness (DCS 0x51) -----------------------------------------
  * The AUO h139 is qcom "bl_ctrl_dcs" with qcom,mdss-dsi-bl-max-level = <0xff>
@@ -182,6 +243,8 @@ int panel_full_init(void) { con_puts("panel: blind init unsupported (takeover on
  * The guard below is the belt: if DSI_CTRL does not show the controller
  * enabled in command mode, the link is not in the state we are assuming, so
  * refuse rather than poke it. */
+static int s_ctrl_display_sent;
+void dsi_dcs_ctrl_display_resend(void) { s_ctrl_display_sent = 0; }
 int dsi_dcs_set_brightness(uint8_t level)
 {
     uint32_t ctrl = mmio_read(PLAT_DSI_CTRL_BASE + DSI_CTRL);
@@ -197,7 +260,7 @@ int dsi_dcs_set_brightness(uint8_t level)
      * invention. Sent once: if aboot's on-sequence already ran it, writing it
      * again is harmless; if the panel came up some other way, 0x51 would
      * otherwise be ignored. */
-    static int s_ctrl_display_sent;
+    s_bl_last = level; s_bl_valid = 1;
     if (!s_ctrl_display_sent) {
         uint8_t on = 0x20;
         if (dsi_dcs_write(0x53, &on, 1) < 0) {

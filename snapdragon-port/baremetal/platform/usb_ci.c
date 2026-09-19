@@ -229,9 +229,12 @@ static int      s_have_cursor;
 #define USB_LOG_TAIL 16384u
 #endif
 #ifndef USB_IN_STUCK_MS
-#define USB_IN_STUCK_MS 3000u
+#define USB_IN_STUCK_MS 5000u
 #endif
-static uint32_t s_in_len, s_in_t0, s_in_recover;
+static uint32_t s_in_len, s_in_t0, s_in_recover, s_in_cursor0, s_in_stall_t, s_in_msg_t;
+int usb_dev_reinit(void);
+int usb_reenum_allowed(void) __attribute__((weak));
+int usb_reenum_allowed(void) { return 1; }
 
 /* ---- endpoint plumbing --------------------------------------------------- */
 static void ep_prime(int idx, const void *buf, uint32_t len)
@@ -462,6 +465,28 @@ int usb_dev_init(void)
 {
     if (s_inited) return 0;
 
+#if defined(PLAT_USB_RAIL_DIG_LDO)
+    /* PHY RAILS. Everything below this point assumes the PHY is powered, and
+     * until now that assumption was inherited from aboot: it ran fastboot over
+     * this same port moments earlier, so its rails were still up when we took
+     * over. That holds on the Gen 4. It is not something to rely on -- LK
+     * tears the controller down before jumping, and whether the rails survive
+     * is a property of the board's PMIC and of which LDOs happen to be shared
+     * with something else still running.
+     *
+     * The two watches do not even use the same parts (usb@78d9000 supplies):
+     *     Gen 4   hsusb_vdd_dig 8916_l2   1p8 8916_l7    3p3 8916_l13
+     *     Gen 5   hsusb_vdd_dig pm660_l5  1p8 pm660_l12  3p3 pm660_l16
+     * so the board names its own, and asking the RPM for them is idempotent:
+     * voting a rail that is already on costs one SMD round trip and changes
+     * nothing. Soft-fail by design -- if the RPM channel is not up this early,
+     * rpm_ldo_on() returns < 0 and we carry on exactly as before, which is the
+     * behaviour every board had before this block existed. */
+    (void)rpm_ldo_on(PLAT_USB_RAIL_DIG_LDO, PLAT_USB_RAIL_DIG_UV, 30u);
+    (void)rpm_ldo_on(PLAT_USB_RAIL_1P8_LDO, 1800000u, 30u);
+    (void)rpm_ldo_on(PLAT_USB_RAIL_3P3_LDO, 3300000u, 30u);
+#endif
+
     if (gcc_usb_hs_up() < 0) {
         con_puts("usb: clocks failed\n");
         return -1;
@@ -512,7 +537,16 @@ int usb_dev_init(void)
      * first (RS=0 releases the pull-up) and hold long enough for any host to
      * register a real detach before the reset sequence re-attaches. */
     mmio_write(OP(USBCMD), mmio_read(OP(USBCMD)) & ~USBCMD_RS);
-    timer_delay_ms(200);
+    /* 800 ms, not 200 (2026-09-10). The 200 ms was measured against a WARM
+     * REBOOT, where the host had already seen the old session go quiet. The
+     * harder case is `fastboot boot`: aboot's own gadget is LIVE and enumerated
+     * at the moment it hands over, the pull-up never drops across the handover,
+     * and the host still holds the fastboot device's descriptors. It has to see
+     * a real detach before our re-attach, or it keeps matching the new device
+     * against the old state and parks it -- "Device in error state", which no
+     * replug of the WSL attachment can clear because the watch never actually
+     * left the bus. Cost is 600 ms of boot, once. */
+    timer_delay_ms(800);
 
     gcc_usb_qusb2_phy_reset();
     mmio_write(OP(PORTSC),
@@ -738,11 +772,46 @@ void usb_poll(void)
      * awake (user, 2026-09-08) and the cause is not yet known. */
     if (s_in_busy) {
         dcache_inval(&s_td[EP_IDX(EP_BULK_IN, 1)], sizeof s_td[0]);
-        if (s_td[EP_IDX(EP_BULK_IN, 1)].token & DTD_TOKEN_ACTIVE) return;
-        mmio_write(OP(off_complete()), 1u << (16 + EP_BULK_IN));
-        s_in_busy = 0;
+        if (s_td[EP_IDX(EP_BULK_IN, 1)].token & DTD_TOKEN_ACTIVE) {
+            /* v437: THE LOG THAT DIES. A bulk-IN dTD that never completes used to park this path
+             * forever ("return" below) -- the watch runs on, the console is dead (every board, at a
+             * burst of output). After USB_IN_STUCK_MS: flush the IN endpoint, rewind the log cursor
+             * to where this transfer started, and re-prime the same bytes. Minimal, in the v168 path. */
+            if (!s_in_t0) { s_in_t0 = timer_ms(); return; }
+            if ((uint32_t)(timer_ms() - s_in_t0) < USB_IN_STUCK_MS) return;
+            mmio_write(OP(off_flush()), 1u << (16 + EP_BULK_IN));
+            { uint32_t t0 = timer_ms(); while ((mmio_read(OP(off_flush())) & (1u << (16 + EP_BULK_IN))) && (uint32_t)(timer_ms() - t0) < 20u) { } }
+            mmio_write(OP(off_complete()), 1u << (16 + EP_BULK_IN));
+            s_in_busy = 0; s_in_t0 = 0; s_in_recover++;
+            s_log_cursor = s_in_cursor0;
+            /* v445: on a marginal link (Gen 5E on guessed USB pins) the flush "works" just long enough
+             * to reset a consecutive-stall streak, so it never escalated and printed on every cycle.
+             * Now: any two stalls inside a minute -> re-enumerate; and one status line per 10 s. */
+            { uint32_t now = timer_ms();
+              /* v447: no re-enumeration while the modem loading screen still runs (heavy output on a
+               * lagging link looked like stalls and reconnected the 5E every 10 s during boot). */
+#if defined(PLAT_BOARD_FOSSIL_GEN5E)
+              /* v476: GEN 5E ONLY. A host that has the CDC device enumerated but no program reading it
+               * (Windows with usbipd not attached, a closed terminal) leaves every bulk-IN transfer
+               * pending: that is a normal state, not a broken link. On the other boards this path
+               * re-enumerated every ~10 s, which also kept usbipd in "Device in error state" (C2/Gen 4
+               * v473-v475, user report 2026-09-15). The 5E keeps it for its marginal link (v445). */
+              if (s_in_stall_t && (uint32_t)(now - s_in_stall_t) < 60000u && (usb_reenum_allowed() || s_in_recover >= 4u)) {   /* v448: during the gate only after 4 stalls (>= 20 s dead) */
+                  s_in_stall_t = 0;
+                  con_puts("usb: bulk-IN stalled twice within a minute -> re-enumerating\n");
+                  (void)usb_dev_reinit();
+                  return;
+              }
+#endif
+              s_in_stall_t = now;
+              if (!s_in_msg_t || (uint32_t)(now - s_in_msg_t) >= 10000u) { s_in_msg_t = now; con_puts("usb: bulk-IN stuck -> flushed and re-primed (total "); con_putdec(s_in_recover); con_puts(")\n"); } }
+        } else {
+            mmio_write(OP(off_complete()), 1u << (16 + EP_BULK_IN));
+            s_in_busy = 0; s_in_t0 = 0;
+        }
     }
     {
+        s_in_cursor0 = s_log_cursor;
         uint32_t n = ramlog_read(&s_log_cursor, (char *)s_inbuf, sizeof s_inbuf);
         if (n) {
             ep_prime(EP_IDX(EP_BULK_IN, 1), s_inbuf, n);

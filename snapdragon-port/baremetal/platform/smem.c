@@ -97,7 +97,9 @@ struct smem_global_entry {          /* one item in the global heap TOC */
 #define SMEM_AUX_BASE_MASK  0xFFFFFFFCu
 
 /* ---- partition table: last 4 KB of the region ---------------------------- */
-#define SMEM_PTABLE_OFF     (PLAT_SMEM_SIZE - 0x1000u)
+/* Runtime now: the partition table sits in the last 4 KiB of SMEM, and SMEM's
+ * size is whatever smem_targ_info reports, not what the board header guessed. */
+#define SMEM_PTABLE_OFF     (s_smem_size - 0x1000u)
 #define SMEM_PTABLE_MAGIC   0x434F5424u   /* "$TOC" little-endian */
 #define SMEM_PART_MAGIC     0x54525024u   /* "$PRT" */
 #define SMEM_PRIVATE_CANARY 0xA5A5u
@@ -143,7 +145,23 @@ struct smem_private_entry {         /* header of each item in a partition */
 #define SMEM_ID_CHANNEL_ALLOC_TBL   13u   /* SMD channel directory (per edge) */
 #define SMEM_ID_HW_SW_BUILD_ID     137u   /* ASCII build string: our proof    */
 
-static volatile uint8_t *const s_smem = (volatile uint8_t *)PLAT_SMEM_BASE;
+/* SMEM BASE IS DISCOVERED, NOT ASSUMED (2026-09-13).
+ *
+ * These were compile-time constants from the board header. On the TicWatch C2+
+ * that is wrong: its SBL places SMEM somewhere else, so every SMD channel
+ * lookup failed, the RPM request channel never opened, and both sys_pc8909 and
+ * sleep_floor reported "no RPM channel" -- which on the C2+ means no RPM sleep
+ * set, no XO shutdown, and the ~37 mA fallback instead of ~6 mA. The board
+ * header is right for the C2 and there is no reason to think it is right for
+ * every unit.
+ *
+ * msm8909w exposes struct smem_targ_info { u32 "SIII"; u32 size; u64 base; } in
+ * a register (PLAT_SMEM_TARG_INFO_REG), and the vendor smem driver takes
+ * base/size from there in preference to the device tree. smem_init() now does
+ * the same. The board header values remain the fallback for a unit whose
+ * targ_info is absent or implausible. */
+static volatile uint8_t *s_smem = (volatile uint8_t *)PLAT_SMEM_BASE;
+static uint32_t s_smem_size = PLAT_SMEM_SIZE;
 static int      s_smem_ok;
 static uint32_t s_version;              /* SBL SMEM version (11 or 12)       */
 static volatile struct smem_ptable *s_ptable;                /* NULL if none */
@@ -160,9 +178,9 @@ static uint32_t smem_rd32(uint32_t off)
  * into TrustZone DDR and an instant, unexplained reset. */
 static int smem_range_ok(uint32_t off, uint32_t size)
 {
-    if (size == 0u || size > PLAT_SMEM_SIZE) return 0;
-    if (off  >= PLAT_SMEM_SIZE)              return 0;
-    if (off + size > PLAT_SMEM_SIZE)         return 0;
+    if (size == 0u || size > s_smem_size) return 0;
+    if (off  >= s_smem_size)              return 0;
+    if (off + size > s_smem_size)         return 0;
     return 1;
 }
 
@@ -239,6 +257,37 @@ int smem_init(void)
     uint32_t init, reserved, ver;
 
     if (s_smem_ok) return 0;
+
+#if defined(PLAT_SMEM_TARG_INFO_REG)
+    /* Ask the hardware where SMEM is before reading a single byte of it. Only
+     * adopt the answer if it is inside the identity-mapped DDR window (mmu.c
+     * maps PLAT_DDR_BASE..+PLAT_DDR_SIZE and nothing else) -- following a base
+     * outside that would fault instead of failing. */
+    {
+        uint32_t id   = mmio_read(PLAT_SMEM_TARG_INFO_REG);
+        uint32_t size = mmio_read(PLAT_SMEM_TARG_INFO_REG + 4u);
+        uint32_t base = mmio_read(PLAT_SMEM_TARG_INFO_REG + 8u);   /* u64, low word */
+        if (id == 0x49494953u) {          /* "SIII" */
+            if (base != PLAT_SMEM_BASE || size != PLAT_SMEM_SIZE) {
+                con_puts("smem: targ_info base="); con_puthex(base);
+                con_puts(" size="); con_puthex(size);
+                con_puts(" vs header "); con_puthex(PLAT_SMEM_BASE);
+                con_puts("/"); con_puthex(PLAT_SMEM_SIZE);
+            }
+            /* No longer required to sit inside PLAT_DDR_SIZE: mmu.c maps
+             * SMEM's own window from this same register, so a base above the
+             * board header's DDR end (the 1 GB C2+) is reachable. */
+            if (size >= 0x1000u && size <= 0x00400000u && base >= PLAT_DDR_BASE) {
+                if (base != PLAT_SMEM_BASE || size != PLAT_SMEM_SIZE)
+                    con_puts(" - adopting it\n");
+                s_smem      = (volatile uint8_t *)(uintptr_t)base;
+                s_smem_size = size;
+            } else if (base != PLAT_SMEM_BASE || size != PLAT_SMEM_SIZE) {
+                con_puts(" - implausible, keeping the header\n");
+            }
+        }
+    }
+#endif
 
     init     = smem_rd32(SMEM_HDR_INIT_OFF);
     reserved = smem_rd32(SMEM_HDR_RESERVED_OFF);
@@ -338,6 +387,107 @@ void *smem_get_host(uint32_t host, uint32_t id, uint32_t *size_out)
     return smem_partition_get(p, id, size_out);
 }
 
+/* Allocate (or return the existing) uncached item `id` in the APPS<->`host` partition
+ * (drivers/soc/qcom/smem.c alloc_item_secure, uncached branch). Serialised against the
+ * remote processors with the SMEM alloc hw spinlock "S:3": qcom,ipc-spinlock-sfpb at
+ * 0x01905000, 8 locks in 0x8000 -> lock 3 at 0x01908000, APPS token 1. */
+#define SMEM_ALLOC_LOCK_REG 0x01908000u
+void *smem_alloc_host(uint32_t host, uint32_t id, uint32_t size_in)
+{
+    volatile struct smem_partition_header *p;
+    uint32_t got = 0, t0;
+    void *ret;
+
+    if (!s_smem_ok || id >= SMEM_ITEM_COUNT) return NULL;
+    p = smem_find_partition(host);
+    if (!p) return NULL;
+    if ((ret = smem_partition_get(p, id, &got)) != NULL) return got >= size_in ? ret : NULL;
+    t0 = timer_ms();
+    for (;;) {
+        if (mmio_read(SMEM_ALLOC_LOCK_REG) == 0u) { mmio_write(SMEM_ALLOC_LOCK_REG, 1u); if (mmio_read(SMEM_ALLOC_LOCK_REG) == 1u) break; }
+        if (timer_ms() - t0 > 1000u) return NULL;
+    }
+    ret = NULL;
+    if ((ret = smem_partition_get(p, id, &got)) == NULL) {
+        uint32_t off = p->offset_free_uncached, a_data = (size_in + 7u) & ~7u;
+        uint32_t hsz = sizeof(struct smem_private_entry);
+        if (p->offset_free_uncached <= p->offset_free_cached && p->offset_free_cached <= p->size &&
+            p->offset_free_cached - off >= hsz + a_data) {
+            volatile struct smem_private_entry *e = (volatile struct smem_private_entry *)((volatile uint8_t *)p + off);
+            volatile uint8_t *d = (volatile uint8_t *)e + hsz;
+            for (uint32_t k = 0; k < a_data; k++) d[k] = 0;
+            e->canary = SMEM_PRIVATE_CANARY; e->item = (uint16_t)id; e->size = a_data;
+            e->padding_data = (uint16_t)(a_data - size_in); e->padding_hdr = 0; e->reserved = 0;
+            p->offset_free_uncached = off + hsz + a_data;
+            ret = (void *)d;
+        }
+    }
+    mmio_write(SMEM_ALLOC_LOCK_REG, 0u);
+    return ret;
+}
+
+
+/* v362: legacy global-heap allocation (kernel 3.18 smem_alloc with SMEM_ANY_HOST_FLAG on a
+ * global-heap SBL): under the SMEM hw spinlock, bump free_offset and mark the TOC entry.
+ * Needed for SMSM items 23/63, which only the kernel allocates on stock. */
+void *smem_alloc_global(uint32_t id, uint32_t size_in)
+{
+    volatile struct smem_global_entry *e;
+    uint32_t got = 0, t0, a = (size_in + 7u) & ~7u; void *ret;
+    if (!s_smem_ok || id >= SMEM_ITEM_COUNT || s_global) return NULL;
+    if ((ret = smem_get(id, &got)) != NULL) return got >= size_in ? ret : NULL;
+    t0 = timer_ms();
+    for (;;) {
+        if (mmio_read(SMEM_ALLOC_LOCK_REG) == 0u) { mmio_write(SMEM_ALLOC_LOCK_REG, 1u); if (mmio_read(SMEM_ALLOC_LOCK_REG) == 1u) break; }
+        if (timer_ms() - t0 > 1000u) return NULL;
+    }
+    ret = NULL;
+    e = (volatile struct smem_global_entry *)(s_smem + SMEM_HDR_TOC_OFF) + id;
+    if (e->allocated != 1u) {
+        uint32_t off = smem_rd32(SMEM_HDR_FREE_OFF), avail = smem_rd32(SMEM_HDR_AVAIL_OFF);
+        if (avail >= a && off + a <= s_smem_size) {
+            volatile uint8_t *d = s_smem + off;
+            for (uint32_t k = 0; k < a; k++) d[k] = 0;
+            e->offset = off; e->size = a; e->aux_base = 0; __asm__ volatile("dsb sy" ::: "memory");
+            e->allocated = 1u;
+            ((volatile uint32_t *)(s_smem + SMEM_HDR_FREE_OFF))[0] = off + a; ((volatile uint32_t *)(s_smem + SMEM_HDR_AVAIL_OFF))[0] = avail - a;
+            ret = (void *)d;
+        }
+    } else ret = smem_get(id, &got);
+    mmio_write(SMEM_ALLOC_LOCK_REG, 0u);
+    return ret;
+}
+
+/* v367: progress trace of the modem's init = which SMEM items exist. Prints allocated global TOC
+ * ids (id:size) and, per host partition, the uncached item ids + the cached free offset. */
+void smem_dump_items(const char *tag)
+{
+    if (!s_smem_ok) return;
+    con_puts("smem-items["); con_puts(tag); con_puts("] global:");
+    if (!s_global) {
+        for (uint32_t id = 0; id < SMEM_ITEM_COUNT; id++) {
+            volatile struct smem_global_entry *e = (volatile struct smem_global_entry *)(s_smem + SMEM_HDR_TOC_OFF) + id;
+            if (e->allocated == 1u) { con_puts(" "); con_putdec(id); con_puts(":"); con_putdec(e->size); }
+        }
+    }
+    con_puts("\n");
+    for (uint32_t host = 0; host < SMEM_HOST_COUNT; host++) {
+        volatile struct smem_partition_header *p = smem_find_partition(host);
+        if (!p) continue;
+        uint32_t base = (uint32_t)((volatile uint8_t *)p - s_smem), off = sizeof *p, end = p->offset_free_uncached;
+        con_puts("smem-items["); con_puts(tag); con_puts("] host "); con_putdec(host);
+        con_puts(" cached-free "); con_puthex(p->offset_free_cached); con_puts(" size "); con_puthex(p->size); con_puts(" uncached:");
+        while (off + sizeof(struct smem_private_entry) <= end) {
+            volatile struct smem_private_entry *e = (volatile struct smem_private_entry *)(s_smem + base + off);
+            if (e->canary != SMEM_PRIVATE_CANARY) break;
+            uint32_t next = off + sizeof *e + e->padding_hdr + e->size;
+            if (next > end || next < off) break;
+            con_puts(" "); con_putdec(e->item); con_puts(":"); con_putdec(e->size);
+            off = next;
+        }
+        con_puts("\n");
+    }
+}
 int      smem_ok(void)      { return s_smem_ok; }
 uint32_t smem_version(void) { return s_version; }
 

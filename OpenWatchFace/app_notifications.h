@@ -33,6 +33,18 @@ static void app_open_notif_detail(void);     // fwd (full-screen reader; screen_
 static void ancs_dismiss_id(uint64_t id);
 static void ancs_dismiss_all(void);
 
+/* Is the notification list — or a single notification's reader — the screen on
+ * top right now? nav_current (app_menu.h) is the builder of the open sub-app,
+ * which is the same test app_menu.h itself uses for the camera and gallery.
+ *
+ * Used to suppress the arrived-while-in-an-app badge: that pill exists to tell
+ * you something came in that you cannot currently see, and inside this app you
+ * are looking straight at it. */
+static bool notif_app_is_open(void) {
+  return nav_current == app_open_notifications ||
+         nav_current == app_open_notif_detail;
+}
+
 /* Screen rebuilds MUST be deferred out of the click event. A row/X/Clear handler
  * runs as an event on a child of app_scr; rebuilding (open detail, or rebuild the
  * list after a dismiss) calls app_screen_begin(), which does lv_obj_del(app_scr) —
@@ -255,6 +267,7 @@ static void notif_add_row(lv_obj_t *list, uint16_t idx, const char *title,
  * top-left; we keep the content clear of it. */
 static void app_open_notif_detail(void) {
   app_screen_begin("");   // no header text; just the "<- BOOT" hint top-left
+  notif_badge_hide();     // reached only from the list, but a rebuild can land here first
 
   // Scrollable reader column. No title header, so it starts just below the BOOT
   // hint band (which the shell draws at the very top-left) and fills the screen.
@@ -319,6 +332,7 @@ static void app_open_notif_detail(void) {
 /* ----------------------------- List screen -------------------------------- */
 static void app_open_notifications(void) {
   app_screen_begin("Notifications");
+  notif_badge_hide();   // the list is on screen: the badge has nothing left to say
 
   // Pick the source by card presence: with a card we read the SD archive (the
   // FULL, untruncated history, ONE page at a time — flash only mirrors the newest

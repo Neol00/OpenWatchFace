@@ -32,6 +32,9 @@
  * survives one. The dead-man timer still reboots to fastboot if it hangs.
  */
 #include "platform.h"
+#include "FreeRTOS.h"
+#include "task.h"
+int mss_ready(void);
 #if defined(PLAT_WCNSS_FW_BASE) && defined(PLAT_SMEM_BASE)
 
 #include <string.h>
@@ -141,6 +144,15 @@ static int fat_read_file(const char *name11, uint32_t *size_out,
 }
 
 /* ---- ELF / MDT -------------------------------------------------------- */
+/* Exported for mss_boot.c (2026-09-13): the same FAT reader over the modem
+ * partition's IMAGE/ directory, 8.3 names padded to 11 characters. */
+int wcnss_fat_read_file(const char *name11, uint32_t *size_out,
+                        void (*sink)(void *ctx, const uint8_t *p, uint32_t off, uint32_t n), void *ctx)
+{
+    if (fat_init() < 0) return -1;
+    return fat_read_file(name11, size_out, sink, ctx);
+}
+
 struct elf32_phdr { uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align; };
 #define PT_LOAD            1u
 #define MDT_TYPE_MASK      (7u << 24)
@@ -375,6 +387,21 @@ static int crypto_clocks_on(void)
            timer_ms() - t0 < 10u) { }
     crypto_dump("after ");
     return (GCC_R(CRYPTO_CBCR) & (1u << 31)) ? -1 : 0;
+}
+
+/* v470: the crypto engine for OTHER TrustZone image loads. qsee_app_start (bg_load.c) has TZ hash
+ * the bgapp image with the CE exactly as pas_init does for WCNSS, and stock qseecom enables the
+ * ce clocks + a bus vote around every such call. Our BG load only ever worked when this loader had
+ * already run (loop-started builds); behind the modem loading gate (v465/v468/v469) the BG's call
+ * was the boot's first TZ call with the CE dead -> reboot after "pre-load reset pulse". */
+int pas_crypto_up(void)
+{
+    int rc;
+    if (!smem_ok() || rpm_smd_init() < 0) { say("pas-crypto: SMEM/RPM not up\n"); return -1; }
+    rc = crypto_clocks_on();
+    say_rc("pas-crypto: crypto clocks", rc);
+    vote_pas_bw();
+    return rc;
 }
 
 /* ---- Iris XO configuration (qcom_wcnss.c: wcnss_configure_iris) --------- */
@@ -759,7 +786,24 @@ static int wcnss_ctrl_handshake(void)
 /* ---- the boot ----------------------------------------------------------- */
 static uint32_t s_seg_dest;   /* sink_seg ctx */
 
+/* v395: the two PAS loaders must not interleave. v394 (WiFi on + modem task from main init) had
+ * the MBA reject modem segment 13 with status -19 while wcnss_boot() ran concurrently. */
+static volatile int s_wcnss_booting;
+int wcnss_boot_busy(void) { return s_wcnss_booting; }
+int mss_loading(void);
+static int wcnss_boot_inner(void);
 int wcnss_boot(void)
+{
+    int rc;
+#if defined(MSS_BOOT)
+    if (mss_loading()) { say("wcnss: modem image is loading -- radio boot refused for now, retry later\n"); return -1; }
+#endif
+    s_wcnss_booting = 1;
+    rc = wcnss_boot_inner();
+    s_wcnss_booting = 0;
+    return rc;
+}
+static int wcnss_boot_inner(void)
 {
     const struct elf32_phdr *ph;
     uint32_t phoff, phnum, i, lo = 0xFFFFFFFFu, hi = 0, total = 0, size, reloc;
@@ -843,7 +887,13 @@ int wcnss_boot(void)
     vote_ldo   ("  vddpx/vddxo/pll 8916_l7 1.8V",  7u, 1800000u, 10u);
     vote_ldo   ("  vdddig 8916_l5 1.8V",            5u, 1800000u, 10u);
     vote_ldo   ("  vddpa  8916_l9 3.3V",            9u, 3300000u, 515u);
+    /* v406: NOT voted any more. The stock C2+ runs WiFi (adb over WiFi, associated) with
+     * 8916_s3 "disabled users=0", and S3 reads off on the cable with the screen off; our vote here
+     * was the holder that kept S3 up for the whole awake time (v405: EN_CTL 0x80 with WiFi on).
+     * -DWCNSS_VOTE_S3 restores the old behaviour if the radio ever needs it. */
+#if defined(WCNSS_VOTE_S3)
     vote_uv    ("  vddrfa 8916_s3 1.3V (smpa3)",    T_SMPA, 3u, 1300000u, 100u);
+#endif
 #if defined(WCNSS_CORNER_VOTES)
     vote_corner("  vddmx  8916_l3 corner 5 (ldoa3 corn only)", T_LDOA, 3u, 5u);
     vote_corner("  vddcx  8916_s1 corner 5 (smpa1 corn only)", T_SMPA, 1u, 5u);
@@ -862,6 +912,56 @@ int wcnss_boot(void)
      * from the DT alone. */
     vote_kv    ("  rf_clk2 (clka id5 swen)",        T_CLKA, 5u, K_SWEN, 1u);
     vote_kv    ("  rf_clk1 (clka id4 swen)",        T_CLKA, 4u, K_SWEN, 1u);
+#elif defined(PLAT_WCNSS_RAILS_PM660_8909)
+    /* msm8909w + PM660 — the Fossil Gen 5 (triggerfish, Wear 3100).
+     *
+     * A SEPARATE TABLE FROM THE PM660 ONE ABOVE, deliberately. "PM660" is not
+     * enough to name a rail map: the Gen 6 (hoki, SDA429W + PM660) puts vddcx
+     * on s1 and vddrfa on l5, while this watch puts vddcx on s3 and vddrfa on
+     * l6. Same PMIC, different board wiring — so the two tables cannot share a
+     * symbol, and folding them together would have quietly voted hoki's rails
+     * on triggerfish.
+     * FROM-DTB (triggerfish-stock.dts, qcom,wcnss-wlan@a000000), phandles
+     * resolved to regulator-name:
+     *   pronto vddmx pm660_s2_corner_ao   vddcx pm660_s3_corner
+     *          vddpx pm660_l13 1.8 V      pil proxy vdd_pronto_pll pm660_l12
+     *   iris   vddxo pm660_l12 1.8 V      vddrfa pm660_l6 1.3 V
+     *          vdddig pm660_l13 1.8 V
+     *
+     * TWO DIFFERENCES THAT MATTER vs the PM8916 table above, both of which
+     * would be silent corruption if this had been written by analogy:
+     *
+     *  1. vddrfa is an LDO here (pm660_l6), NOT an SMPS. On the PM8916 watches
+     *     it is 8916_s3 and the vote goes to T_SMPA id 3. Sending this board's
+     *     1.3 V to smpa6 would program an unrelated buck converter.
+     *  2. THERE IS NO vddpa. The PM8916 tree carries iris-vddpa = 8916_l9 at
+     *     3.3 V / 515 mA and this tree has no vddpa property anywhere — so the
+     *     PA rail is not AP-switchable on this board. wlan_votes_resume()'s
+     *     vddpa re-vote is already guarded on PLAT_WCNSS_RAILS_PM8916.
+     *
+     * RPM resource ids: PM660 is the primary PMIC, so ldoa<N> = pm660_l<N> and
+     * smpa<N> = pm660_s<N>, the standard rpm-smd-regulator mapping.
+     * Currents FROM-DTB: iris-vddxo 0x2710 = 10 mA, vddrfa 0x186a0 = 100 mA,
+     * vdddig 0x2710 = 10 mA.
+     *
+     * NOTHING HERE HAS BEEN RUN. This is a transcription of a device tree on a
+     * watch whose radio has never been powered by this code. The corner votes
+     * are gated off for the same reason as the PM8916 table: on the Gen 4 the
+     * first corner vote reset the SoC, twice, and that is still not understood.
+     * Expect to bisect this table, not to trust it. */
+    vote_ldo   ("  vddpx/vdddig pm660_l13 1.8V", 13u, 1800000u, 10u);
+    vote_ldo   ("  vddxo/pll    pm660_l12 1.8V", 12u, 1800000u, 10u);
+    vote_ldo   ("  vddrfa       pm660_l6  1.3V",  6u, 1300000u, 100u);
+    /* (no vddpa on this board -- see the note above) */
+#if defined(WCNSS_CORNER_VOTES)
+    vote_corner("  vddmx pm660_s2 corner 5 (smpa2 corn only)", T_SMPA, 2u, 5u);
+    vote_corner("  vddcx pm660_s3 corner 5 (smpa3 corn only)", T_SMPA, 3u, 5u);
+#else
+    vsay("  vddmx/vddcx corner votes: skipped in this build (-DWCNSS_CORNER_VOTES enables)\n");
+#endif
+    vote_kv    ("  cxo (clk0 id0 Enab)",         T_CLK0, 0u, K_ENAB, 1u);
+    vote_kv    ("  rf_clk2 (clka id5 swen)",     T_CLKA, 5u, K_SWEN, 1u);
+    vote_kv    ("  rf_clk1 (clka id4 swen)",     T_CLKA, 4u, K_SWEN, 1u);
 #else
 #error "no PLAT_WCNSS_RAILS_* table for this board"
 #endif
@@ -1137,6 +1237,35 @@ int wcnss_fw_resident(void) { return s_wlan_up; }
  * resident. The app turns WiFi off after every scan and on every sleep entry,
  * so a full PAS reload each time (6 s, and a path never exercised) is neither
  * affordable nor proven. wlan_power_off() is the real shutdown. */
+/* The exact mirror of what wlan_idle() releases.
+ *
+ * THIS WAS MISSING, and it is why a wake could land in "WLAN_CTRL send did not
+ * fit" -> "MAC restart FAILED" for good, until the watch was rebooted (Gen 4,
+ * 2026-09-09). wlan_idle() drops the AP's snoc/pcnoc rates, the EBI bandwidth
+ * vote and the l9 PA rail; wlan_up()'s resident path then pushed HAL_START
+ * straight into the WLAN_CTRL FIFO with all of them still at zero. That FIFO
+ * lives in shared memory and the Pronto drains it, so with the interconnect at
+ * its floor the firmware could not keep up inside hal_send_wait()'s 1 s window
+ * and the send never fitted. It only ever half-worked because some other RPM
+ * master usually happened to be holding the buses up -- which is exactly the
+ * kind of thing that changes when unrelated timing changes, and why this
+ * surfaced on one watch and not the other.
+ *
+ * Values are wcnss_boot()'s: snoc 200 MHz, pcnoc 100 MHz, EBI at PAS_BW_BPS. */
+static void wlan_votes_resume(void)
+{
+#if defined(PLAT_WCNSS_RAILS_PM8916)
+    vote_kv("  vddpa 8916_l9 on",            T_LDOA, 9u, K_SWEN, 1u);
+    /* wlan_idle() drops vddrfa too; without it back the MAC restarts but the
+     * Iris RF front end is unpowered and every scan hears 0 frames. */
+    vote_kv("  vddrfa 8916_s3 on",           T_SMPA, 3u, K_SWEN, 1u);
+#endif
+    vote_kv("  snoc 200 MHz (clk1 id1 KHz)",  T_CLK1, 1u, K_KHZ, 200000u);
+    vote_kv("  pcnoc 100 MHz (clk1 id0 KHz)", T_CLK1, 0u, K_KHZ, 100000u);
+    { uint32_t kv[3] = { RPM_KEY_BW, 4u, PAS_BW_BPS };
+      (void)rpm_smd_request(0, RPM_BUS_SLAVE_REQ, EBI_SLV_RPM_ID, kv, sizeof kv); }
+}
+
 int wlan_up(void)
 {
     int rc;
@@ -1145,10 +1274,17 @@ int wlan_up(void)
         uint32_t t = timer_ms();
         vsay("wlan: restarting the MAC\n");
         wdog_extend(31u); deadman_kick();
+        wlan_votes_resume();                  /* buses back BEFORE any HAL traffic */
         rc = wlan_hal_mac_start();
-        if (rc == 0) say_dec("wlan: radio UP (MAC restarted in ", timer_ms() - t), say(" ms)\n");
-        else         say("wlan: MAC restart FAILED\n");
-        return rc;
+        if (rc == 0) { say_dec("wlan: radio UP (MAC restarted in ", timer_ms() - t); say(" ms)\n"); return 0; }
+        /* SELF-HEAL. The firmware is resident but no longer answering, and every
+         * later attempt takes this same path, so without this the radio stays
+         * dead until the watch is rebooted -- which is what a user actually hit.
+         * Tear the firmware down and fall through to the cold bring-up below;
+         * wlan_power_off() sets s_restart, so the handshake waits for the new
+         * firmware's WCNSS_CTRL reset edge instead of trusting stale SMEM. */
+        say("wlan: MAC restart FAILED - rebuilding the radio from cold\n");
+        wlan_power_off();
     }
     if (!smem_ok() && smem_init() != 0) { vsay("wlan: SMEM not available\n"); return -1; }
     say("wlan: bringing the radio up\n");
@@ -1157,6 +1293,13 @@ int wlan_up(void)
     wdog_extend(31u); deadman_kick();
     say(rc == 0 ? "wlan: radio UP\n" : "wlan: bring-up FAILED\n");
     s_wlan_up = (rc == 0);
+    q6_audio_probe(2000u, "P4 after WLAN bring-up");
+#if defined(NO_RADIO_BOOT)
+    /* v380: nothing was started, so there is nothing to tear down. The teardown below ends with a
+     * write to PMU_CFG inside the WCNSS block; with the core never clocked that access can hang the
+     * bus (v375/v379a: silent total stall ~30 s after boot, hw wdog to fastboot). */
+    return rc;
+#endif
     if (rc != 0) {
         /* Leave nothing half-started: a firmware that was released but never
          * answered, or rails left up, poisoned the next attempt (Iris reset
@@ -1172,7 +1315,12 @@ int wlan_up(void)
         vote_kv("  rf_clk1 off", T_CLKA, 4u, K_SWEN, 0u);
         vote_kv("  vddpa  8916_l9 off", T_LDOA, 9u, K_SWEN, 0u);
         vote_kv("  vddrfa 8916_s3 off", T_SMPA, 3u, K_SWEN, 0u);
-        vote_kv("  vdddig 8916_l5 off", T_LDOA, 5u, K_SWEN, 0u);
+        /* 8916_l5 is NOT released -- see wlan_power_off(). */
+#elif defined(PLAT_WCNSS_RAILS_PM660_8909)
+        vote_kv("  rf_clk2 off", T_CLKA, 5u, K_SWEN, 0u);
+        vote_kv("  rf_clk1 off", T_CLKA, 4u, K_SWEN, 0u);
+        vote_kv("  vddrfa pm660_l6 off",  T_LDOA, 6u, K_SWEN, 0u);
+        /* l12 and l13 are NOT released -- see wlan_power_off(). */
 #endif
         mmio_write(PMU_CFG, 0);                   /* Iris/PMU back to the reset state */
     }
@@ -1210,6 +1358,15 @@ int wlan_idle(void)
     wlan_down();
 #if defined(PLAT_WCNSS_RAILS_PM8916)
     vote_kv("  vddpa 8916_l9 off (AP vote; Pronto votes it when it needs the PA)", T_LDOA, 9u, K_SWEN, 0u);
+    /* vddrfa TOO (2026-09-13). This was missing, and it is why s3 read ON in
+     * every sleep census and why sleep_floor's STEP_RAILS off-vote appeared to
+     * "lose": it was not another master outvoting us, it was THIS driver's own
+     * vote_uv("vddrfa 8916_s3 1.3V", smpa3, 100 mA) from wlan_up() still
+     * standing. wlan_power_off() drops s3 (see below); the idle path released
+     * l9, snoc, pcnoc and EBI but never s3, so the RF buck stayed up all night
+     * with the MAC stopped. Stock keeps s3 off while running BT, so nothing
+     * here needs it. Re-voted by the next wlan_up(). */
+    vote_kv("  vddrfa 8916_s3 off", T_SMPA, 3u, K_SWEN, 0u);
 #endif
     vote_kv("  snoc 0 KHz",  T_CLK1, 1u, K_KHZ, 0u);
     vote_kv("  pcnoc 0 KHz", T_CLK1, 0u, K_KHZ, 0u);
@@ -1230,8 +1387,32 @@ int wlan_power_off(void)
     vote_kv("  rf_clk1 off", T_CLKA, 4u, K_SWEN, 0u);
     vote_kv("  vddpa  8916_l9 off", T_LDOA, 9u, K_SWEN, 0u);
     vote_kv("  vddrfa 8916_s3 off", T_SMPA, 3u, K_SWEN, 0u);
-    vote_kv("  vdddig 8916_l5 off", T_LDOA, 5u, K_SWEN, 0u);
-    vote_kv("  vddpx/pll 8916_l7 off", T_LDOA, 7u, K_SWEN, 0u);
+    /* SHARED RAILS, same bug the Gen 5 hung on (2026-09-10). The RPM aggregates
+     * votes per master, so a radio "swen 0" cancels every other AP vote. From
+     * firefish-stock.dts:
+     *   8916_l5  iris vdddig -- AND sdhci@7824000 vdd-io (eMMC I/O) and the
+     *            codec (cdc-vdda-h, cdc-vdd-pa)
+     *   8916_l7  pronto vddpx, iris vddxo, pll -- AND HSUSB_1p8 and vdd_pll
+     * The Gen 4 survived this in daily use, most likely because another master
+     * keeps both up, but the votes were wrong for the same reason they hung the
+     * Gen 5. l9 (vddpa) and s3 (vddrfa) are radio-only and still released. */
+#elif defined(PLAT_WCNSS_RAILS_PM660_8909)
+    vote_kv("  rf_clk2 off", T_CLKA, 5u, K_SWEN, 0u);
+    vote_kv("  rf_clk1 off", T_CLKA, 4u, K_SWEN, 0u);
+    vote_kv("  vddrfa pm660_l6 off",  T_LDOA, 6u, K_SWEN, 0u);
+    /* SHARED RAILS ARE NOT OURS TO SWITCH OFF (2026-09-10). The RPM aggregates
+     * votes per MASTER, and every consumer on this CPU is the same master, so a
+     * "swen 0" from the radio cancels every other AP vote for that rail. From
+     * triggerfish's own DTB:
+     *   pm660_l12  iris vddxo, pronto pll -- AND mdss_dsi@0 vddio, the DSI PLL
+     *              vdd_pll, and HSUSB_1p8
+     *   pm660_l13  pronto vddpx, iris vdddig -- AND sdhci@7824000 vdd-io (the
+     *              eMMC's I/O rail) and raydium@39 vcc_i2c
+     *   pm660_l6   iris vddrfa only                          -> safe to release
+     * A failed PAS attempt on hardware ran the teardown, and the log stopped
+     * dead after "vddrfa off": the next vote cut the display link, the USB PHY
+     * and the eMMC I/O at once, which is the "hang that kills USB". Leaving
+     * them on only returns them to the state aboot already had them in. */
 #endif
     /* (2026-09-07) the boot also pinned the crystal and both NoCs; release
      * them too or the SoC never drops below the WiFi-active bus rates. */
@@ -1245,6 +1426,63 @@ int wlan_power_off(void)
     say("wlan: radio powered DOWN\n");
     return 0;
 }
+
+
+#if defined(PRONTO_HS_PROBE)
+/* ---- PRONTO SAW2 -> RPM handshake probe (2026-09-13, route 1) --------------
+ * The RPM marks a master asleep only through its SAW2's hardware handshake, so
+ * a PRONTO that never sleeps (our logs: shutdowns=0) pins the RPM out of vmin,
+ * which is the stock <2 mA state. This drives the Pronto SAW2 ourselves:
+ * pronto_saw2_base = 0x0a219000 (skipjack wcnss node), SAW2 v2.1 register map
+ * (SPM_STS 0x0c, SPM_CTL 0x30, SEQ_ENTRY 0x80, VERSION 0xfd0). Sequence bytes
+ * from the 8909 L2 pc mode: 0x07 = sleep WITH RPM handshake, 0x0f = end; the
+ * L2 pc mode also sets qcom,slp_cmd_mode (CTL bit 17). Three escalating
+ * attempts, each followed by the RPM master stats: PRONTO shutdowns moving is
+ * the only success signal. Every MMIO access is announced and flushed first:
+ * if the SAW block is unclocked the NoC error resets the watch and the last
+ * line names the access. Called once per sleep from suspend_msm.c. */
+#define PSAW  0x0a219000u
+static void psaw_regs(const char *tag)
+{
+    con_puts("pronto-hs["); con_puts(tag); con_puts("]: STS "); con_puthex(mmio_read(PSAW + 0x0cu));
+    con_puts(" CTL "); con_puthex(mmio_read(PSAW + 0x30u)); con_puts(" CFG "); con_puthex(mmio_read(PSAW + 0x08u));
+    con_puts(" SEQ0 "); con_puthex(mmio_read(PSAW + s_seq_off)); con_puts("\n"); con_flush(); usb_poll();
+}
+static uint32_t s_seq_off = 0x400u;
+static uint32_t pronto_shutdowns(void) { return mmio_read(0x60150u + 2u * 4096u + 4u); }
+void pronto_hs_probe(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    uint32_t before = pronto_shutdowns();
+    rpm_master_stats_line("pronto-hs before");
+    say("pronto-hs: reading SAW2 VERSION at 0x0a219fd0 ...\n");
+    say_hex("pronto-hs: VERSION ", mmio_read(PSAW + 0xfd0u)); say_hex(" SECURE ", mmio_read(PSAW + 0x00u));
+    say_hex(" ID ", mmio_read(PSAW + 0x04u)); say("\n");
+    psaw_regs("idle");
+    s_seq_off = (mmio_read(PSAW + 0xfd0u) >> 28) >= 3u ? 0x400u : 0x80u;
+    static const struct { const char *what; uint32_t seq, ctl; } k[] = {
+        { "seq {07 0f} CTL EN|SLP_CMD",          0x00000f07u, (1u << 0) | (1u << 17) },
+        { "seq {07 0f} CTL EN|PC_MODE|SLP_CMD",  0x00000f07u, (1u << 0) | (1u << 16) | (1u << 17) },
+        { "seq {b0 07 0f} CTL EN|PC_MODE|SLP_CMD", 0x000f07b0u, (1u << 0) | (1u << 16) | (1u << 17) },
+    };
+    for (unsigned i = 0; i < 3u; i++) {
+        say("pronto-hs: attempt "); say_dec("", i + 1u); say(": "); say(k[i].what); say(" ...\n");
+        mmio_write(PSAW + 0x30u, 0u);                 /* SPM_EN off while the program changes */
+        mmio_write(PSAW + s_seq_off, k[i].seq);        /* v3.0 SAW2 (VERSION 0x30000000 read on the C2): SEQ_ENTRY is 0x400, v2.x 0x80 */
+        __asm__ volatile("dsb" ::: "memory");
+        mmio_write(PSAW + 0x30u, k[i].ctl);           /* start offset 0 in bits [12:4] */
+        __asm__ volatile("dsb" ::: "memory");
+        timer_delay_ms(20u);
+        psaw_regs("+20ms");
+        timer_delay_ms(300u);
+        rpm_master_stats_line("pronto-hs after");
+        if (pronto_shutdowns() != before) { say("pronto-hs: PRONTO shutdowns MOVED -> RPM took the handshake\n"); return; }
+    }
+    say("pronto-hs: no attempt moved PRONTO shutdowns\n");
+}
+#endif
 
 int wlan_scan(struct wlan_scan_net *out, uint32_t max)
 {

@@ -623,6 +623,127 @@ static void settings_set_cpu_mhz(uint16_t mhz) {
   prefs.putUShort("cpumhz", mhz);          // persist to NVS
 }
 
+#if BOARD_HAS_CPU_UNDERVOLT
+/* ---- manual CPU-rail undervolt (Wear 2100) ---------------------------------------
+ * The port's cpu_volt_a7.c normally programs the rail to the voltage the die's own
+ * CPR fuses were characterised at, clamped to the DT floor for the corner. This is
+ * a user-driven offset BELOW that, in whole steps of the regulator's granularity
+ * (12.5 mV on the PM8916's SMPS2). The offset rides on top of whatever corner the
+ * current frequency selects, so it survives speed changes.
+ *
+ * WHY THIS NEEDS A SURVIVED-BOOT GUARD. Below the DT floor there is no way to ask
+ * the chip whether it is happy: an undervolt failure is a hang or silent corruption,
+ * not an error return. Worse, the setting is persistent, so a value that hangs the
+ * watch would hang it again on every boot -- a soft brick recoverable only over
+ * fastboot. Storage mirrors the T5 overclock's scheme: "uvstep" holds the offset and
+ * "uvarm" is set just before applying it and cleared once the watch has proven it can
+ * run. A boot that finds "uvarm" still set knows the previous boot did not survive
+ * and throws the offset away. Cost of a bad setting is therefore one failed boot. */
+static int8_t s_uv_steps    = 0;      // <= 0, in regulator steps
+static bool   s_uv_reverted = false;  // this boot discarded a non-surviving offset
+static bool   s_uv_armed    = false;  // applied this boot, not yet confirmed
+/* Breadcrumb for the value that killed the watch. "uvtry" is written just BEFORE
+ * each rail write, so it survives a hang that happens during the write itself --
+ * the case where "uvstep" was never updated and the next boot silently comes back
+ * on the last good value. Without it a crash tells you only that one happened,
+ * not at what voltage, which is the one thing worth knowing. */
+static int8_t s_uv_hung     = 0;      // offset that did not survive, 0 = none
+
+extern "C" int cpu_volt_set_uv_steps(int steps);
+extern "C" int cpu_volt_uv_step_uv(void);
+extern "C" int cpu_volt_uv_max_steps(void);
+#if BOARD_PLATFORM_FOSSIL
+extern "C" int nvs_commit(void);                   /* snapdragon-port: RAM store -> eMMC slot flip */
+static void settings_store_commit(void) { (void)nvs_commit(); }
+#else
+static void settings_store_commit(void) {}         /* ESP32 NVS commits on every put */
+#endif
+
+static int8_t settings_get_uv_steps(void)  { return s_uv_steps; }
+static bool   settings_uv_was_reverted(void) { return s_uv_reverted; }
+/* The offset that did not survive, or 0. Non-zero only on a boot that followed a
+ * crash, so the Power app can name the voltage instead of just reporting a reset. */
+static int8_t settings_uv_hung_steps(void)   { return s_uv_hung; }
+/* Step size in TENTHS of a mV, so 12.5 mV survives integer formatting. */
+static int    settings_uv_step_tenths(void) { return cpu_volt_uv_step_uv() / 100; }
+static int    settings_uv_max_steps(void)   { return cpu_volt_uv_max_steps(); }
+
+/* Apply + persist a new offset. Re-arms the survived-boot guard, because the value
+ * being set right now is exactly the one that has not been proven yet. */
+static void settings_set_uv_steps(int steps) {
+  // Clamp here too, so the breadcrumb records the value actually attempted.
+  if (steps > 0) steps = 0;
+  if (steps < -settings_uv_max_steps()) steps = -settings_uv_max_steps();
+  prefs.putChar("uvtry", (char)steps);          // BEFORE the write that may hang
+  int got = cpu_volt_set_uv_steps(steps);       // clamps to the port's own limits
+  s_uv_steps = (int8_t)got;
+  s_uv_hung  = 0;
+  prefs.putChar("uvstep", (char)s_uv_steps);
+  if (s_uv_steps != 0) { prefs.putBool("uvarm", true);  s_uv_armed = true; }
+  else                 { prefs.putBool("uvarm", false); s_uv_armed = false; }
+  s_uv_reverted = false;
+}
+
+/* Boot-time apply with the survived-boot gate. Call AFTER settings_load() and after
+ * the saved CPU speed has been applied, since the offset rides on the corner that
+ * speed selects. */
+static void settings_uv_boot_apply(void) {
+  /* A "uvtry" that disagrees with the saved offset means the last button press
+   * hung DURING the rail write: the new value never reached "uvstep", so this
+   * boot is quietly back on the last good one. Report the value that did it. */
+  int8_t tried = (int8_t)prefs.getChar("uvtry", (char)s_uv_steps);
+  if (tried != s_uv_steps) {
+    s_uv_hung = tried;
+    prefs.putChar("uvtry", (char)s_uv_steps);
+  }
+  if (s_uv_steps == 0) return;
+  if (prefs.getBool("uvarm", false)) {
+    // The previous boot applied an offset and never reached settings_uv_boot_ok():
+    // it hung. Drop back to the characterised voltage and say so in the Power app.
+    prefs.putBool("uvarm",  false);
+    prefs.putChar("uvstep", 0);
+    prefs.putChar("uvtry",  0);
+    if (!s_uv_hung) s_uv_hung = s_uv_steps;   // it ran, then died later
+    s_uv_steps = 0; s_uv_reverted = true;
+    return;
+  }
+  prefs.putBool("uvarm", true);
+  s_uv_armed = true;
+  settings_store_commit();                     // the armed state must be ON DISK before the rail moves
+  (void)cpu_volt_set_uv_steps(s_uv_steps);
+}
+
+/* Survived-boot confirmation (2026-09-15 semantics, user): the offset is kept ONLY across a
+ * CLEAN exit -- power off from the Power app or the fastboot button -- which calls
+ * settings_uv_clean_exit() below. Everything else (power button held, crash, watchdog) leaves
+ * "uvarm" set on disk and the next boot discards the offset. So this only marks the RAM state
+ * healthy for the Power app; it no longer clears the on-disk flag. On the eMMC boards the store
+ * reaches disk only on an explicit commit (the clock's epoch save was doing it incidentally,
+ * which is why a reboot used to revert the undervolt at random). */
+static void settings_uv_boot_ok(void) {
+  if (s_uv_armed) {
+    prefs.putChar("uvtry", (char)s_uv_steps);  // this value is proven; resync
+    s_uv_armed = false;
+  }
+}
+
+/* Clean exit: disarm the guard on disk and commit, so the next boot keeps the offset. */
+static void settings_uv_clean_exit(void) {
+  prefs.putBool("uvarm", false);
+  prefs.putChar("uvtry", (char)s_uv_steps);
+  settings_store_commit();
+}
+#endif  /* BOARD_HAS_CPU_UNDERVOLT */
+/* Called from board_power_off() (board_power.h, included before this file): the clean
+ * power-off keeps the undervolt on the boards that have one, no-op elsewhere. */
+static void settings_uv_clean_exit_if_any(void) {
+#if BOARD_HAS_CPU_UNDERVOLT
+  settings_uv_clean_exit();
+#endif
+}
+#if BOARD_HAS_CPU_UNDERVOLT
+#endif  /* BOARD_HAS_CPU_UNDERVOLT */
+
 #if BOARD_PLATFORM_TUYA
 /* ---- persistent DPLL overclock (T5) ----------------------------------------------
  * Storage keys in the "watch" namespace: "ocen" (bool), "ocband" (u8), "ocmv" (u16),
@@ -726,6 +847,10 @@ static void settings_load(void) {
       if (CPU_FREQS[i] == s_cpu_mhz) { cpu_ok = true; break; }
     if (!cpu_ok) s_cpu_mhz = cpu_def;
   }
+#if BOARD_HAS_CPU_UNDERVOLT
+  s_uv_steps          = (int8_t)prefs.getChar("uvstep", (char)s_uv_steps);
+  if (s_uv_steps > 0) s_uv_steps = 0;     // the offset only ever lowers the rail
+#endif
   s_wifi_enabled      = prefs.getBool  ("wifien",   s_wifi_enabled);
   s_ble_enabled       = prefs.getBool  ("bleen",    s_ble_enabled);
   s_wifi_txp          = prefs.getUChar ("wifitxp",  s_wifi_txp) % RADIO_TXP_COUNT;

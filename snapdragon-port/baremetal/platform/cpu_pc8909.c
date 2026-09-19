@@ -123,6 +123,7 @@ void cpu_pc8909_init(void)
 #if defined(SYS_PC_8909)
     (void)sys_pc8909_init();
 #endif
+    q6_audio_probe(1500u, "P3 after sys-pc init (sleep-set votes, spm)");
 }
 
 int cpu_pc8909_ready(void) { return s_ready; }
@@ -142,52 +143,93 @@ void cpu_pc8909_prev_report(void)
 #endif
 #if defined(SYS_PC_8909)
     pon_crumb_report();
+    con_puts("prev-report: crumb done, next the TZ counters\n"); con_flush(); usb_poll();
 #if !defined(SYS_PC_WARM_RESET_DIAG)
+#if defined(MSS_BOOT)
+    /* 2026-09-18 (gen5-modem-29): with the modem running, every boot since chime11 died between
+     * the crumb line and this IMEM read. IMEM 0x08600000 is shared with the modem's PIL and TZ;
+     * an XPU-protected word answers with an external abort or a secure reset, not a value. The
+     * counters are a diagnostic only, so they are not read while the modem owns the system. */
+    { extern int mss_ready(void);
+      if (mss_ready()) con_puts("tzdbg[previous life]: skipped, modem up (IMEM read is not safe here)\n");
+      else tz_boot_counters("previous life"); }
+#else
     tz_boot_counters("previous life");   /* IMEM survives the PMIC reset (v158): did TZ start the warm boot? */
 #endif
 #endif
-    {   /* v192: CPU fault record from the previous life (startup.S fault_stub) */
-        volatile uint32_t *f = (volatile uint32_t *)(__ramlog_end - 32);
-        if ((f[0] & 0xFF000000u) == 0xFA000000u) {
-            uint32_t cls = f[0] & 0xFFu;
-            con_puts("!! FAULT in previous life: "); con_puts(cls == 1u ? "UNDEF" : cls == 3u ? "PREFETCH ABORT" : cls == 4u ? "DATA ABORT" : cls == 5u ? "FIQ" : cls == 6u ? "MALLOC FAILED (FreeRTOS heap)" : cls == 7u ? "STACK OVERFLOW (task tag in far)" : cls == 8u ? "DEAD-MAN TIMEOUT (30 s without a loop kick)" : "?");
-            con_puts(" lr="); con_puthex(f[1]); con_puts(" (pc ~ lr-8 for a data abort, lr-4 otherwise)");
-            con_puts(" fsr="); con_puthex(f[2]); con_puts(" far="); con_puthex(f[3]);
-            con_puts("  -> arm-none-eabi-addr2line -e build/<board>/owf.elf 0x"); con_puthex(f[1] - (cls == 4u ? 8u : 4u)); con_puts("\n");
-            f[0] = 0u;
-        }
-    }
+#endif
+    fault_record_report();   /* v192 record; now also printed before the modem gate (irq.c) */
     volatile uint32_t *slot = (volatile uint32_t *)(__ramlog_end - 16);
     uint32_t mark = *slot; const char *src = "DDR";
+#if defined(MSS_BOOT)
+    { extern int mss_ready(void); if (!mss_ready()) {   /* same IMEM caveat as the TZ counters above */
+#else
+    {   {
+#endif
     if (mmio_read(PC_IMEM_MARK + 4u) == PC_IMEM_MAGIC) {
         mark = mmio_read(PC_IMEM_MARK); src = "IMEM";
         mmio_write(PC_IMEM_MARK + 4u, 0u);            /* consume: report each life once */
-    }
+    } } }
     con_puts("cpu-pc: "); con_puts(src); con_puts(" mark from previous life = "); con_puthex(mark); con_puts(" (");
-    switch (mark) {
-    case 0x10u: case 0x11u: con_puts("died before the SCM call"); break;
-    case 0x12u: con_puts("SCM issued, never re-entered: TZ did not warm-boot our address"); break;
-    case 0x13u: con_puts("SCM returned without collapsing"); break;
-    case 0x20u: case 0x21u: case 0x22u: case 0x23u: con_puts("TZ re-entered us, restore faulted at this step"); break;
-    case 0x24u: con_puts("restore completed, died before gic_cpu_resume"); break;
-    case 0x30u: con_puts("died in gic_cpu_resume"); break;
-    case 0x31u: con_puts("died in tick_rearm"); break;
-    case 0x32u: con_puts("died clearing the qtimer frame"); break;
-    case 0x33u: con_puts("died on cpsie / first interrupt"); break;
-    case 0x34u: con_puts("died in spm_cpu0_mode(0)"); break;
-    case 0x35u: con_puts("died in wdog_extend"); break;
-    case 0x36u: con_puts("died in xTaskCatchUpTicks"); break;
-    case 0x37u: con_puts("cpu-pc returned to the suspend loop, died there"); break;
-    case 0x38u: con_puts("died after cpu_pc8909_report"); break;
-    case 0x39u: con_puts("died in the chunk housekeeping"); break;
-    case 0x3Au: con_puts("suspend loop ended, died on the way back to the app"); break;
-    case 0x3Bu: con_puts("report + blackbox commit done, died before housekeeping (wdog_pet/deadman_kick)"); break;
-    case 0x3Cu: con_puts("died in usb_poll() after a resume"); break;
-    case 0x3Du: con_puts("died in con_flush()/wake checks after a resume"); break;
-    case 0x3Eu: con_puts("next chunk started, died before/inside cpu_pc8909_sleep entry (timer reads)"); break;
-    case 0x3Fu: con_puts("died in qt_arm() of the next attempt"); break;
-    case 0x40u: con_puts("qtimer armed for the next attempt, died before/in the pre-SMC print or blackbox"); break;
-    default: con_puts("no collapse attempt, or IMEM not retained"); break;
+    /* 2026-09-18 (gen5-modem-34): this used to be a switch. Its compiled jump table dispatched
+     * mark 0x3a into the tz_boot_counters() block above, whose tail re-enters the report: an
+     * endless "cpu-pc: DDR mark ... (tzdbg[..." flood on chime27..29, on three different code
+     * layouts, with the table correct in the image. A string table with a bounds check has no
+     * computed jump to misfire. */
+    {
+        static const char *const k_mark_txt[] = {
+        /* 0x10 */ "died before the SCM call",
+        /* 0x11 */ "died before the SCM call",
+        /* 0x12 */ "SCM issued, never re-entered: TZ did not warm-boot our address",
+        /* 0x13 */ "SCM returned without collapsing",
+        /* 0x14 */ NULL,
+        /* 0x15 */ NULL,
+        /* 0x16 */ NULL,
+        /* 0x17 */ NULL,
+        /* 0x18 */ NULL,
+        /* 0x19 */ NULL,
+        /* 0x1a */ NULL,
+        /* 0x1b */ NULL,
+        /* 0x1c */ NULL,
+        /* 0x1d */ NULL,
+        /* 0x1e */ NULL,
+        /* 0x1f */ NULL,
+        /* 0x20 */ NULL,
+        /* 0x21 */ NULL,
+        /* 0x22 */ "TZ re-entered us, restore faulted at this step",
+        /* 0x23 */ "TZ re-entered us, restore faulted at this step",
+        /* 0x24 */ "restore completed, died before gic_cpu_resume",
+        /* 0x25 */ NULL,
+        /* 0x26 */ NULL,
+        /* 0x27 */ NULL,
+        /* 0x28 */ NULL,
+        /* 0x29 */ NULL,
+        /* 0x2a */ NULL,
+        /* 0x2b */ NULL,
+        /* 0x2c */ NULL,
+        /* 0x2d */ NULL,
+        /* 0x2e */ NULL,
+        /* 0x2f */ NULL,
+        /* 0x30 */ "died in gic_cpu_resume",
+        /* 0x31 */ "died in tick_rearm",
+        /* 0x32 */ "died clearing the qtimer frame",
+        /* 0x33 */ "died on cpsie / first interrupt",
+        /* 0x34 */ "died in spm_cpu0_mode(0)",
+        /* 0x35 */ "died in wdog_extend",
+        /* 0x36 */ "died in xTaskCatchUpTicks",
+        /* 0x37 */ "cpu-pc returned to the suspend loop, died there",
+        /* 0x38 */ "died after cpu_pc8909_report",
+        /* 0x39 */ "died in the chunk housekeeping",
+        /* 0x3a */ "suspend loop ended, died on the way back to the app",
+        /* 0x3b */ "report + blackbox commit done, died before housekeeping (wdog_pet/deadman_kick)",
+        /* 0x3c */ "died in usb_poll() after a resume",
+        /* 0x3d */ "died in con_flush()/wake checks after a resume",
+        /* 0x3e */ "next chunk started, died before/inside cpu_pc8909_sleep entry (timer reads)",
+        /* 0x3f */ "died in qt_arm() of the next attempt",
+        /* 0x40 */ "qtimer armed for the next attempt, died before/in the pre-SMC print or blackbox",
+        };
+        const char *t = (mark >= 0x10u && mark <= 0x40u) ? k_mark_txt[mark - 0x10u] : NULL;
+        con_puts(t ? t : "no collapse attempt, or IMEM not retained");
     }
     con_puts(")\n");
     *slot = 0u;

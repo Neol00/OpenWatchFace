@@ -19,7 +19,7 @@ SECTIONS
         *(.text.startup)
         *(.text*)
     }
-    .rodata : { *(.rodata*) }
+    .rodata : { __rodata_start = .; *(.rodata*) __rodata_end = .; }
     /* C++ static constructors. THE 3-SECOND BUG (2026-08-03): this section
      * existed but NOTHING ever ran it, so every global C++ object (USBSerial!)
      * kept a NULL vtable pointer — the .ino banner println was a call through

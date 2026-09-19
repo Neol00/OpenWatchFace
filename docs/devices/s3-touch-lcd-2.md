@@ -1,4 +1,4 @@
-# Waveshare ESP32-S3-Touch-LCD-2 — install guide
+# Waveshare ESP32-S3-Touch-LCD-2 install guide
 
 | | |
 |---|---|
@@ -44,7 +44,7 @@ On Windows the default location for the libraries is:
 `C:\Users\yourusername\Documents\Arduino\libraries`
 
 On Linux the default location for the libraries is:
-`/home/yourusername/Arduino/libraries`
+`~/Arduino/libraries`
 
 Copy the **contents** of this repo's `libraries/` folder in, so the library folders
 and `lv_conf.h` land directly inside it. `lv_conf.h` must sit **next to** the `lvgl`
@@ -65,7 +65,7 @@ On Windows the location for the esp32 libs is:
 `C:\Users\yourusername\AppData\Local\Arduino15\packages\esp32\tools`
 
 On Linux the location for the esp32 libs is:
-`/home/yourusername/.arduino15/packages/esp32/tools`
+`~/.arduino15/packages/esp32/tools`
 
 > The S3 boards need `esp32s3-libs`. The `esp32c6-libs` set is only for the C6, so you
 > can leave it alone here.
@@ -172,7 +172,7 @@ Open `OpenWatchFace/OpenWatchFace.ino`, then **Verify** (compile) and **Upload**
 
 All of these are compile-time and live in the sketch folder.
 
-### Board header — `OpenWatchFace/board_ws_s3_touch_lcd_2.h`
+### Board header `OpenWatchFace/board_ws_s3_touch_lcd_2.h`
 
 | Setting | Default | What it does |
 |---|---|---|

@@ -36,7 +36,24 @@
 #include "platform.h"
 #if defined(PLAT_SOC_MSM)
 
-#if defined(PLAT_SOC_MSM8909)
+/* WHICH VIBRATOR BLOCK — asked as a capability, not as "which watch".
+ * This used to select PM8916 on PLAT_SOC_MSM8909 and PM660 on
+ * PLAT_BOARD_FOSSIL_GEN6, which silently assumed 8909 implies PM8916. The
+ * Fossil Gen 5 (triggerfish, Wear 3100) breaks that: it is an msm8909 AP with
+ * a PM660, so the old guards would have handed it the PM8916 single-enable-bit
+ * driver and written 0x80 into a register that block does not have. The Gen 6
+ * keeps working through the compatibility shim below. */
+#if defined(PLAT_BOARD_FOSSIL_GEN6) && !defined(PLAT_VIB_PM660_HAPTICS)
+#define PLAT_VIB_PM660_HAPTICS 1
+#endif
+
+#if defined(PLAT_VIB_PM660_HAPTICS)
+#define PLAT_VIB_BLOCK_PM660 1
+#elif defined(PLAT_SOC_MSM8909)
+#define PLAT_VIB_BLOCK_PM8916 1
+#endif
+
+#if defined(PLAT_VIB_BLOCK_PM8916)
 /* ---- PM8916 vibrator (qpnp-vibrator @ 0xc000, slave id 1) ----------------
  * Shared by every msm8909w watch here: the Wear 2100 is paired with a PM8916
  * on both the Fossil Gen 4 and the TicWatch C2, and the vibrator block is part
@@ -133,55 +150,192 @@ void vib_set(int on)
     spmi_write8(s_vib_sid, QPNP_VIB_EN_CTL, on ? QPNP_VIB_EN : 0u);
 }
 
-#elif defined(PLAT_BOARD_FOSSIL_GEN6)
+#elif defined(PLAT_VIB_BLOCK_PM660)
 /* ---- PM660 haptics (qcom,pm660-haptics @ 0xc000, SPMI slave id 1) --------
  * DIFFERENT BLOCK from the Gen 4's PM8916 vibrator: qpnp-haptics is a waveform
  * player, not a single enable bit, so it needs a mode + drive config before
- * PLAY does anything. DTB (qcom,haptic@c000 on qcom,pm660@1):
+ * PLAY does anything. DTB (qcom,haptics@c000 on qcom,pm660@1):
  *   qcom,actuator-type = "erm"      -> ERM, not LRA (no resonance tracking)
  *   qcom,vmax-mv       = 0xc80      -> 3200 mV
- *   qcom,play-rate-us  = 0x2710
+ *   qcom,ilim-ma       = 0x190      -> 400 mA
+ *   qcom,play-rate-us  = 0x2710     -> 10000 us
  *
- * Register map from the vendor qpnp-haptics driver (drivers/.../qpnp-haptics.c):
- *   0xC023 ACT_TYPE   bit0: 0 = LRA, 1 = ERM
- *   0xC043 PLAY       bit7 PLAY_EN
- *   0xC044 EN_CTL     bit7 EN
- *   0xC04A VMAX_CFG   [5:1] vmax, step 116 mV
- *   0xC04C WAVE_SHAPE bit0: 0 = square, 1 = sine
- *   0xC04D PLAY_MODE  [1:0] 0 = direct play (what we want: no waveform table)
+ * REGISTER MAP — THIS IS WHAT WAS WRONG (fixed 2026-09-12, Gen 5 motor dead).
+ * The compatible string is "qcom,pm660-haptics", and that binding is served by
+ * drivers/leds/leds-qpnp-haptics.c, NOT by the older qpnp-haptic.c. The map
+ * this file used before (ACT_TYPE 0x23, PLAY 0x43, EN 0x44, VMAX 0x4A,
+ * PLAY_MODE 0x4D) matches NEITHER driver — every write landed on an unrelated
+ * offset inside the peripheral, so the block was never configured and PLAY was
+ * never asserted. SPMI reported success for all of it, which is why this looked
+ * like working code. The real offsets from the base, per leds-qpnp-haptics.c:
+ *   0x0A STATUS_1     bit1 BUSY, bit3 SC_FLAG (short-circuit latched)
+ *   0x46 EN           bit7 module enable
+ *   0x4B AUTO_RES_CTRL bit7 auto-resonance (LRA only -> off for an ERM)
+ *   0x4C ACT_TYPE     bit0: 0 = LRA, 1 = ERM
+ *   0x4D WAV_SHAPE    bit0: 0 = square, 1 = sine
+ *   0x4E PLAY_MODE    [5:4] WF_SOURCE: 0 = direct play (no waveform table)
+ *   0x51 VMAX_CFG     [5:1] vmax, one step per 116 mV
+ *   0x52 ILIM_CFG     bit0: 0 = 400 mA, 1 = 800 mA
+ *   0x54 RATE_CFG1    play rate low  8 bits, one step per 5 us
+ *   0x55 RATE_CFG2    play rate high 4 bits
+ *   0x5C BRAKE        brake pattern (0 = no braking)
+ *   0x70 PLAY         bit7 PLAY, bit0 PAUSE
  *
  * Direct-play mode is deliberate — it is the fewest moving parts that produces
  * a buzz, which is the whole point of this driver during bring-up. */
-#define QPNP_HAP_ACT_TYPE   0xC023u
-#define QPNP_HAP_PLAY       0xC043u
-#define QPNP_HAP_EN_CTL     0xC044u
-#define QPNP_HAP_VMAX_CFG   0xC04Au
-#define QPNP_HAP_PLAY_MODE  0xC04Du
+#define QPNP_HAP_STATUS_1   (PLAT_HAP_BASE + 0x0Au)
+#define QPNP_HAP_EN_CTL     (PLAT_HAP_BASE + 0x46u)
+#define QPNP_HAP_AUTO_RES   (PLAT_HAP_BASE + 0x4Bu)
+#define QPNP_HAP_ACT_TYPE   (PLAT_HAP_BASE + 0x4Cu)
+#define QPNP_HAP_WAV_SHAPE  (PLAT_HAP_BASE + 0x4Du)
+#define QPNP_HAP_PLAY_MODE  (PLAT_HAP_BASE + 0x4Eu)
+#define QPNP_HAP_VMAX_CFG   (PLAT_HAP_BASE + 0x51u)
+#define QPNP_HAP_ILIM_CFG   (PLAT_HAP_BASE + 0x52u)
+#define QPNP_HAP_RATE_CFG1  (PLAT_HAP_BASE + 0x54u)
+#define QPNP_HAP_RATE_CFG2  (PLAT_HAP_BASE + 0x55u)
+#define QPNP_HAP_EN_CTL2    (PLAT_HAP_BASE + 0x48u)
+#define QPNP_HAP_BRAKE      (PLAT_HAP_BASE + 0x5Cu)
+#define QPNP_HAP_PLAY       (PLAT_HAP_BASE + 0x70u)
 
-#define QPNP_HAP_ACT_ERM    0x01u
-#define QPNP_HAP_PLAY_EN    (1u << 7)
-#define QPNP_HAP_EN         (1u << 7)
-#define QPNP_HAP_MODE_DIRECT 0x00u
+#define QPNP_HAP_BUSY_BIT    (1u << 1)
+#define QPNP_HAP_SC_FLAG_BIT (1u << 3)
+#define QPNP_HAP_ACT_ERM     0x01u
+#define QPNP_HAP_WAVE_SQUARE 0x00u
+#define QPNP_HAP_PLAY_BIT    (1u << 7)
+#define QPNP_HAP_EN          (1u << 7)
+#define QPNP_HAP_MODE_DIRECT 0x00u   /* WF_SOURCE [5:4] = 0 */
+#define QPNP_HAP_BRAKE_EN    (1u << 0)   /* EN_CTL2 bit0 */
 
-/* VMAX_CFG holds the level in bits [5:1], one step per 116 mV. */
+/* ---- BRAKING: what makes a buzz feel like a TICK instead of a "wrrrr" ------
+ * An ERM does not stop when the drive stops. The rotor has momentum and coasts
+ * for tens of milliseconds, and that tail is what a wearer perceives as the
+ * motor being slow, sluggish or delayed -- the harder it was driven, the longer
+ * and more noticeable the tail. Raising the drive level without braking makes
+ * this WORSE, not better, which is exactly what happened on the Gen 5 in v295.
+ *
+ * Braking drives the motor briefly in REVERSE to kill that momentum, so the
+ * buzz ends when the pulse ends. The block does it in hardware from a 4-entry
+ * pattern in HAP_BRAKE, two bits per entry, oldest in [1:0]. This watch's own
+ * DTB says what the vendor uses for it (qcom,haptics@c000, wf_0):
+ *
+ *     qcom,wf-brake-pattern = <0x1000000>   ->  bytes 01 00 00 00
+ *
+ * i.e. one reverse step then nothing: brake hard, immediately, once. That is
+ * the value below. Braking is gated by BRAKE_EN in EN_CTL2 (0x48) -- the
+ * pattern alone does nothing without it, which is why v295 had a brake pattern
+ * register write of 0 AND no enable, and coasted freely. */
+#ifndef PLAT_HAP_BRAKE_EN
+#define PLAT_HAP_BRAKE_EN 1
+#endif
+#ifndef PLAT_HAP_BRAKE_PATTERN
+#define PLAT_HAP_BRAKE_PATTERN 0x01u   /* from this watch's DTB: 01 00 00 00 */
+#endif
+
+/* VMAX_CFG holds the drive level in bits [5:1], one step per 116 mV, so the
+ * block's range is 116 mV (1) to 3596 mV (31) and 3596 is FULL SCALE.
+ *
+ * ROUNDING, not truncation. qpnp_haptics_vmax_config() uses DIV_ROUND_CLOSEST,
+ * and the difference is not cosmetic: 3200 mV truncated is 27 steps = 3132 mV,
+ * rounded it is 28 = 3248 mV. Truncating threw away 116 mV of drive on every
+ * board using this file. Clamped to the block's own range first, as the vendor
+ * does, so an out-of-range board value can never wrap into a tiny level. */
 #define QPNP_HAP_VMAX_STEP_MV 116u
-#define QPNP_HAP_VMAX_REG(mv) (uint8_t)((((mv) / QPNP_HAP_VMAX_STEP_MV) & 0x1Fu) << 1)
+#define QPNP_HAP_VMAX_MIN_MV  116u
+#define QPNP_HAP_VMAX_MAX_MV  3596u
+#define QPNP_HAP_VMAX_CLAMP(mv) \
+    ((mv) < QPNP_HAP_VMAX_MIN_MV ? QPNP_HAP_VMAX_MIN_MV : \
+     (mv) > QPNP_HAP_VMAX_MAX_MV ? QPNP_HAP_VMAX_MAX_MV : (mv))
+#define QPNP_HAP_VMAX_STEPS(mv) \
+    (((QPNP_HAP_VMAX_CLAMP(mv) + (QPNP_HAP_VMAX_STEP_MV / 2u)) / QPNP_HAP_VMAX_STEP_MV))
+#define QPNP_HAP_VMAX_REG(mv) (uint8_t)((QPNP_HAP_VMAX_STEPS(mv) & 0x1Fu) << 1)
+
+/* Play rate is programmed in 5 us steps across two registers (12 bits). */
+#ifndef PLAT_HAP_PLAY_RATE_US
+#define PLAT_HAP_PLAY_RATE_US 10000u   /* DTB qcom,play-rate-us = 0x2710 */
+#endif
+#define QPNP_HAP_RATE_STEP_US 5u
+#define QPNP_HAP_RATE_VAL     ((PLAT_HAP_PLAY_RATE_US) / QPNP_HAP_RATE_STEP_US)
+
+/* ILIM: bit0 selects the current limit. DTB says 400 mA. */
+#ifndef PLAT_HAP_ILIM_MA
+#define PLAT_HAP_ILIM_MA 400u
+#endif
+#define QPNP_HAP_ILIM_VAL ((PLAT_HAP_ILIM_MA) > 400u ? 1u : 0u)
+
+static uint8_t s_vib_sid;
+static int     s_vib_ok;
+
+/* Resolve the slave id the ARBITER agrees the haptics block lives on, exactly
+ * as the PM8916 branch does. This is not politeness: writing an SPMI peripheral
+ * owned by another execution environment trips an ownership violation and the
+ * secure world answers with an instant TZ reset (pmic_rtc.c cost a flash cycle
+ * learning that). Resolve read-only first, write only if we own it.
+ *
+ * PLAT_PMIC_SID (1) is the device tree's answer and is tried first; sid 0 is a
+ * fallback so a board that really differs degrades to a log line, not a reset. */
+static int vib_resolve_sid(void)
+{
+    static const uint8_t cand[2] = { (uint8_t)PLAT_PMIC_SID, 0u };
+
+    for (unsigned i = 0; i < 2u; i++) {
+        int apid = spmi_apid_of(cand[i], QPNP_HAP_EN_CTL);
+        int ee   = spmi_owner_ee(cand[i], QPNP_HAP_EN_CTL);
+        bdiag_puts("hap: sid=");   bdiag_putdec(cand[i]);
+        bdiag_puts(" apid=");      bdiag_putdec((uint32_t)apid);
+        bdiag_puts(" owner_ee=");  bdiag_putdec((uint32_t)ee);
+        bdiag_puts("\n");
+        if (apid >= 0 && ee == 0) {
+            s_vib_sid = cand[i];
+            return 0;
+        }
+    }
+    return -1;
+}
 
 int vib_init(void)
 {
     int rc = 0;
-    rc |= spmi_write8(PLAT_PMIC_SID, QPNP_HAP_ACT_TYPE,  QPNP_HAP_ACT_ERM);
-    rc |= spmi_write8(PLAT_PMIC_SID, QPNP_HAP_PLAY_MODE, QPNP_HAP_MODE_DIRECT);
-    rc |= spmi_write8(PLAT_PMIC_SID, QPNP_HAP_VMAX_CFG,
+
+    if (!s_vib_ok) {
+        if (vib_resolve_sid() < 0) {
+            con_puts("hap: no writable haptics channel - motor disabled\n");
+            return -1;
+        }
+        s_vib_ok = 1;
+    }
+
+    /* Module OFF while reconfiguring: the vendor driver never changes the
+     * actuator type or the play mode with EN asserted. */
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_EN_CTL,    0u);
+
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_ACT_TYPE,  QPNP_HAP_ACT_ERM);
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_AUTO_RES,  0u);   /* LRA-only feature */
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_WAV_SHAPE, QPNP_HAP_WAVE_SQUARE);
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_PLAY_MODE, QPNP_HAP_MODE_DIRECT);
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_VMAX_CFG,
                       QPNP_HAP_VMAX_REG(PLAT_HAP_VMAX_MV));
-    /* Module enable stays on; PLAY is what gates the motor. */
-    rc |= spmi_write8(PLAT_PMIC_SID, QPNP_HAP_EN_CTL,    QPNP_HAP_EN);
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_ILIM_CFG,  (uint8_t)QPNP_HAP_ILIM_VAL);
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_RATE_CFG1,
+                      (uint8_t)(QPNP_HAP_RATE_VAL & 0xFFu));
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_RATE_CFG2,
+                      (uint8_t)((QPNP_HAP_RATE_VAL >> 8) & 0x0Fu));
+    /* Brake pattern first, then the enable that arms it. */
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_BRAKE,
+                      (uint8_t)(PLAT_HAP_BRAKE_EN ? PLAT_HAP_BRAKE_PATTERN : 0u));
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_EN_CTL2,
+                      (uint8_t)(PLAT_HAP_BRAKE_EN ? QPNP_HAP_BRAKE_EN : 0u));
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_PLAY,      0u);   /* known-idle */
+
+    /* Module enable stays on from here; PLAY is what gates the motor. */
+    rc |= spmi_write8(s_vib_sid, QPNP_HAP_EN_CTL,    QPNP_HAP_EN);
+
     return rc ? -1 : 0;
 }
 
 void vib_set(int on)
 {
-    spmi_write8(PLAT_PMIC_SID, QPNP_HAP_PLAY, on ? QPNP_HAP_PLAY_EN : 0u);
+    if (!s_vib_ok) return;          /* never write an unowned peripheral */
+    spmi_write8(s_vib_sid, QPNP_HAP_PLAY, on ? QPNP_HAP_PLAY_BIT : 0u);
 }
 #endif
 

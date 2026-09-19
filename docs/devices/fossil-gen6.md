@@ -20,9 +20,9 @@
 
 > **Wear OS is replaced, not dual-booted.** Flashing this firmware to `boot`
 > overwrites Wear OS. If you may want to go back, take a
-> [full backup of the stock partitions](#4-optional-back-up-your-original-wear-os-installation)
+> [full backup of the stock partitions](#4-back-up-your-original-installation)
 > first. There is also a temporary option that leaves Wear OS in place, see
-> [Temporary install](#option-b--temporary-install-recovery-partition).
+> [Temporary install](#option-b-temporary-install-recovery-partition).
 
 ---
 
@@ -98,16 +98,16 @@ fastboot --version
 
 ---
 
-## Part 1 Getting an image
+## Part 1: Getting an image
 
 You have two options. **Most people should take the prebuilt image.**
 
-### Option A download a prebuilt image (recommended)
+### Option A: download a prebuilt image (recommended)
 
 Grab the Fossil Gen 6 `.img` from the [GitHub releases page](../../../../releases).
-That is the whole step. Skip to [Part 2 Flashing](#part-2--flashing).
+That is the whole step. Skip to [Part 2: Flashing](#part-2-flashing).
 
-### Option B build it yourself
+### Option B: build it yourself
 
 Only needed if you want to change the firmware or the build flags.
 
@@ -153,12 +153,12 @@ ls build/gen6/ # result should be: build/gen6/owf-boot.img
 > exactly as written above.
 >
 > The cost is only a chattier log. If you want it quiet, see
-> [Logging / debugging flags](#logging--debugging-flags) but expect the
+> [Diagnostics](#diagnostics) but expect the
 > boot loop until this note disappears.
 
 > **Do not drop flags from that `CFLAGS_EXTRA` line.** Two of them are named
 > like debug options but the firmware is broken without them, see
-> [Load-bearing flags](#load-bearing-flags-do-not-omit). This mistake has been
+> [Load-bearing](#load-bearing). This mistake has been
 > made more than once and produces a watch that reboots after 30 seconds with
 > dead touch.
 
@@ -190,7 +190,7 @@ Full build reference, including every flag in the tree:
 
 ---
 
-## Part 2 Flashing
+## Part 2: Flashing
 
 ### 1. Connect the charger the right way round
 
@@ -283,7 +283,7 @@ side keys and hold down the middle button to select the option that unlocks boot
 > factory reset the watch Wear OS installation. I take no resposiblity if you brick your 
 > hardware or lose any valuable data. 
 
-### 4. Optional: back up your original Wear OS installation
+### 4. Back up your original installation
 
 If you want to be able to return the watch to exactly how it shipped, take a
 full dump of the stock partitions **before** you flash anything over them. This
@@ -376,7 +376,7 @@ fastboot flash recovery recovery.img
 
 ### 5. Flash
 
-#### Option A permanent install (`boot` partition)
+#### Option A: permanent install (`boot` partition)
 
 This is the normal install. It replaces Wear OS.
 
@@ -387,7 +387,7 @@ fastboot reboot
 
 The watch boots into OpenWatchFace.
 
-#### Option B temporary install (`recovery` partition)
+#### Option B: temporary install (`recovery` partition)
 
 For trying the firmware **without** removing Wear OS.
 
@@ -449,21 +449,21 @@ Only relevant if you are building yourself (Part 1, Option B). The full
 reference is in [`BUILD-GEN6.md`](../../snapdragon-port/BUILD-GEN6.md); this is the
 practical subset.
 
-### Load-bearing flags (do not omit)
-
-| Flag | What happens without it |
-|---|---|
-| `-DWDOG_TRACE` | The only thing that compiles `wdog_pet()` into the main loop. Without it nothing pets the watchdog and **the watch reboots ~30 s into every boot.** |
-| `-DPLAT_I2C_RETEST` | Without it the board header sets `PLAT_I2C_DISABLED`, the QUP never initialises and **touch is completely dead.** |
-
-### Recommended defaults
+### Recommended
 
 | Flag | What it does |
 |---|---|
 | `-DDISPLAY_BISECT` | Selects the watchdog stage-timeout table used by every image proven on hardware. |
 | `-DTOUCH_DIAG` | Paints one diagnostic colour **only if the touch probe fails**, magenta = QUP/clock, red = chip mute + L13 rail off, green = rail fine so suspect pins/protocol, yellow = rail unreadable. Inert when touch works. |
 
-### Logging / debugging flags
+### Load-bearing
+
+| Flag | What happens without it |
+|---|---|
+| `-DWDOG_TRACE` | The only thing that compiles `wdog_pet()` into the main loop. Without it nothing pets the watchdog and **the watch reboots ~30 s into every boot.** |
+| `-DPLAT_I2C_RETEST` | Without it the board header sets `PLAT_I2C_DISABLED`, the QUP never initialises and **touch is completely dead.** |
+
+### Diagnostics
 
 The port carries a lot of instrumentation from bring-up. It is all **silent by
 default**, add a flag to bring it back. **Failures always print regardless;**
@@ -501,7 +501,7 @@ A quiet boot is roughly 20 lines and a sleep is two.
 
 ---
 
-## Troubleshooting fastboot
+## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -510,7 +510,7 @@ A quiet boot is roughly 20 lines and a sleep is two.
 | Every fastboot command hangs after you interrupted one | **Never kill `fastboot` mid-transfer.** `pkill fastboot`, or a `timeout` firing, leaves stale bytes in the host USB buffer and desyncs the protocol. Fix with a USB port reset rather than more killing: find the device via `lsusb \| grep 18d1:d00d` → `/dev/bus/usb/<bus>/<dev>`, then issue a `USBDEVFS_RESET` ioctl on it. Unplugging and replugging the puck also clears it. |
 | `fastboot boot` does nothing | Expected. It does not work on the Gen 6, flash instead. |
 | Flashed `recovery`, watch still boots Wear OS | You must pick **Recovery mode** from the on-watch fastboot menu (select with the crown). You cannot select it over fastboot. |
-| Firmware in `recovery` disappeared | Wear OS restored the stock recovery image on its next boot. Expected see [Option B](#option-b--temporary-install-recovery-partition). |
+| Firmware in `recovery` disappeared | Wear OS restored the stock recovery image on its next boot. Expected see [Option B](#option-b-temporary-install-recovery-partition). |
 | Watch boot-loops immediately after flashing your own build | **Known issue.** You built without the logging flags. Rebuild with `-DBOOT_DIAG -DLV_DIAG -DDSI_DIAG -DSLEEP_DIAG -DOWF_SLEEP_VERBOSE` added see [Build](#build). Your image is not corrupt and nothing is missing from it. |
 | Watch reboots ~30 s into every boot | You built without `-DWDOG_TRACE`. |
 | Touch completely dead | You built without `-DPLAT_I2C_RETEST`. |

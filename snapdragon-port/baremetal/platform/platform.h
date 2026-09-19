@@ -7,6 +7,17 @@
 #include "../boards/qemu_virt.h"
 #elif defined(PLAT_BOARD_FOSSIL_GEN4)
 #include "../boards/fossil_gen4.h"
+#elif defined(PLAT_BOARD_FOSSIL_DARTER)
+#include "../boards/fossil_darter.h"    /* Fossil Sport "darter": Gen 5 + 390x390 panel (also defines PLAT_BOARD_FOSSIL_GEN5) */
+#elif defined(PLAT_BOARD_FOSSIL_GEN5E)
+#include "../boards/fossil_gen5e.h"     /* Gen 5E "sole": Gen 5 + 390x390 panel (also defines PLAT_BOARD_FOSSIL_GEN5) */
+#elif defined(PLAT_BOARD_FOSSIL_GEN5)
+/* Gen 5 = triggerfish (Wear 3100): the msm8909 AP of the Gen 4 with the PM660
+ * of the Gen 6. It sits in the MSM8909 tier like the Gen 4, so it picks up the
+ * A7 clock RCG / MDP3 / DSI / MMU work unchanged — but its PMIC-side drivers
+ * (haptics, RTC, charger, WCNSS rails) are the Gen 6's, selected per-capability
+ * rather than per-board. */
+#include "../boards/fossil_gen5.h"
 #elif defined(PLAT_BOARD_FOSSIL_GEN6)
 #include "../boards/fossil_gen6.h"
 #elif defined(PLAT_BOARD_TICWATCH_S2)
@@ -17,7 +28,7 @@
 #include "../boards/ticwatch_c2.h"
 #else
 #error "platform.h: define PLAT_BOARD_QEMU_VIRT, PLAT_BOARD_FOSSIL_GEN4, \
-PLAT_BOARD_FOSSIL_GEN6 or PLAT_BOARD_TICWATCH_C2"
+PLAT_BOARD_FOSSIL_GEN5, PLAT_BOARD_FOSSIL_GEN6 or PLAT_BOARD_TICWATCH_C2"
 #endif
 
 /* Both Fossil watches share the MSM driver model (SPMI, UARTDM, GIC-400,
@@ -87,6 +98,9 @@ void usb_irq_arm(int on);             /* usb_ci.c (-DUSB_IRQ_WAKE): controller I
 void sleep_floor_census(const char *tag);
 void sleep_floor_enter(int cable);
 void sleep_floor_exit(void);
+/* sleep_floor.c without -DSLEEP_FLOOR: just the SLEEP_RAILS_OFF rails */
+void sleep_rails_enter(void);
+void sleep_rails_exit(void);
 int  usb_phy_force_vbus_valid(void);
 int  usb_dev_init(void);
 void usb_poll(void);
@@ -126,9 +140,11 @@ void     fb_perf_loop_tick(uint32_t body_ms); /* PERF_BARS: loop-rate sample */
 void     fb_dbg_mark(uint32_t idx, uint32_t xrgb); /* 3 big center trace blocks */
 void     fb_dbg_byte(uint32_t row, uint32_t val);  /* 8 bit-blocks, center band */
 void     fb_text_dump(const char *s); /* 8x8 font text straight into the fb */
+void     fb_spinner_frame(uint32_t ms); /* gfx_spinner.c: boot loading spinner, ms since start */
 void     fb_trace(uint32_t xrgb); /* VISUAL_TRACE: paint+kick a milestone color */
 int      gcc_blsp_qup4_up(void);  /* gen6: enable touch-I2C QUP clocks first */
 int      gcc_blsp_qup_i2c_up(uint32_t cmd_rcgr, uint32_t cbcr, const char *name);
+int      gcc_blsp_qup_spi_up(uint32_t cmd_rcgr, uint32_t cbcr, uint32_t cfg, const char *name);
 int      rpm_ldo_on(uint32_t id, uint32_t uv, uint32_t ma);   /* wcnss.c: vote a PM8916 LDO on */
 void     sensor_scan(void);                                   /* sensor_scan.c: -DSENSOR_SCAN */
 /* spm_8909.c / cpu_pc8909.c / scm.c: msm8909w CPU power collapse (sleep rung 2) */
@@ -148,6 +164,8 @@ void     cpu_pc8909_prev_report(void);
 void     cpu_pc8909_mark(uint32_t v);
 void     cpu_pc8909_trace(uint32_t v);   /* flash-committed text breadcrumb (IRQs on only) */
 void     ramlog_prev_tail(uint32_t n);
+uint32_t ramlog_prev_tail_buf(char *out, uint32_t max);  /* same, to a buffer */
+uint32_t ramlog_tail_buf(char *out, uint32_t max);       /* THIS boot's tail   */
 int      cpu_pc8909_ready(void);
 int      cpu_pc8909_sleep(uint64_t wake_ticks);
 void     cpu_pc8909_report(void);
@@ -165,6 +183,7 @@ void     tlmm_cfg(uint32_t pin, uint32_t func, uint32_t pull, uint32_t drv_ma,
                   int output);    /* gen6 TLMM pin mux (tlmm.c) */
 void     tlmm_out(uint32_t pin, int hi);
 int      tlmm_in(uint32_t pin);   /* GPIO_IN_OUT bit0 — live pin level */
+void     bg_probe_report(void);  /* bg_probe.c: QCC1110 co-processor first contact (PLAT_HAS_BG_QCC1110) */
 void     tlmm_touch_setup(void);  /* mux i2c4 pins; reset line held high */
 void     tlmm_touch_reset_pulse(void); /* fallback hard reset pulse */
 /* DCS command layer. The msm8909w watches and the Gen 6 have DIFFERENT DSI
@@ -214,6 +233,8 @@ void     dsi_init(void);
 int      panel_on(void);
 int      panel_off(void);
 int      panel_full_init(void);   /* dsi_init() + panel_on(): blind bring-up */
+int      panel_reinit_after_rail(void); /* reset pulse + on-command after the DDIC lost vddio */
+void     dsi_dcs_ctrl_display_resend(void);
 #endif
 
 uint32_t fb_last_kick_err(void); /* 0 ok, 1 pingpong timeout, 2 DSI timeout */
@@ -271,6 +292,10 @@ void pon_crumb_write(uint8_t v); uint8_t pon_crumb_read(void); void pon_crumb_re
 void pon_ps_hold_hard(void);      /* restore the PMIC default */
 void reboot_to_bootloader(void);  /* warm reset -> aboot fastboot */
 void reboot_to_recovery(void);    /* warm reset -> recovery */
+/* bcb.c — Android Bootloader Control Block in the misc partition. Some aboots
+ * (the Fossil Gen 5's) honour this and NOT the IMEM restart cookie. */
+int  bcb_request_bootloader(void);  /* misc command = "bootonce-bootloader" */
+int  bcb_clear(void);               /* misc command = "" (undo a stuck one) */
 void deadman_arm(uint32_t timeout_ms);  /* auto-reboot-to-fastboot if un-kicked */
 void deadman_kick(void);          /* prove liveness; restart the countdown */
 void net_keepalive(void);         /* wlan_net.c: wdog + dead-man + usb console, for blocking network waits */
@@ -448,6 +473,11 @@ int      bt_dl_start(void);
 int      bt_dl_step(void);                 /* 0 busy, 1 done, <0 failed */
 int      bt_probe_step(void);              /* whole bring-up, stepped; same returns */
 void     tlmm_irq_mask(int mask);          /* tlmm_irq.c: mask the GPIO summary IRQ (suspend) */
+void     tlmm_irq_set_wake(uint32_t pin);  /* tlmm_irq.c: pin stays live through tlmm_irq_mask(1) */
+int      stem_key_pressed(unsigned idx);   /* stem_keys.c: gpio_keys pusher held (0 = STEM_1) */
+void     stem_keys_arm_irq(void);          /* stem_keys.c: edge IRQs = suspend wake sources */
+uint32_t stem_keys_irq_total(void);
+int      stem_keys_mpm_fired(void);        /* stem pin set in MPM STATUS (after a system collapse) */
 int      touch_set_sleep(int sleep);       /* touch_ft.c: 1 = hibernate, 0 = reset awake */
 
 /* sleep_stats.c (gen6) — READ-ONLY sleep accounting. These counters are how a
@@ -496,8 +526,11 @@ int chg_charging(void);      /* 1/0, -1 on error */
  * (TicWatch C2/S2, PLAT_CHG_SMB231). pmic_fg.c consults these first. */
 int  smb231_ready(void);        /* 1 once the part answered on the bus (probes lazily) */
 int  smb231_usb_present(void);  /* 1/0, -1 unknown */
+int  smb231_batt_temp_c(void);  /* STC3117 internal sensor, whole degrees C; -128 unknown */
+void smb231_apply_jeita(int force);  /* float voltage + fast-charge current for the current temperature */
 int  smb231_charging(void);     /* 1/0, -1 unknown */
 int  smb231_batt_ma(void); int smb231_soc_x512(void);
+int  smb231_batt_ma_why(void);  /* 0 ok, 1 not probed, 2 MODE read failed, 3 GG_RUN clear, 4 current read failed */
 #ifndef PLAT_BATT_MAH
 #define PLAT_BATT_MAH 400   /* TicWatch C2 cell */
 #endif      /* + = discharging; -32768 unknown */
@@ -511,6 +544,7 @@ void logfile_flush(void);                        /* logfile.c */
 void gcc_mdss_sleep(int on);                     /* gate/ungate MDSS branches (GDSC + PLL kept) */
 void gcc_sdcc1_sleep(int on);                    /* gate/ungate eMMC clocks */
 void gcc_blsp_sleep(int on);                     /* gate/ungate running QUP core clocks */
+int  gcc_blsp_asleep(void);                      /* 1 while those clocks are gated */
 void spm_cpu1_mode(int mode);                    /* spm_8909.c: CPU1's SAW */
 int  smp_park_extra_cores(void);   /* smp_8909.c v180: cpu2/cpu3 into TZ power collapse */
 int  spm_cpu1_ready(void); void spm_cpu_mode_n(unsigned cpu, int mode); int spm_cpu_ready_n(unsigned cpu);
@@ -539,6 +573,7 @@ void cpu_pc8909_state_line(const char *tag);   /* cpu_pc8909.c: register census 
  *   devmem 0x08600808 ... 0x08600814 -> aux values (fb address, geometry, rc) */
 void bootmark(uint32_t stage);
 void bootmark_aux(unsigned idx, uint32_t val);
+uint32_t bootmark_aux_get(unsigned idx);
 
 #define BOOTMARK_START      1u   /* startup.S entry (written in asm) */
 #define BOOTMARK_RELOCATED  2u   /* self-relocation + bss clear done, in C */
@@ -557,6 +592,9 @@ void bootmark_aux(unsigned idx, uint32_t val);
  * stock OS at ~15 s (observed on hardware). Our own dead-man then owns
  * recovery. */
 void wdog_disable(void);
+void fault_record_report(void);
+void rodata_verify(const char *where);
+void mmu_protect_code_ro(void);              /* sections holding only code/rodata -> privileged read-only */   /* .rodata CRC: first call records, later calls report a change */   /* previous-life CPU fault / hook record, printed once (irq.c) */
 void wdog_extend(uint32_t sec);   /* preferred: keep the backstop, widen it.
                                      CLAMPED to 31 s: the hardware register is
                                      20-bit and TRUNCATES silently above that */
@@ -584,6 +622,33 @@ int emmc_write_window_boot(uint32_t lba, uint32_t nblocks); /* OTA only: bootimg
 int bootimg_write(const void *img, uint32_t len, void (*progress)(uint32_t done, uint32_t total));
 /* rng_msm.c -- mbedtls_hardware_poll(): entropy for mbedTLS (SoC PRNG, timer-jitter fallback) */
 int emmc_write(uint32_t lba, uint32_t nblocks, const void *src);
+/* modem EFS window (mss_rmtfs.c only): up to 4 partition ranges, armed ONCE per boot, only when
+ * OpenWatchFace is flashed in `boot` (owf_is_flashed() == 1). */
+int emmc_write_window_modem(const uint32_t *lba, const uint32_t *nblocks, uint32_t count);
+struct smd_chan;
+void     mss_fastrpc_poll(struct smd_chan *ch);   /* FastRPC listener for the Wear 3100 modem (mss_fastrpc.c) */
+void     mss_fastrpc_stats(void);
+void     mss_apr_poll(struct smd_chan *ch);       /* APR link to the modem's audio DSP (mss_apr.c) */
+int      mss_apr_busy(void);                      /* 1 while an APR command / the speaker tone is in flight */
+void     q6_audio_tone(uint32_t hz, uint32_t ms); /* speaker: play a sine through the DSP (hz 0 = stop) */
+int      q6_audio_ready(void);
+void     q6_audio_probe(uint32_t hz, const char *where);   /* -DAUDIO_PROBES: blocking 800 ms bisect tone */                    /* 1 once the playback stream is up */
+int      q6_audio_playing(void);                  /* 1 while a tone is sounding */
+uint32_t q6_audio_push(const int16_t *frames, uint32_t n);  /* app-rendered 48 kHz stereo PCM */
+uint32_t q6_audio_space(void);                    /* frames the ring can still take */
+uint32_t q6_audio_queued(void);                   /* frames waiting to be played */
+void     q6_audio_flush(void);                    /* drop queued PCM (stop now) */
+void     q6_audio_sleep(void);                    /* deep sleep: queue no DSP buffers (no doorbells) */
+void     q6_audio_wake(void);                     /* undo, lazily from the first sound */
+void     q6_audio_service(void);                  /* pump WRITE_DONE/WRITE_V2 from a busy-wait loop */
+extern volatile int g_audio_tone_state;           /* mss_apr.c: 0 idle, 1 tone setup/playing, 2 done, 3 failed */
+int      mss_diag_cntl_rx(struct smd_chan *cntl, const uint8_t *p, uint32_t n);  /* mss_diag.c */
+void     mss_diag_data_rx(const uint8_t *p, uint32_t n);
+void     mss_diag_stats(void);
+/* mss_rmtfs.c -- QMI remote-storage server for the modem (svc 14 inst 1, node 1 port 0x4000) */
+void mss_rmtfs_handle(struct smd_chan *c, const uint8_t *pk, uint32_t got);
+void mss_rmtfs_stats(void);
+int  mss_rtr_resume_tx(struct smd_chan *c, uint32_t src_node, uint32_t dst_node, uint32_t dst_port);
 
 /* storage_gen6.c — userdata-partition storage core (region ids: 0=blackbox,
  * 1=nvs, 2=ffat). storage_init is idempotent-ish via storage_ok(). */
@@ -641,6 +706,9 @@ int      smem_ok(void);
 uint32_t smem_version(void);                 /* 11 = global heap, 12 = partitioned */
 void    *smem_get(uint32_t id, uint32_t *size_out);  /* global item; NULL if absent */
 void    *smem_get_host(uint32_t host, uint32_t id, uint32_t *size_out);
+void     smem_dump_items(const char *tag);                 /* diagnostic: allocated item ids */
+void    *smem_alloc_global(uint32_t id, uint32_t size);   /* legacy global heap item (SMSM) */
+void    *smem_alloc_host(uint32_t host, uint32_t id, uint32_t size);  /* uncached item in the APPS<->host partition */
                                              /* item in the apps<->host partition */
 int      smem_host_partition_present(uint32_t host);
 void     smem_diag_dump(void);               /* -DSMEM_DIAG: inventory + build id */
@@ -662,6 +730,30 @@ int  scm_pas_mem_setup(uint32_t pas_id, uint32_t base, uint32_t size);
 int  scm_pas_auth_and_reset(uint32_t pas_id);
 int  scm_pas_shutdown(uint32_t pas_id);
 int  scm_pas_is_supported(uint32_t pas_id);   /* r1: 1 = PAS boot for this id */
+/* legacy command-buffer SCM (QSEECOM shape); <0 = error, 0 = TZ answered */
+int  scm_legacy_buf(uint32_t svc, uint32_t cmd, const void *in, uint32_t in_len,
+                    void *out, uint32_t out_len);
+/* qseecom.c — TrustZone application service (Gen 5 BG co-processor path) */
+int  qsee_version(uint32_t *ver);            /* 0 = ok, *ver = QSEE version */
+int  qsee_app_lookup(const char *name, uint32_t *app_id);  /* app_id 0 = not loaded */
+void qsee_report(void);
+int  qsee_app_start(const char *name, const void *img, uint32_t mdt_len,
+                    uint32_t img_len, uint32_t *app_id);
+int  qsee_send_cmd(uint32_t app_id, const void *req, uint32_t req_len,
+                   void *rsp, uint32_t rsp_len);
+void scm_dcache_clean(const void *p, uint32_t n);
+void scm_dcache_inval(const void *p, uint32_t n);
+void bg_load_report(void);   /* bg_load.c: load bgapp + authenticate bg-wear */
+void bg_boot_start(void);    /* bg_load.c: run the whole BG bring-up in its own task once SMEM+RPM are up (v277) */
+void bgcom_bringup_report(void); /* bgcom.c: AP-side bgcom + GLINK link-up over bit-banged SPI */
+void bgcom_bus_take(void);
+int  bgcom_reg_read(uint8_t reg, unsigned n, uint32_t *w);
+int  bgcom_fifo_read(unsigned nwords, uint32_t *w);
+int  bgcom_fifo_write(unsigned nwords, const uint32_t *w);
+int  bgcom_ahb_read(uint32_t addr, unsigned nwords, uint32_t *w);
+int  bgcom_ahb_write(uint32_t addr, unsigned nwords, const uint32_t *w);
+void bgcom_codec_report(void);   /* bgcom.c: CODEC_CHANNEL (speaker) control test */
+void lpass_probe_report(void);   /* lpass_probe.c: can the AP clock LPASS/LPAIF? */
 
 /* wcnss.c — Pronto/WCNSS bring-up: firmware from the modem partition, rails
  * via the RPM, Iris XO config, PAS boot. -DWIFI_DIAG runs wcnss_boot_diag(). */
@@ -749,12 +841,18 @@ int      wlan_up(void);        /* full bring-up: rails, PAS, NV, HAL start, DXE.
 int      wlan_down(void);      /* light: HAL stop, firmware stays resident. */
 int      wlan_power_off(void); /* full: HAL stop + PAS shutdown + rails released. */
 int      wlan_idle(void);      /* sleep: HAL stop, firmware resident, AP-side WLAN votes released (the stock idle) */
+void     pronto_hs_probe(void); /* -DPRONTO_HS_PROBE: SAW2 -> RPM handshake experiment (wcnss.c) */
+int      wcnss_fat_read_file(const char *name11, uint32_t *size_out, void (*sink)(void *ctx, const uint8_t *p, uint32_t off, uint32_t n), void *ctx);
+int      mss_boot(void);        /* -DMSS_BOOT: boot the real modem via the MBA (mss_boot.c) */
+void     mss_boot_start(void);  /* -DMSS_BOOT: run mss_boot() in its own FreeRTOS task */
+int      mss_ready(void);       /* modem err_ready seen (smp2p slave-kernel bit 1) */
 int      wlan_is_up(void);
 int      wlan_scan(struct wlan_scan_net *out, uint32_t max);   /* passive scan; count or <0 */
 int      wlan_connect(const char *ssid, const char *pass);      /* scan for it, join, WPA2 handshake. 0 = keys installed */
 int      wlan_connected(void);
 int      wlan_disconnect(void);
 int      rpm_smd_init(void);
+int      rpm_smd_is_open(void);   /* smd.c: 0 = requests fail silently with -1 */
 int      rpm_smd_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t kv_bytes);
 void     rpm_diag(void);
 

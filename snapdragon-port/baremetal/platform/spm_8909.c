@@ -48,7 +48,18 @@ static const uint8_t k_cpu_wfi[] = { 0x60,0x03,0x60,0x0b,0x0f };
 static const uint8_t k_cpu_pc[]  = { 0x20,0x10,0x80,0x30,0x90,0x5b,0x60,0x03,0x60,0x3b,0x76,0x76,0x0b,0x94,0x5b,0x80,0x10,0x26,0x30,0x0f };
 static const uint8_t k_l2_ret[]  = { 0x00,0x03,0x00,0x0f };
 static const uint8_t k_l2_gdhs[] = { 0x00,0x20,0x32,0x6b,0xc0,0xe0,0xd0,0x42,0x03,0x50,0x4e,0x02,0x02,0xd0,0xe0,0xc0,0x22,0x6b,0x02,0x32,0x50,0x0f };
-static const uint8_t k_l2_pc[]   = { 0x00,0x20,0x32,0xb0,0x6b,0xc0,0xe0,0xd0,0x42,0x51,0x11,0x07,0x01,0x41,0xb0,0x50,0x4e,0x02,0x02,0xd0,0xe0,0xc0,0x22,0x6b,0x02,0x32,0x52,0x0f };
+#if defined(PLAT_SPM_L2_PM660)
+/* PM660 boards (Fossil Gen 5, triggerfish-stock.dts qcom,spm@b012000): the pc
+ * sequence has no "51" / "41" bytes -- the commands that send pmic-data 5 and 4,
+ * which this tree does not even define. Those carry PM8916 APC-rail commands;
+ * sending them on a PM660 during every collapse would program whatever sits at
+ * those SPMI addresses. gdhs and ret are byte-identical to the Gen 4's. */
+static const uint8_t k_l2_pc_pm660[] = { 0x00,0x20,0x32,0xb0,0x6b,0xc0,0xe0,0xd0,0x42,0x11,0x07,0x01,0xb0,0x50,0x4e,0x02,0x02,0xd0,0xe0,0xc0,0x22,0x6b,0x02,0x32,0x52,0x0f };
+#define K_L2_PC k_l2_pc_pm660
+#else
+#define K_L2_PC k_l2_pc
+#endif
+static const uint8_t k_l2_pc[] __attribute__((unused)) = { 0x00,0x20,0x32,0xb0,0x6b,0xc0,0xe0,0xd0,0x42,0x51,0x11,0x07,0x01,0x41,0xb0,0x50,0x4e,0x02,0x02,0xd0,0xe0,0xc0,0x22,0x6b,0x02,0x32,0x52,0x0f };
 
 struct spm { uint32_t base, seq_off; uint32_t ctl[3]; int ok; };
 static struct spm s_cpu0, s_cpu1, s_cpu2, s_cpu3, s_l2;
@@ -83,16 +94,8 @@ static int spm_dev_init(struct spm *s, uint32_t base, uint32_t cfg, const char *
     con_puts(" id "); con_puthex(rd(base, R_ID)); con_puts(" ctl "); con_puthex(rd(base, R_CTL));
     if (major != 2u && major != 3u) { con_puts(" -- unknown SAW, not programmed\n"); return 0; }
     (void)minor;
-    /* v187: CORRECTION of v175. spm_devices.c probe writes every qcom,saw2-*
-     * DTS value straight to the SAW via msm_spm_drv_upd_reg_shadow (cfg,
-     * spm-dly, spm-ctl 0x0e, pmic-data0/1/4/5); the bootloader leaves ALL of
-     * them at zero (C2 boot log 2026-09-09). Log the boot values, then write
-     * the DTS values like the kernel does. */
-    con_puts("\n  saw boot regs: cfg="); con_puthex(rd(base, R_CFG)); con_puts(" dly="); con_puthex(rd(base, R_DLY));
-    con_puts(" vctl="); con_puthex(rd(base, 0x1Cu)); con_puts(" avs_ctl="); con_puthex(rd(base, 0x20u));
-    con_puts(" pmic0/1/4/5="); con_puthex(rd(base, R_PMIC0)); con_puts("/"); con_puthex(rd(base, R_PMIC0 + 4u));
-    con_puts("/"); con_puthex(rd(base, R_PMIC0 + 0x10u)); con_puts("/"); con_puthex(rd(base, R_PMIC0 + 0x14u));
-    con_puts(" sts="); con_puthex(rd(base, R_STS));
+    /* v384: the SAW boot-register dump that used to sit here (cfg/dly/vctl/avs/pmic/sts, all zero
+     * from the bootloader on the C2, 2026-09-09) is gone by request; the DTS values are still written. */
     wr(base, R_CFG, cfg);
     wr(base, R_DLY, 0x3c102800u);
     wr(base, R_CTL, 0x0eu);                 /* qcom,saw2-spm-ctl init value; a mode write replaces it */
@@ -146,16 +149,23 @@ void spm_init(void)
 #if !defined(SPM_NO_PMIC_DATA)
         wr(SPM_L2, R_PMIC0 + 0x00u, 0x5030080u);   /* qcom,saw2-pmic-data0/1/4/5 (device DTB) */
         wr(SPM_L2, R_PMIC0 + 0x04u, 0x30000u);
-        wr(SPM_L2, R_PMIC0 + 0x10u, 0x10080u);
+#if !defined(PLAT_SPM_L2_PM660)
+        wr(SPM_L2, R_PMIC0 + 0x10u, 0x10080u);      /* data4/5: PM8916 only (see K_L2_PC) */
         wr(SPM_L2, R_PMIC0 + 0x14u, 0x10000u);
+#endif
 #endif
         off = 0;
         s_l2.ctl[0] = CTL_SPM_EN | (seq_write(&s_l2, k_l2_ret, sizeof k_l2_ret, &off) << 4);
         s_l2.ctl[1] = CTL_SPM_EN | CTL_PC_MODE | (seq_write(&s_l2, k_l2_gdhs, sizeof k_l2_gdhs, &off) << 4);
-        s_l2.ctl[2] = CTL_SPM_EN | CTL_PC_MODE | CTL_SLP_CMD | (seq_write(&s_l2, k_l2_pc, sizeof k_l2_pc, &off) << 4);
+        s_l2.ctl[2] = CTL_SPM_EN | CTL_PC_MODE | CTL_SLP_CMD | (seq_write(&s_l2, K_L2_PC, sizeof K_L2_PC, &off) << 4);
 #if !defined(SPM_NO_L2_VDD_INIT)
+#if defined(PLAT_SPM_L2_PM660)
+        { extern int cpu_volt_mv(void); extern int spm_l2_set_vdd_pm660(uint32_t mv); int mv = cpu_volt_mv();
+          if (mv > 0) (void)spm_l2_set_vdd_pm660((uint32_t)mv); else con_puts("spm-l2 set_vdd: APC rail unreadable, skipped\n"); }
+#else
         { extern int cpu_volt_vset_raw(void); int v = cpu_volt_vset_raw();
           if (v >= 0) (void)spm_l2_set_vdd((uint32_t)v); else con_puts("spm-l2 set_vdd: APC VSET unreadable, skipped\n"); }
+#endif
 #endif
 #if defined(L2_SAW_AP_ENABLE)
         wr(SPM_L2, R_CTL, s_l2.ctl[0]);
@@ -208,6 +218,55 @@ int spm_l2_set_vdd(uint32_t vlevel)
     con_puts(" pmic_sts="); con_puthex(sts); con_puts(left ? " OK\n" : " TIMEOUT (wrong level)\n");
     return left ? 0 : -1;
 }
+
+#if defined(PLAT_SPM_L2_PM660)
+/* FTS426 (PM660 s1) SAW voltage handshake, mirrored from the REAL PM660 kernel
+ * (hoki-4.14 drivers/soc/qcom/msm-spm.c msm_spm_drv_set_vdd with vctl_port_ub,
+ * and drivers/regulator/spm-regulator.c spm_regulator_uv_to_vlevel):
+ *   vlevel = roundup(uV, 4000) / 1000   -- millivolts on a 4 mV grid, 12 bits
+ *   lower 8 bits on vctl_port    (0): RST, VCTL + PMIC_DATA_3, wait idle AND
+ *                                      PMIC_STS level == byte
+ *   upper 8 bits on vctl_port_ub (1): RST, VCTL + PMIC_DATA_3, wait idle only
+ * "VCTL can send 8bit voltage level at once. Send lower 8bit first, vlevel
+ * change happens when upper 8bit is sent." The PM8916 path above sends one
+ * byte on port 0, which would leave an FTS426 half-programmed.
+ * triggerfish-stock.dts: qcom,vctl-port = <0>, qcom,vctl-port-ub = <1>,
+ * qcom,vctl-timeout-us = <500>. */
+static int spm_l2_vctl_send(uint32_t byte, uint32_t port, uint32_t *sts_out)
+{
+    uint32_t data = (byte & 0xFFu) | ((port & 7u) << 16), sts = 0;
+    int left = 500;
+    wr(SPM_L2, R_RST, 1u);
+    wr(SPM_L2, R_VCTL, (rd(SPM_L2, R_VCTL) & ~0x700FFu) | data);
+    wr(SPM_L2, R_PMIC0 + 0x0Cu, (rd(SPM_L2, R_PMIC0 + 0x0Cu) & ~0x700FFu) | data);
+    do {
+        timer_delay_us(1);
+        sts = rd(SPM_L2, R_PMIC_STS) & 0x300FFu;
+        if (((sts & 0x30000u) == 0u) && (port != 0u || (sts & 0xFFu) == (byte & 0xFFu))) break;
+    } while (--left);
+    if (sts_out) *sts_out = sts;
+    return left ? 0 : -1;
+}
+
+int spm_l2_set_vdd_pm660(uint32_t mv)
+{
+    if (!s_l2.ok) return -1;
+    uint32_t id = rd(SPM_L2, R_ID), sts_lb = 0, sts_ub = 0;
+    uint32_t vlevel = ((mv + 3u) / 4u) * 4u;                      /* roundup to the 4 mV grid */
+    con_puts("spm-l2 set_vdd(pm660): "); con_putdec(mv); con_puts(" mV -> vlevel="); con_puthex(vlevel);
+    con_puts(" arb_present="); con_putdec((id >> 2) & 1u);
+    if (!((id >> 2) & 1u)) { con_puts(" -> no PMIC arbiter on this SAW, skipped\n"); return -1; }
+    if (vlevel > 0xFFFu) { con_puts(" -> out of range, skipped\n"); return -1; }
+    uint32_t avs = rd(SPM_L2, R_AVS_CTL);
+    if (avs & 1u) wr(SPM_L2, R_AVS_CTL, avs & ~1u);
+    int rc = spm_l2_vctl_send(vlevel & 0xFFu, 0u, &sts_lb);
+    if (rc == 0) rc = spm_l2_vctl_send((vlevel >> 8) & 0xFFu, 1u, &sts_ub);
+    if (avs & 1u) wr(SPM_L2, R_AVS_CTL, avs);
+    con_puts(" lb sts="); con_puthex(sts_lb); con_puts(" ub sts="); con_puthex(sts_ub);
+    con_puts(rc == 0 ? " OK\n" : " TIMEOUT\n");
+    return rc;
+}
+#endif
 int  spm_ready(void) { return s_cpu0.ok; }
 void spm_cpu0_mode(int mode)
 {

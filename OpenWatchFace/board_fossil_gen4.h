@@ -184,8 +184,20 @@ extern "C" {
 }
 
 #define BOOT_BTN_GPIO    201
+/* Two extra pushers (stock DT gpio_keys STEM_1 gpio91, STEM_2 gpio90), read as
+ * virtual pins 203/204 (compat/arduino_glue.cpp). The DT does not say which is
+ * on top: STEM_1 = top is assumed until a "[btn]" press log confirms it. */
+#define BOARD_HAS_EXTRA_BUTTONS 1
+#define BTN_TOP_GPIO     203
+#define BTN_BOTTOM_GPIO  204
 #define BOARD_WAKE_GPIO  0
 #define BOARD_LCD_BUS_HZ 0
 /* Idle loop pass every 10 ms instead of 5 (2026-09-04 idle-load work; see the
  * loop() tail in OpenWatchFace.ino). */
 #define BOARD_LOOP_IDLE_MS 10
+
+/* Wear 2100: the core rail is PM8916 SMPS2 behind the SPM regulator, and
+ * platform/cpu_volt_a7.c can write it in the part's own 12.5 mV steps. That
+ * makes a manual undervolt below the DT floor possible -- see the Power app. */
+#define BOARD_HAS_CPU_UNDERVOLT 1
+

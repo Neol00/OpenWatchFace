@@ -13,6 +13,7 @@
  * the UI runs display-only — same graceful path as before.
  */
 #pragma once
+#include <cstdio>
 #include <lvgl.h>
 #include "board.h"   /* LCD_WIDTH / LCD_HEIGHT fallback geometry */
 
@@ -91,6 +92,12 @@ static void owf_fossil_touch_cb(lv_indev_t *, lv_indev_data_t *data) {
     g_touch_us += owf_us_since(tt0);
     g_touch_n++;
     if (trd == 1) {
+#if defined(PLAT_TOUCH_FLIP_Y)
+        /* Gen 5E (v444): the Raydium's frame is mirrored VERTICALLY against the panel (v442's 180
+         * rotation fixed up/down and broke left/right). Y flipped, X untouched. Gen 5: no transform. */
+        { static unsigned s_dbg; if (s_dbg < 6u) { s_dbg++; char tb[48]; snprintf(tb, sizeof tb, "touch: raw %u,%u -> y flipped\n", (unsigned)x, (unsigned)y); con_puts(tb); }
+          y = (uint16_t)((LCD_HEIGHT - 1) - (y < LCD_HEIGHT ? y : LCD_HEIGHT - 1)); }
+#endif
         last_x = x; last_y = y;
         s_fossil_touch_activity = true;   /* any finger = user activity */
         data->state = LV_INDEV_STATE_PRESSED;

@@ -366,6 +366,9 @@ static void notif_reset_page(void);      // defined in app_notifications.h; rewi
 static void app_open_about(void);
 static void app_open_timer(void);
 static void app_open_stopwatch(void);
+#if BOARD_HAS_EXTRA_BUTTONS
+static void app_open_buttons(void);      // defined in button_actions.h (boards with extra pushers)
+#endif
 static void app_open_find_phone(void);
 static void app_open_files(void);
 #if BOARD_HAS_CAMERA
@@ -490,6 +493,12 @@ static const MenuItem MENU_ITEMS[] = {
 #if BOARD_HAS_HR
   { "Heart",         LV_SYMBOL_CHARGE,       0xFF453A, app_open_heart, MDI_HEART_PULSE },
 #endif
+#if BOARD_HAS_EXTRA_BUTTONS
+  /* LAST on purpose (user, 2026-09-16): a new tile goes at the END so it never
+   * reshuffles the established order/pages. Only on watches with extra side
+   * pushers (TicWatch C2/C2+: one; Fossil Gen 4, Gen 5, Sport: two). */
+  { "Buttons",       LV_SYMBOL_SETTINGS,     0xC7A17A, app_open_buttons, MDI_GESTURE_TAP_BUTTON },
+#endif
 };
 static const int MENU_ITEM_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
 
@@ -531,7 +540,10 @@ static void menu_tile_cb(lv_event_t *e) {
  * Design Icons glyph in the 34px icons34 MDI font. Same tint either way. */
 static void menu_tile_set_icon(lv_obj_t *icon, const MenuItem *item) {
   lv_obj_set_style_text_color(icon, lv_color_hex(ui_deco_hex(item->icon_color)), 0);
-  if (item->icon_cp) {
+  lv_font_glyph_dsc_t g;
+  /* A codepoint not (yet) generated into icons34 falls back to the symbol
+   * instead of drawing nothing. */
+  if (item->icon_cp && lv_font_get_glyph_dsc(&icons34, &g, item->icon_cp, 0)) {
     lv_obj_set_style_text_font(icon, &icons34, 0);
     char u[5];
     lv_label_set_text(icon, mdi_utf8(item->icon_cp, u));

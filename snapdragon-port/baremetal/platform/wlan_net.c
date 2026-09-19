@@ -399,4 +399,11 @@ int net_tcp_read(void *h, void *b, uint32_t m) { (void)h; (void)b; (void)m; retu
 int net_tcp_available(void *h) { (void)h; return 0; }
 int net_tcp_connected(void *h) { (void)h; return 0; }
 void net_tcp_close(void *h) { (void)h; }
+/* net_keepalive() is NOT a networking call — it pets the watchdog and pumps the
+ * USB console during long blocking waits, and tls_client.cpp calls it from its
+ * handshake loop regardless of whether this board has a radio. It belongs in
+ * the stub set for exactly that reason: a board built without PLAT_WLAN_APP
+ * (the Fossil Gen 5, whose WCNSS rails are transcribed but unproven) still
+ * links the TLS client, and without this the image does not link at all. */
+void net_keepalive(void) { }
 #endif

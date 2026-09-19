@@ -32,3 +32,14 @@
 #undef  LCD_HEIGHT
 #define LCD_WIDTH  400
 #define LCD_HEIGHT 400
+
+/* Wear 2100: the core rail is PM8916 SMPS2 behind the SPM regulator, and
+ * platform/cpu_volt_a7.c can write it in the part's own 12.5 mV steps. That
+ * makes a manual undervolt below the DT floor possible -- see the Power app. */
+#define BOARD_HAS_CPU_UNDERVOLT 1
+
+/* No extra pusher: tunny's gpio_keys node is disabled and the S2 has only the
+ * power button, so the C2's STEM_1 binding does not apply. */
+#undef  BOARD_HAS_EXTRA_BUTTONS
+#define BOARD_HAS_EXTRA_BUTTONS 0
+#undef  BTN_TOP_GPIO

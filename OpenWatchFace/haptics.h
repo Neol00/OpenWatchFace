@@ -42,6 +42,7 @@ static void haptics_prepare_sleep(void) {}
 static void haptics_stop(void) {}
 static void haptics_pulse(uint16_t) {}
 static void haptics_play(const char *, bool) {}
+static void haptics_notify(void) {}
 static inline bool haptics_active(void) { return false; }
 static void haptics_tick(uint32_t) {}
 #define HAPTICS_HEARTBEAT ""
@@ -66,6 +67,29 @@ static void haptics_tick(uint32_t) {}
 #define H_GAP_MS         45          // gap between the two beats of one heartbeat
 #define H_LOOP_PAUSE_MS 800          // the long REST between heartbeats (the big gap you want)
 
+/* ---- NOTIFICATION ALERT shape -------------------------------------------
+ * These watches (Fossil Gen 4 / TicWatch C2 / S2) have NO SPEAKER, so the motor is
+ * the only way a notification can announce itself. That makes this alert a different
+ * job from every other buzz in this file: the UI click wants to be barely-there and
+ * the alarm heartbeat wants to be calm, but this one has to be felt through a sleeve
+ * by someone who isn't looking at the watch.
+ *
+ * So it does NOT reuse H_DASH_MS/H_GAP_MS (100/45 ms) — a coin ERM spends most of a
+ * 100 ms pulse still spinning up, which reads as a faint tick rather than a buzz. Two
+ * ~190 ms hits with a clear gap between them are unmistakably deliberate, and the gap
+ * has to be long enough that the motor actually STOPS between them (an ERM coasts for
+ * tens of ms after power is cut — too short a gap merges the two into one long blur,
+ * which is exactly what "twice" must not feel like). */
+#ifndef HAPTICS_NOTIF_ON_MS
+#define HAPTICS_NOTIF_ON_MS  190     // length of each of the two buzzes
+#endif
+#ifndef HAPTICS_NOTIF_GAP_MS
+#define HAPTICS_NOTIF_GAP_MS 140     // silence between them (must exceed ERM coast-down)
+#endif
+#ifndef HAPTICS_NOTIF_PATTERN
+#define HAPTICS_NOTIF_PATTERN "--"   // two equal buzzes; both symbols use the ON time above
+#endif
+
 /* Length of the global per-click UI tick (the buzz every CONTROL gives via the
  * indev-level hook in the .ino) — now the SINGLE source of UI haptic feedback (the
  * scattered per-call haptics_pulse() values were all removed in favour of this). Set
@@ -87,6 +111,12 @@ static void haptics_tick(uint32_t) {}
  * gaps = a continuous fast drum roll with no space; this is calm and clearly a heartbeat.) */
 #define HAPTICS_HEARTBEAT ".-"
 
+/* Timing in force for the CURRENT pattern. haptics_play() uses the alarm heartbeat
+ * shape; haptics_play_timed() overrides it (the notification alert needs longer, more
+ * separated hits — see the ALERT block above). Reset on every play so one pattern can
+ * never inherit another's timing. */
+static uint16_t    h_on_ms    = H_DASH_MS;
+static uint16_t    h_gap_ms   = H_GAP_MS;
 static const char *h_pat      = nullptr;  // active pattern (null = none)
 static bool        h_loop     = false;
 static uint16_t    h_idx      = 0;
@@ -155,10 +185,31 @@ static void haptics_pulse(uint16_t ms) {
                                     // lengthen it. Exactly `ms`, every button, every board.
 }
 
-/* Start a dot/dash pattern. loop=true repeats it (with a pause) until stopped. */
-static void haptics_play(const char *pattern, bool loop) {
+/* Start a dot/dash pattern with explicit ON/GAP timing. loop=true repeats it. */
+static void haptics_play_timed(const char *pattern, bool loop,
+                               uint16_t on_ms, uint16_t gap_ms) {
+  h_on_ms = on_ms; h_gap_ms = gap_ms;
   h_pat = pattern; h_loop = loop;
   h_idx = 0; h_phase_on = false; h_deadline = 0;   // fire on the next tick
+}
+
+/* Start a dot/dash pattern. loop=true repeats it (with a pause) until stopped. */
+static void haptics_play(const char *pattern, bool loop) {
+  haptics_play_timed(pattern, loop, H_DASH_MS, H_GAP_MS);
+}
+
+/* THE NOTIFICATION ALERT: buzz clearly twice. Non-blocking (the tick engine runs it),
+ * so it can be fired from the UI path without stalling the redraw of the card it
+ * accompanies.
+ *
+ * Deliberately does NOT check settings_get_mute(): mute silences the SPEAKER, and on a
+ * watch that has no speaker, honouring it here would leave no notification signal at
+ * all — which is the opposite of what mute means. It also never interrupts a ringing
+ * alarm: that pattern owns the motor and is the more urgent of the two. */
+static void haptics_notify(void) {
+  if (h_pat && h_loop) return;      // an alarm/timer pattern is ringing — leave it alone
+  haptics_play_timed(HAPTICS_NOTIF_PATTERN, false,
+                     HAPTICS_NOTIF_ON_MS, HAPTICS_NOTIF_GAP_MS);
 }
 
 /* A one-shot pulse is fully self-contained (blocking) now, so "active" just means a
@@ -181,7 +232,7 @@ static void haptics_tick(uint32_t now) {
       h_idx = 0;
       h_deadline = now + H_LOOP_PAUSE_MS;             // longer pause, then repeat
     } else {
-      h_deadline = now + H_GAP_MS;
+      h_deadline = now + h_gap_ms;
     }
     return;
   }
@@ -191,7 +242,7 @@ static void haptics_tick(uint32_t now) {
   if (c == '.' || c == '-') {
     h_motor(true);
     h_phase_on = true;
-    h_deadline = now + (c == '-' ? H_DASH_MS : H_DOT_MS);
+    h_deadline = now + (c == '-' ? h_on_ms : H_DOT_MS);
   } else {
     h_phase_on = true;                                // treat as a zero-length "on"
     h_deadline = now;                                 // so the gap logic advances idx

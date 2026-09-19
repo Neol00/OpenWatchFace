@@ -9,6 +9,7 @@ headers can cite them by line.
 | File | Device | Origin | Used by |
 |---|---|---|---|
 | `firefish-stock.dtb` / `.dts` | Fossil Gen 4 (firefish / ray), APQ8009W | dumped from the watch's stock `boot` partition | `tools/mk-bootimg.sh` (pass it as the second argument), `boards/fossil_gen4.h` |
+| `panel-auo-416p-amoled-cmd.dts` | Fossil Gen 4 | the panel node extracted from the stock tree | `platform/dsi_panel.c` (command tables ported verbatim) |
 | `skipjack-stock.dtb` / `.dts` | TicWatch C2 and C2+ (skipjack), APQ8009W | dumped from a stock `boot` partition (`tools/extract-dtb.py`); carries both board-ids, so it boots the C2+ too | `tools/mk-bootimg-c2.sh` default, `boards/ticwatch_c2.h` |
 | `skipjack-fromsource.dtb` / `.dts` | TicWatch C2 | compiled from Mobvoi's published kernel source; differs from the stock tree in the board-id line only, kept for reference | docs |
 | `tunny-stock.dtb` / `.dts` | TicWatch S2 / E2 (tunny), APQ8009W | dumped from the S2's stock `boot` partition | `tools/mk-bootimg-s2.sh` default |

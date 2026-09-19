@@ -48,9 +48,27 @@
 #define RESTART_MODE_NORMAL    0x01u    /* 0x77665501 = normal boot       */
 #define RESTART_MODE_RECOVERY  0x02u    /* 0x77665502 = LK RECOVERY_MODE  */
 
-/* Some msm8909 aboots ALSO consult the TCSR boot-misc-detect register for the
- * download/boot hint. Writing the same low nibble there is belt-and-braces and
- * harmless if aboot ignores it. */
+/* TCSR boot-misc-detect. THIS IS THE DOWNLOAD-MODE COOKIE, NOT A BOOT HINT.
+ *
+ * The old comment here read "belt-and-braces and harmless if aboot ignores
+ * it", and that was a guess that turned out to be both wrong and unsafe. In LK
+ * (msm_shared/scm.c) the values this register takes are:
+ *      SCM_DLOAD_MODE  0x10      normal download mode
+ *      SCM_EDLOAD_MODE 0x20      EMERGENCY download mode (9008)
+ * so writing 0x20 was asking every reboot-to-fastboot to come up in EDL. The
+ * Fossil Gen 4's aboot ignores it and lands in fastboot anyway, which is why
+ * this survived; the Fossil Gen 5's aboot does not, and lands in RECOVERY
+ * instead (observed 2026-09-10).
+ *
+ * The IMEM restart_reason cookie above is the documented mechanism and is
+ * sufficient on its own — the Gen 5's own DTB names it at
+ * qcom,msm-imem@8600000/restart_reason@65c, i.e. exactly the 0x0860065C we
+ * already write, and its stock kernel carries the standard msm-poweroff
+ * mapping ("bootloader" -> 0x77665500).
+ *
+ * So the TCSR write is now OPT-IN per board, kept only where it is already
+ * proven not to hurt, rather than sent blindly everywhere. Do not enable it on
+ * a new board without checking what that board's aboot does with 0x20. */
 #define TCSR_BOOT_MISC_BOOTLOADER 0x20u
 
 static inline void dsb(void) { __asm__ volatile("dsb sy" ::: "memory"); }
@@ -133,10 +151,21 @@ static inline void dsb(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  * Gen 6, 1, was simply wrong. Rather than swap one constant for another, the
  * rule itself is ported: the subtype is already read for pon_reset_config, so
  * deciding correctly costs nothing and stays right on the next board. */
-#if defined(PLAT_BOARD_FOSSIL_GEN6)
-#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 1   /* hoki DT sets the property */
-#else
-#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 0   /* firefish DT does not */
+/* THIS IS PER-BOARD DT DATA, so it comes from the board header now.
+ *
+ * It used to be an #if on the board name -- 1 for the Gen 6, 0 for "everything
+ * else" -- and that quietly gave the wrong answer for the first board added
+ * after it was written. The Fossil Gen 5's PON reads subtype 0x04
+ * (GEN2_PRIMARY, read live off the PM660) AND its DTB carries
+ * qcom,use-legacy-hard-reset-offset, so the kernel takes the ELSE branch and
+ * writes reason << 2. The old default of 0 sent it down the gen2 branch
+ * instead, writing reason << 1: the restart reason landed one bit position
+ * off, aboot never saw "bootloader", and every fastboot request became a
+ * recovery boot. Cost: three wrong fixes before the DT was read.
+ *
+ * Each board states what its own qcom,power-on@800 node says. */
+#if !defined(PLAT_PON_LEGACY_HARD_RESET_OFFSET)
+#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 0
 #endif
 
 static int pon_is_gen2(uint8_t subtype)
@@ -183,13 +212,34 @@ static uint8_t pon_reset_config(uint8_t type)
     bdiag_puts(" type=");        bdiag_puthex(type);
     bdiag_puts("\n");
 
-    /* Disable, wait, set the type, re-enable — the driver's exact order. The
-     * delay is ten sleep-clock cycles plus 50% tolerance: the register sits
-     * behind the PMIC's slow clock domain and a back-to-back rewrite does not
-     * latch. (The same slow-domain trap msm_wdog.c documents.) */
+    /* Disable, wait, set the type, WAIT AGAIN, re-enable — the driver's exact
+     * order, and qpnp_pon_system_pwr_off() has TWO waits, not one:
+     *
+     *     masked_write(rst_en_reg, S2_CNTL_EN, 0);
+     *     udelay(500);          // "wait for at least 10 sleep clock cycles"
+     *     masked_write(PS_HOLD_RST_CTL, POWER_OFF_MASK, type);
+     *     udelay(500);          // "wait for at least 10 sleep clock cycles"
+     *     masked_write(rst_en_reg, S2_CNTL_EN, S2_CNTL_EN);
+     *
+     * THE SECOND ONE WAS MISSING (2026-09-12) and it is the one that matters
+     * most: it lets the reset TYPE latch through the PMIC's slow clock domain
+     * before RESET_EN re-arms the S2 reset. Re-arming first can leave the
+     * block armed against the PREVIOUS type, so the PS_HOLD drop executes
+     * something other than the reset that was asked for -- and a type that is
+     * not a reset leaves the rails down with nothing to bring them back, which
+     * is a watch that is simply dead until KPDPWR is held.
+     *
+     * It failed INTERMITTENTLY because the sleep clock is 32.768 kHz: ten
+     * cycles is ~305 us, so whether a back-to-back write landed depended
+     * entirely on where the writes fell relative to a slow-clock edge. That is
+     * the "works four times out of five" shape exactly.
+     *
+     * 1 ms is the vendor's 500 us with room to spare. (The same slow-domain
+     * trap msm_wdog.c documents.) */
     pon_masked_write(rst_en_reg, PON_RESET_EN, 0);
     timer_delay_ms(1);
     pon_masked_write(PON_PS_HOLD_RST_CTL, PON_POWER_OFF_MASK, type);
+    timer_delay_ms(1);
     pon_masked_write(rst_en_reg, PON_RESET_EN, PON_RESET_EN);
     return subtype;
 }
@@ -224,7 +274,14 @@ void pon_crumb_report(void)
     con_puts("pon: DVDD_RB_SPARE crumb from previous life="); con_puthex(v);
     con_puts(" (0x11 SMC issued, 0x20 TZ re-entered us (C side), 0x21 gic/tick restored, 0x30 sys-pc finish, 0x40 suspend loop left, 0x52/0x53 died releasing cpu2/3, 0x62/0x63 cpu2/3 released ok, 0x00/0xFF none)");
     con_puts("\n");
-    pon_crumb_write(0);
+    /* 2026-09-18 (gen5-modem-29): the boot died right after this line, i.e. in this write or
+     * in the IMEM reads that follow it in cpu_pc8909_prev_report(). An SPMI write to a
+     * peripheral EE0 does not own is answered by TZ with an instant reset (spmi_arb.c), so
+     * ask the arbiter first and say what it said. */
+    { int w = spmi_writable(0, PON_DVDD_RB_SPARE);
+      con_puts("pon: crumb byte writable by EE0: "); con_putdec((uint32_t)(w < 0 ? 2u : (uint32_t)w)); con_puts(" (1 yes, 0 denied, 2 unmapped)\n");
+      con_flush(); usb_poll();
+      if (w == 1) pon_crumb_write(0); }
 }
 
 void pon_ps_hold_hard(void)
@@ -266,6 +323,21 @@ static void reboot_commit(uint32_t reason_cookie, uint32_t tcsr_hint,
     mmio_write(MSM_IMEM_RESTART_REASON, reason_cookie);
     if (tcsr_hint) mmio_write(MSM_TCSR_BOOT_MISC, tcsr_hint);
     dsb();
+
+    /* 3b. LET THE PMIC-SIDE WRITES LATCH before PS_HOLD goes away.
+     *
+     * dsb() orders OUR accesses. It says nothing about the PMIC having
+     * executed the SPMI transactions above and latched them into the PON
+     * block's 32.768 kHz clock domain. Drop PS_HOLD too soon and the PMIC
+     * acts on the state it had BEFORE the reset type and restart reason
+     * landed: at best the reason is missing and the watch boots normally
+     * instead of into fastboot, at worst the type is stale and it does not
+     * come back at all.
+     *
+     * poweroff_now() has always had this delay, and power-off has never been
+     * reported flaky while reboot-to-fastboot was -- which is the asymmetry
+     * that pointed here. Same 2 ms. */
+    timer_delay_ms(2);
 
     /* 4. Drop PS_HOLD; the PMIC executes the type configured in step 1.
      *    Control never returns from here on real hardware.
@@ -310,8 +382,34 @@ void poweroff_now(void)
 void reboot_to_bootloader(void)
 {
     con_puts("reboot: -> fastboot\n");
+    /* BCB FIRST, then the cookie. On some aboots (the Fossil Gen 5's) the IMEM
+     * restart cookie is not consulted at all and the Android BCB in the misc
+     * partition is the only route to fastboot -- that watch's own misc dump
+     * held "bootonce-bootloader", left there by the stock reboot path, which is
+     * what named the mechanism. Boards whose aboot honours the cookie are
+     * unaffected: they consume the cookie and never look at misc, and the
+     * "bootonce" form is self-clearing either way.
+     * A failure here is logged, not fatal -- we still try the cookie below. */
+#if defined(PLAT_REBOOT_USE_BCB)
+    /* CLEAR the BCB rather than write a fastboot command into it.
+     *
+     * Writing "bootonce-bootloader" here was my second wrong guess. This
+     * bootloader does not know that string -- its .rodata carries
+     * "boot-recovery" and not "bootonce-bootloader" -- so the write did
+     * nothing except cost an eMMC block. What it DOES parse is
+     * "boot-recovery", and a watch that has been power-cycled out of the stock
+     * recovery screen can be left with exactly that stuck in misc, which then
+     * sends EVERY subsequent boot back to recovery no matter what else we do.
+     * So the useful thing to do on the way out is to clear it. */
+    (void)bcb_clear();
+#endif
     reboot_commit(RESTART_REASON_BASE | RESTART_MODE_BOOTLOADER,
-                  TCSR_BOOT_MISC_BOOTLOADER, PON_REASON_BOOTLOADER);
+#if defined(PLAT_REBOOT_TCSR_HINT)
+                  TCSR_BOOT_MISC_BOOTLOADER,
+#else
+                  0,          /* see the note on TCSR_BOOT_MISC_BOOTLOADER */
+#endif
+                  PON_REASON_BOOTLOADER);
 }
 
 void reboot_to_recovery(void)

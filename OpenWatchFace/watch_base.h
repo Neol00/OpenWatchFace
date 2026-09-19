@@ -95,6 +95,13 @@ static uint16_t s_check_interval_min = 10;
  * instead of waiting for the loop's 20 s poll. */
 static void watchface_refresh_bell(void);
 
+/* Hide the arrived-while-in-an-app notification badge (the count pill at the top
+ * of the screen). DEFINED in the .ino alongside the rest of the badge; forward-
+ * declared here so app_notifications.h — included BEFORE those definitions — can
+ * dismiss it when the notification list opens. Reading the list IS seeing them,
+ * so the badge has nothing left to announce. */
+static void notif_badge_hide(void);
+
 /* Apply the "show voltage readout" setting (settings_get_show_volt) to the watch-
  * face corner label. DEFINED in watchface.h; forward-declared here so settings_store.h
  * — included BEFORE watchface.h — can call it from settings_set_show_volt() to update

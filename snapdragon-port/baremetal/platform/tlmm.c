@@ -106,9 +106,17 @@ void tlmm_touch_reset_pulse(void)
      * plus a 120 ms settle satisfies both, so the pulse stays shared until
      * some watch proves it needs its own. */
     tlmm_out(PLAT_TOUCH_RESET_GPIO, 0);
+#if defined(PLAT_TOUCH_HARD_RESET_MS)
+    timer_delay_ms(PLAT_TOUCH_HARD_RESET_MS);       /* v448: from the board's own tree */
+#else
     timer_delay_ms(6u);
+#endif
     tlmm_out(PLAT_TOUCH_RESET_GPIO, 1);
+#if defined(PLAT_TOUCH_POST_RESET_MS)
+    timer_delay_ms(PLAT_TOUCH_POST_RESET_MS);
+#else
     timer_delay_ms(120u);
+#endif
     bdiag_puts("tlmm: touch reset pulsed (fallback)\n");
 }
 #else

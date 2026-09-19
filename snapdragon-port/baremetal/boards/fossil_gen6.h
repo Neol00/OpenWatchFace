@@ -309,3 +309,26 @@
 #define PLAT_PMIC_SID        1u
 #define PLAT_HAP_BASE        0xC000u
 #define PLAT_HAP_VMAX_MV     3200u
+
+/* Send the legacy TCSR boot-misc hint alongside the IMEM restart cookie.
+ * Kept ON here only because reboot-to-fastboot is PROVEN working on the Gen 6
+ * with it present, and a proven recovery path is not worth disturbing. It is
+ * off by default for new boards -- the value is LK's EDL cookie; see the long
+ * note in platform/reboot_msm.c. */
+#define PLAT_REBOOT_TCSR_HINT 1
+
+/* qcom,use-legacy-hard-reset-offset: hoki's qcom,power-on@800 carries qcom,use-legacy-hard-reset-offset.
+ * Selects where qpnp_pon_set_restart_reason() puts the restart reason in
+ * SOFT_RB_SPARE -- see the long note in platform/reboot_msm.c. */
+#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 1
+
+/* ---- Battery: QPNP FG-GEN3 fuel gauge + SMB2 charger on the PM660 ---------
+ * FROM-DTB (hoki): qcom,fg-gen3 on pm660@0 with
+ *   qcom,fg-batt-soc@4000   MONOTONIC_SOC at 0x4009 (shadow 0x400A)
+ *   qcom,fg-batt-info@4100  BATT_TEMP 0x4150, VBATT 0x41A0, IBATT 0x41A2
+ *   qcom,fg-memif@4400      (SRAM access, not used by this driver)
+ * and qcom,qpnp-smb2 with qcom,chgr@1000 (BATTERY_CHARGER_STATUS_1 at 0x1006)
+ * and qcom,usb-chgpth@1300 (USB INT_RT_STS at 0x1310, USBIN_PLUGIN bit 4).
+ * All on SPMI slave id 0. See platform/pmic_fg.c. */
+#define PLAT_FG_GEN3 1
+

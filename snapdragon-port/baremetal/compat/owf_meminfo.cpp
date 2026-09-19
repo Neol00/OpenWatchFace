@@ -11,6 +11,37 @@
 #include "task.h"
 #include "owf_meminfo.h"
 extern "C" uint32_t plat_ddr_size(void);
+extern "C" uint32_t ddr_size_detect(void);   /* platform/ddr_size.c */
+
+/* HOW MUCH DDR THIS WATCH ACTUALLY HAS — detected, never assumed.
+ *
+ * OWF_DDR_SIZE (owf_meminfo.h) is chosen by SOC TIER, and DDR size is not a
+ * property of the SoC tier: every PLAT_SOC_MSM8909 board took the 512 MB
+ * branch, so the Fossil Gen 5 reported 512 MB on a 1 GB watch even though its
+ * own board header (boards/fossil_gen5.h) says 1 GB. Worse, the TicWatch C2
+ * and C2+ are the SAME board key, the SAME dtb and the SAME image and differ
+ * ONLY in RAM, 512 MB against 1 GB -- so no compile-time constant can be right
+ * for both, on any board key we could invent. It has to be read at runtime.
+ *
+ * ddr_size.c does exactly that from two independent sources (aboot's device
+ * tree, then the SMEM usable-RAM table) and was written for this, but nothing
+ * ever called it. Called lazily HERE rather than at boot on purpose: this runs
+ * from the UI task when the About screen asks, long after the failure window
+ * that got the boot-time call removed in v83 (see arduino_main.cpp), and by
+ * then SMEM is up because the radio bring-up has run.
+ *
+ * Cached on success only, so an early call that predates SMEM does not freeze
+ * the fallback in. OWF_DDR_SIZE stays as the last resort. */
+static uint32_t owf_ddr_total(void)
+{
+    static uint32_t s_cached = 0;
+    if (s_cached) return s_cached;
+    uint32_t b = ddr_size_detect();
+    if (b < (128u * 1024u * 1024u)) return OWF_DDR_SIZE;   /* implausible: do not cache */
+    if (b == OWF_DDR_SIZE) { s_cached = b; return b; }     /* agrees with the constant */
+    s_cached = b;
+    return b;
+}
 
 /* linker.ld */
 extern "C" char __image_start[], __image_end[];
@@ -32,7 +63,7 @@ extern "C" void owf_meminfo(owf_meminfo_t *out)
     memset(out, 0, sizeof *out);
 
     out->ddr_base  = OWF_DDR_BASE;
-    out->ddr_total = OWF_DDR_SIZE;      /* v83: ddr_size_detect() not run at boot (see arduino_main.cpp) */
+    out->ddr_total = owf_ddr_total();   /* detected at runtime; see above */
     for (unsigned i = 0; i < sizeof k_reserved / sizeof k_reserved[0]; i++)
         out->ddr_reserved += (k_reserved[i].last_mb - k_reserved[i].first_mb + 1u) << 20;
 

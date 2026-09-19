@@ -237,6 +237,12 @@
 #define PLAT_PANEL_W        360u
 #define PLAT_PANEL_H        360u
 #define PLAT_SCREEN_ROUND   1
+/* Panel control lines, FROM-DTB (skipjack-stock.dts qcom,mdss_dsi_ctrl0):
+ *   platform-reset-gpio TLMM 25 (0x19), platform-te-gpio TLMM 24 (0x18).
+ * The reset line is only driven by panel_reinit_after_rail() (wake after l6
+ * was cut); aboot configured it as an output and left it high. */
+#define PLAT_PANEL_RESET_GPIO 25u
+#define PLAT_PANEL_TE_GPIO    24u
 
 /* Brightness: "bl_ctrl_dcs", min level 1, max 255 — the SAME scheme as the
  * Gen 4's AUO h139. dsi_dcs_set_brightness() (DCS 0x51 over the msm8909w DSI
@@ -325,6 +331,7 @@
  * digitalRead() of the virtual BOOT_BTN_GPIO maps here. */
 #define PLAT_BTN_STEM1_GPIO   91u
 #define PLAT_BTN_ACTIVE_LOW   1
+#define PLAT_BTN_STEM1_MPM    32u   /* skipjack qcom,gpio-map <0x20 0x5b>: MPM pin 32 = gpio91 */
 
 /* ---- Crown / rotation: NONE ----------------------------------------------
  * RESOLVED, FROM-DTB. The QTI wear reference boards put a PixArt optical
@@ -348,3 +355,56 @@
  * while the takeover framebuffer is still the live scanout. */
 #define PLAT_SPLASH_BASE    0x83000000u
 #define PLAT_SPLASH_SIZE    0x00C00000u
+
+/* PixArt PAH8011 PPG is fitted on the TicWatch C2/S2 as well — see the note in
+ * fossil_gen4.h for why this is a capability and not an SoC test. */
+#define PLAT_HAS_HR_PAH8011 1
+
+/* Send the legacy TCSR boot-misc hint alongside the IMEM restart cookie.
+ * Kept ON here only because reboot-to-fastboot is PROVEN working on the TicWatch C2/S2
+ * with it present, and a proven recovery path is not worth disturbing. It is
+ * off by default for new boards -- the value is LK's EDL cookie; see the long
+ * note in platform/reboot_msm.c. */
+#define PLAT_REBOOT_TCSR_HINT 1
+
+/* qcom,use-legacy-hard-reset-offset: skipjack matches firefish here: no legacy-offset property.
+ * Selects where qpnp_pon_set_restart_reason() puts the restart reason in
+ * SOFT_RB_SPARE -- see the long note in platform/reboot_msm.c. */
+#define PLAT_PON_LEGACY_HARD_RESET_OFFSET 0
+
+/* CPU core rail: same as the Gen 4 (8916_s2 @0x1700 on sid 1). */
+#define PLAT_APC_SID            1u
+#define PLAT_APC_SPMI_BASE      0x1700u
+
+/* ---- Modem channels: NO DIAG, NO FASTRPC on this watch (2026-09-17) --------
+ * mss_boot.c defaults MSS_OPEN_MASK to 0x7F (every channel stock opens). That
+ * default was chosen for the Wear 3100 stall hunt, and it is wrong here for a
+ * reason that costs real current: bit 4 (DIAG_CNTL) compiles in mss_diag.c,
+ * which answers the modem's SSID range report by enabling EVERY F3 debug level
+ * on EVERY range and then receives the resulting message stream for as long as
+ * the watch runs; bit 1 does the same for the fastrpc listener. Neither is
+ * linked into a Wear 2100 image before v473, and neither diagnoses anything on
+ * a board whose modem already boots.
+ *
+ * 0x6D = 0x7F without bits 1 and 4: the SAME set of channels is opened as
+ * before, so the modem bring-up is untouched, but nothing asks the modem to
+ * talk. A build may still override this (the Wear 3100 boards pass their own).
+ * Inherited by the S2, which includes this header. */
+#ifndef MSS_OPEN_MASK
+#define MSS_OPEN_MASK 0x6Du
+#endif
+
+/* Rails switched off for every deep sleep (platform/sleep_floor.c, mask: bit N
+ * = pm8916 lN, bit 24+N = sN). Confirmed on the C2 (2026-09-18): l6 + l11 +
+ * l12 + l17 = 0x21840, with display, touch and steps all fine after wake.
+ *   l6  - panel DDIC vddio; the wake path re-initialises the panel
+ *         (dsi_panel.c panel_reinit_after_rail + MADCTL).
+ *   l11 - FocalTech touch vdd (+ tpiu/qpdi); the wake reset pulse and 120 ms
+ *         settle bring the controller back from power-on.
+ *   l12 - tpiu/qpdi vdd-io only (the sdhci2 that also lists it is disabled).
+ *   l17 - only disabled touch nodes (synaptics, it7260) in the stock tree.
+ * Inherited by the S2, confirmed there too (it only needs its own MADCTL,
+ * see ticwatch_s2.h). -DSLEEP_RAILS_OFF=0 keeps every rail on. */
+#ifndef SLEEP_RAILS_OFF
+#define SLEEP_RAILS_OFF 0x21840u
+#endif

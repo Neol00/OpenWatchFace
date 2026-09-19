@@ -94,7 +94,13 @@ smp_secondary_entry:
     and     r0, r0, #0xff
     cmp     r0, #1
     bhi     4f
+    /* 2026-09-18 (gen5-modem-37): this was `ldr sp, =smp_cpu1_stack_top` -- the ADDRESS of the
+     * pointer variable (in .rodata), not its value. CPU1 ran on a stack growing down from
+     * 0x80179ca0 through the read-only data of cpu_pc8909, msm_wdog, pmic_fg, bt_hci, wlan,
+     * wcnss, scm... every tick, SGI and frame push. Caught by the read-only sections: DATA
+     * ABORT at smp_secondary_main's first push, far inside .rodata. */
     ldr     sp, =smp_cpu1_stack_top
+    ldr     sp, [sp]
     bl      smp_secondary_main
 3:  wfi
     b       3b
