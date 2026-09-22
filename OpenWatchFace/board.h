@@ -199,6 +199,12 @@
 #ifndef BOARD_PLATFORM_FOSSIL
 #define BOARD_PLATFORM_FOSSIL 0      /* Fossil watches, bare-metal (snapdragon-port runtime) */
 #endif
+/* The bare-metal watches are built by the snapdragon-port scripts, which pass
+ * -DBOARD_SELECT themselves. Selecting one here in an Arduino (ESP32) build only
+ * fails later with "owf_fossil_lvgl.h: No such file or directory". */
+#if BOARD_PLATFORM_FOSSIL && defined(ESP_PLATFORM)
+#error "board.h: this BOARD_SELECT is a bare-metal watch (build it with snapdragon-port/baremetal/build-owf-image-*.sh); pick an ESP32 BOARD_ID_* for the Arduino IDE"
+#endif
 
 /* -- display (exactly one =1; checked below) -------------------------------- */
 #ifndef BOARD_DISPLAY_CO5300_QSPI

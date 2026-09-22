@@ -6,11 +6,11 @@
 Arduino_ESP32DSIPanel::Arduino_ESP32DSIPanel(
     uint32_t hsync_pulse_width, uint32_t hsync_back_porch, uint32_t hsync_front_porch,
     uint32_t vsync_pulse_width, uint32_t vsync_back_porch, uint32_t vsync_front_porch,
-    uint32_t prefer_speed,uint32_t lane_bit_rate /*新增成员变量*/)
+    uint32_t prefer_speed, uint32_t lane_bit_rate /*新增成员变量*/)
     : _hsync_pulse_width(hsync_pulse_width), _hsync_back_porch(hsync_back_porch), _hsync_front_porch(hsync_front_porch),
       _vsync_pulse_width(vsync_pulse_width), _vsync_back_porch(vsync_back_porch), _vsync_front_porch(vsync_front_porch),
       _prefer_speed(prefer_speed),
-	  _lane_bit_rate(lane_bit_rate)/*新增成员变量*/
+      _lane_bit_rate(lane_bit_rate) /*新增成员变量*/
 {
 }
 
@@ -39,8 +39,12 @@ bool Arduino_ESP32DSIPanel::begin(int16_t w, int16_t h, int32_t speed, const lcd
   esp_lcd_dsi_bus_config_t bus_config = {
       .bus_id = 0,
       .num_data_lanes = 2,
+#if CONFIG_ESP32P4_SELECTS_REV_LESS_V3
       .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-      .lane_bit_rate_mbps = _lane_bit_rate, /*新增成员变量*/
+#else
+      .phy_clk_src = MIPI_DSI_PHY_PLLREF_CLK_SRC_DEFAULT,
+#endif
+      .lane_bit_rate_mbps = _lane_bit_rate,
   };
   esp_lcd_dsi_bus_handle_t mipi_dsi_bus = NULL;
 
@@ -54,6 +58,7 @@ bool Arduino_ESP32DSIPanel::begin(int16_t w, int16_t h, int32_t speed, const lcd
   };
   esp_lcd_panel_io_handle_t io_handle = NULL;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &io_handle));
+  _io_handle = io_handle;
 
   esp_lcd_dpi_panel_config_t dpi_config = {
       .virtual_channel = 0,
@@ -103,6 +108,13 @@ uint16_t *Arduino_ESP32DSIPanel::getFrameBuffer()
   ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(_panel_handle, 1, &frame_buffer));
 
   return ((uint16_t *)frame_buffer);
+}
+
+bool Arduino_ESP32DSIPanel::writeCommand(uint8_t cmd, const uint8_t *data, size_t data_bytes)
+{
+  if (_io_handle == NULL)
+    return false;
+  return esp_lcd_panel_io_tx_param(_io_handle, cmd, data, data_bytes) == ESP_OK;
 }
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32P4)

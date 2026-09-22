@@ -382,6 +382,24 @@ static int bms_raw_to_mv(uint16_t raw)
     return (int)((uv * BMS_VBATT_MUL) / 1000u);
 }
 
+/* A sample the BMS took AFTER this call (2026-09-22). FIFO_0 holds the last sample the BMS
+ * state machine produced, and straight after a collapse that is still the one from before the
+ * sleep: "sleep-batt: 4318 mV -> 4318 mV over 11723 s" on a Gen 4 whose screen showed 4.11 V a
+ * few seconds later. Wait until the raw word changes, at most wait_ms; *fresh says whether it
+ * did. Measurement use only -- it blocks. */
+int fg_batt_mv_fresh(uint32_t wait_ms, int *fresh)
+{
+    uint16_t raw0 = 0, raw = 0;
+    if (fresh) *fresh = 0;
+    if (bms_read16(BMS_FIFO_0_LSB, &raw0) < 0) return -1;
+    uint32_t t0 = timer_ms();
+    while ((uint32_t)(timer_ms() - t0) < wait_ms) {
+        timer_delay_ms(50u);
+        if (bms_read16(BMS_FIFO_0_LSB, &raw) == 0 && raw != raw0) { if (fresh) *fresh = 1; return bms_raw_to_mv(raw); }
+    }
+    return bms_raw_to_mv(raw0);
+}
+
 int fg_batt_mv(void)
 {
     uint16_t raw = 0;

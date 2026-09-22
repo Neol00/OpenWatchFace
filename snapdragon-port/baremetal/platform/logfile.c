@@ -69,6 +69,7 @@ static int wr(const char *p, uint32_t n)
 void logfile_flush(void)
 {
     if (s_state < 0) return;
+    if (emmc_is_suspended()) return;             /* card powered off for the sleep: the ring keeps it */
     if (RL->magic != RAMLOG_MAGIC) return;
 
     uint32_t now = timer_ms();

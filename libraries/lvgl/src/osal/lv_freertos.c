@@ -15,18 +15,12 @@
 #include "lv_os_private.h"
 #if LV_USE_OS == LV_OS_FREERTOS
 
-/* LOCAL PATCH (ESP32-S3-WatchFace): ESP-IDF's FreeRTOS ships atomic.h under the
- * freertos/ include prefix, not as a bare "atomic.h" on the include path, so the
- * upstream `#include "atomic.h"` fails to resolve. Use the freertos/ path which is
- * on the default include path for every chip (S3/C6/...). */
-#if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_ESP32)
-#include "freertos/atomic.h"
+#ifdef ESP_PLATFORM
+    #include <freertos/atomic.h>
 #else
-#include "atomic.h"
+    #include <atomic.h>
 #endif
 
-#include "../tick/lv_tick.h"
-#include "../misc/lv_log.h"
 #include "../core/lv_global.h"
 
 /*********************
@@ -428,7 +422,7 @@ lv_result_t lv_thread_sync_signal_isr(lv_thread_sync_t * pxCond)
 
 void lv_freertos_task_switch_in(const char * name)
 {
-    if(lv_strcmp(name, "IDLE")) globals->freertos_idle_task_running = false;
+    if(lv_strncmp(name, "IDLE", 4)) globals->freertos_idle_task_running = false;
     else globals->freertos_idle_task_running = true;
 
     globals->freertos_task_switch_timestamp = lv_tick_get();
@@ -441,6 +435,7 @@ void lv_freertos_task_switch_out(void)
     else globals->freertos_non_idle_time_sum += elaps;
 }
 
+#if LV_OS_IDLE_PERCENT_CUSTOM == 0
 uint32_t lv_os_get_idle_percent(void)
 {
     if(globals->freertos_non_idle_time_sum + globals->freertos_idle_time_sum == 0) {
@@ -456,6 +451,7 @@ uint32_t lv_os_get_idle_percent(void)
 
     return pct;
 }
+#endif
 
 void lv_sleep_ms(uint32_t ms)
 {

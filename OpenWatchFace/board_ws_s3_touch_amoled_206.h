@@ -99,7 +99,7 @@
 /* Lines per LVGL partial render buffer (x2 buffers, internal SRAM).
  * SIZING IS FIXED AT COMPILE TIME — never auto-size from boot free-heap
  * (see the PARTIAL render comment in the .ino). */
-#define BOARD_PARTIAL_BUF_LINES 76
+#define BOARD_PARTIAL_BUF_LINES 84
 
 /* ---- Touch: FT3168 + shared I2C bus (touch/PMU/RTC/IMU) ------------------- */
 #define IIC_SDA  15

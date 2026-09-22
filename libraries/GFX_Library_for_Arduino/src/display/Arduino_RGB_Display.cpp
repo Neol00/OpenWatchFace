@@ -104,7 +104,7 @@ void Arduino_RGB_Display::writePixelPreclipped(int16_t x, int16_t y, uint16_t co
   *fb = color;
   if (_auto_flush)
   {
-    Cache_WriteBack_Addr((uint32_t)fb, 2);
+    _dirty(fb, 2);
   }
 }
 
@@ -163,7 +163,7 @@ void Arduino_RGB_Display::writeFastVLineCore(int16_t x, int16_t y,
           while (h--)
           {
             *fb = color;
-            Cache_WriteBack_Addr((uint32_t)fb, 2);
+            _dirty(fb, 2);
             fb += _fb_width;
           }
         }
@@ -230,7 +230,7 @@ void Arduino_RGB_Display::writeFastHLineCore(int16_t x, int16_t y,
         x += COL_OFFSET1;
         y += ROW_OFFSET1;
         uint16_t *fb = _framebuffer + ((int32_t)y * _fb_width) + x;
-        uint32_t cachePos = (uint32_t)fb;
+        uint16_t *cachePos = fb;
         int16_t writeSize = w * 2;
         while (w--)
         {
@@ -238,7 +238,7 @@ void Arduino_RGB_Display::writeFastHLineCore(int16_t x, int16_t y,
         }
         if (_auto_flush)
         {
-          Cache_WriteBack_Addr(cachePos, writeSize);
+          _dirty(cachePos, writeSize);
         }
       }
     }
@@ -279,7 +279,7 @@ void Arduino_RGB_Display::writeFillRectPreclipped(int16_t x, int16_t y,
   y += ROW_OFFSET1;
   uint16_t *row = _framebuffer;
   row += y * _fb_width;
-  uint32_t cachePos = (uint32_t)row;
+  uint16_t *cachePos = row;
   row += x;
   for (int j = 0; j < h; j++)
   {
@@ -291,7 +291,7 @@ void Arduino_RGB_Display::writeFillRectPreclipped(int16_t x, int16_t y,
   }
   if (_auto_flush)
   {
-    Cache_WriteBack_Addr(cachePos, _fb_width * h * 2);
+    _dirty(cachePos, _fb_width * h * 2);
   }
 }
 
@@ -341,7 +341,7 @@ void Arduino_RGB_Display::drawIndexedBitmap(int16_t x, int16_t y, uint8_t *bitma
       y += ROW_OFFSET1;
       uint16_t *row = _framebuffer;
       row += y * _fb_width;
-      uint32_t cachePos = (uint32_t)row;
+      uint16_t *cachePos = row;
       row += x;
       for (int j = 0; j < h; j++)
       {
@@ -354,7 +354,7 @@ void Arduino_RGB_Display::drawIndexedBitmap(int16_t x, int16_t y, uint8_t *bitma
       }
       if (_auto_flush)
       {
-        Cache_WriteBack_Addr(cachePos, _fb_width * h * 2);
+        _dirty(cachePos, _fb_width * h * 2);
       }
     }
   }
@@ -402,27 +402,27 @@ void Arduino_RGB_Display::draw16bitRGBBitmap(int16_t x, int16_t y,
   {
     if (_auto_flush)
     {
-      uint32_t cachePos;
+      uint16_t *cachePos;
       size_t cache_size;
       switch (_rotation)
       {
       case 1:
-        cachePos = (uint32_t)(_framebuffer + (x * _fb_width));
+        cachePos = _framebuffer + (x * _fb_width);
         cache_size = _fb_width * w * 2;
         break;
       case 2:
-        cachePos = (uint32_t)(_framebuffer + ((HEIGHT - y - h) * _fb_width));
+        cachePos = _framebuffer + ((HEIGHT - y - h) * _fb_width);
         cache_size = _fb_width * h * 2;
         break;
       case 3:
-        cachePos = (uint32_t)(_framebuffer + ((HEIGHT - x - w) * _fb_width));
+        cachePos = _framebuffer + ((HEIGHT - x - w) * _fb_width);
         cache_size = _fb_width * w * 2;
         break;
       default: // case 0:
-        cachePos = (uint32_t)(_framebuffer + (y * _fb_width) + x);
+        cachePos = _framebuffer + (y * _fb_width) + x;
         cache_size = (_fb_width * (h - 1) + w) * 2;
       }
-      Cache_WriteBack_Addr(cachePos, cache_size);
+      _dirty(cachePos, cache_size);
     }
   }
 }
@@ -474,7 +474,7 @@ void Arduino_RGB_Display::draw16bitBeRGBBitmap(int16_t x, int16_t y,
       }
       uint16_t *row = _framebuffer;
       row += y * _fb_width;
-      uint32_t cachePos = (uint32_t)row;
+      uint16_t *cachePos = row;
       row += x;
       uint16_t color;
       for (int j = 0; j < h; j++)
@@ -489,7 +489,7 @@ void Arduino_RGB_Display::draw16bitBeRGBBitmap(int16_t x, int16_t y,
       }
       if (_auto_flush)
       {
-        Cache_WriteBack_Addr(cachePos, _fb_width * h * 2);
+        _dirty(cachePos, _fb_width * h * 2);
       }
     }
   }
@@ -545,7 +545,7 @@ void Arduino_RGB_Display::drawYCbCrBitmap(int16_t x, int16_t y, uint8_t *yData, 
     }
     if (_auto_flush)
     {
-      Cache_WriteBack_Addr((uint32_t)cachePos, _fb_width * h * 2);
+      _dirty(cachePos, _fb_width * h * 2);
     }
   }
 }
@@ -561,6 +561,62 @@ void Arduino_RGB_Display::flush(bool force_flush)
 uint16_t *Arduino_RGB_Display::getFramebuffer()
 {
   return _framebuffer;
+}
+
+void Arduino_RGB_Display::_dirty(const void *ptr, size_t bytes)
+{
+  if (!_auto_flush)
+  {
+    return; // caller drives flush() itself
+  }
+  if (_write_depth == 0)
+  {
+    // Not inside a transaction: preserve the immediate-write contract.
+    Cache_WriteBack_Addr((uint32_t)ptr, bytes);
+    return;
+  }
+  const int32_t lo = (int32_t)((const uint8_t *)ptr - (const uint8_t *)_framebuffer);
+  const int32_t hi = lo + (int32_t)bytes;
+  if (_dirty_begin < 0)
+  {
+    _dirty_begin = lo;
+    _dirty_end = hi;
+  }
+  else
+  {
+    if (lo < _dirty_begin)
+    {
+      _dirty_begin = lo;
+    }
+    if (hi > _dirty_end)
+    {
+      _dirty_end = hi;
+    }
+  }
+}
+
+void Arduino_RGB_Display::startWrite(void)
+{
+  if (_write_depth++ == 0)
+  {
+    _dirty_begin = -1;
+    _dirty_end = -1;
+  }
+}
+
+void Arduino_RGB_Display::endWrite(void)
+{
+  if (_write_depth == 0)
+  {
+    return; // unbalanced call, nothing pending
+  }
+  if ((--_write_depth == 0) && (_dirty_begin >= 0) && (_dirty_end > _dirty_begin))
+  {
+    Cache_WriteBack_Addr((uint32_t)((uint8_t *)_framebuffer + _dirty_begin),
+                          (size_t)(_dirty_end - _dirty_begin));
+    _dirty_begin = -1;
+    _dirty_end = -1;
+  }
 }
 
 #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)

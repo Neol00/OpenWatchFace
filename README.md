@@ -1,7 +1,7 @@
 # OpenWatchFace — a small "watch OS"
 
 A from-scratch smartwatch firmware for touch-display boards, from the Tuya T5, the MaixCam-Pro
-to a growing set of Qualcomm-based Wear OS watches (Fossil Gen 4 and Gen 6, TicWatch C2 and S2) run bare-metal.
+to a growing set of Qualcomm-based Wear OS watches (Fossil Gen 4, Gen 5, Gen 5E, Sport and Gen 6, TicWatch C2 and S2) run bare-metal.
 On the Wear 2100 watches that means the whole stack with no Linux underneath: WiFi and BLE on the SoC's own radio,
 over-the-air updates, dual core, and a deep sleep that power-collapses the CPU cluster.
 It is a real little OS in miniature: a watch face, an app launcher, a notification pipeline
@@ -77,6 +77,9 @@ flashing, so you only follow the steps that apply to the hardware you own.
 | Waveshare T5-E1-Touch-AMOLED-1.75 | Tuya T5-E1 | 466×466 CO5300 AMOLED | [Guide](docs/devices/tuya-t5-amoled-1.75.md) |
 | Sipeed MaixCam-Pro | SG2002 (Linux) | MaixCDK-owned panel | [Guide](docs/devices/maixcam-pro.md) |
 | Fossil Gen 6 (hoki) | Wear 4100 (SDA429W) | 416×416 AMOLED | [Guide](docs/devices/fossil-gen6.md) |
+| Fossil Gen 5 (triggerfish / Carlyle HR) | Wear 3100 (APQ8009W + PM660) | 416×416 AMOLED | [Guide](docs/devices/fossil-gen5.md) |
+| Fossil Gen 5E (sole) | Wear 3100 (APQ8009W + PM660) | 390×390 AMOLED | [Guide](docs/devices/fossil-gen5e.md) |
+| Fossil Sport (darter) | Wear 3100 (APQ8009W + PM660) | 390×390 AMOLED | [Guide](docs/devices/fossil-darter.md) |
 | Fossil Gen 4 (firefish/ray) | Wear 2100 (APQ8009W) | 454×454 AMOLED | [Guide](docs/devices/fossil-gen4.md) |
 | Mobvoi TicWatch C2 / C2+ (skipjack) | Wear 2100 (APQ8009W) | 360×360 round AMOLED | [Guide](docs/devices/ticwatch-c2.md) |
 | Mobvoi TicWatch S2 / E2 (tunny) | Wear 2100 (APQ8009W) | 400×400 round AMOLED | [Guide](docs/devices/ticwatch-s2.md) |
@@ -84,10 +87,10 @@ flashing, so you only follow the steps that apply to the hardware you own.
 Most boards build in the **Arduino IDE** against the bundled libraries in
 `libraries/` (the exact versions the firmware was built against) plus the ESP32 core
 from the Boards Manager. The MaixCam and the Qualcomm watches use their own
-toolchains — the Fossil Gen 6, Fossil Gen 4, TicWatch C2 and TicWatch S2 are
+toolchains — the Fossil Gen 6, Gen 5, Gen 5E, Sport, Gen 4, TicWatch C2 and TicWatch S2 are
 bare-metal ARM, built with `arm-none-eabi-gcc` and run with `fastboot` as an
-Android boot image. The three Wear 2100 watches can be RAM-booted without
-overwriting Wear OS.
+Android boot image. The Gen 5, Gen 5E, Sport and the three Wear 2100 watches can be
+RAM-booted without overwriting Wear OS.
 
 > **Shared reference:** the out-of-tree library patches are documented once in
 > [`patches/README.md`](patches/README.md); every Arduino device page links to it.
@@ -588,16 +591,34 @@ library's license, and all are GPL-compatible).
 
 | Library | Version | Author | License |
 |---------|---------|--------|---------|
-| [LVGL](https://github.com/lvgl/lvgl) | 9.5.0 | LVGL community | MIT |
-| [Arduino_GFX](https://github.com/moononournation/Arduino_GFX) (`GFX_Library_for_Arduino`) | 1.6.5 | Moon On Our Nation | BSD |
+| [LVGL](https://github.com/lvgl/lvgl) | 9.6.0 | LVGL community | MIT |
+| [Arduino_GFX](https://github.com/moononournation/Arduino_GFX) (`GFX_Library_for_Arduino`) | 1.6.8 | Moon On Our Nation | BSD |
 | [Arduino_DriveBus](https://github.com/XKArduino/Arduino_DriveBus) | 1.0.1 | Xk_w | GPL-3.0 |
 | [SensorLib](https://github.com/lewisxhe/SensorLib) | 0.4.1 | Lewis He | MIT |
 | [XPowersLib](https://github.com/lewisxhe/XPowersLib) | 0.3.3 | Lewis He | MIT |
+| [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library) (`Adafruit_GFX_Library`) | 1.12.6 | Adafruit Industries | BSD |
+| [Adafruit BusIO](https://github.com/adafruit/Adafruit_BusIO) (`Adafruit_BusIO`) | 1.17.4 | Adafruit Industries | MIT |
+| [GxEPD2](https://github.com/ZinggJM/GxEPD2) | 1.6.9 | Jean-Marc Zingg | GPL-3.0 |
+| `esp_lcd_touch_axs5106l` (AXS5106L touch driver) | — | from Waveshare's board examples | as published by Waveshare |
 
 The **ESP32 Arduino core** (Espressif Systems, v3.3.11, Apache-2.0) is installed
 separately via the Boards Manager (see [Installation](#installation)); the patches this
 project makes to it (the bundled `BLE` and `ESP_I2S` libraries, and `Esp.cpp`) are in
 [`patches/`](patches/).
+
+### Bundled with the Snapdragon port
+
+The bare-metal Snapdragon Wear port carries its own network, crypto and Bluetooth stacks in
+[`snapdragon-port/baremetal/third_party/`](snapdragon-port/baremetal/third_party/). Each
+directory keeps the upstream license file it came with.
+
+| Component | Version | Author | License |
+|-----------|---------|--------|---------|
+| [lwIP](https://savannah.nongnu.org/projects/lwip/) (`lwip`) | 2.1.3 | Adam Dunkels / Swedish Institute of Computer Science and the lwIP developers | BSD-3-Clause |
+| [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) (`mbedtls`) | 3.6.7 | The Mbed TLS contributors | Apache-2.0 OR GPL-2.0-or-later |
+| [Apache Mynewt NimBLE](https://github.com/apache/mynewt-nimble) (`nimble`) | upstream snapshot | The Apache Software Foundation | Apache-2.0 |
+| [TinyCrypt](https://github.com/intel/tinycrypt) (`tinycrypt`) | 0.2.8 | Intel Corporation | BSD-3-Clause |
+| [ESP32 Arduino core](https://github.com/espressif/arduino-esp32) `BLE` library (`arduino-esp32-ble`) | 3.3.11 | Espressif Systems, Ryan Powell, Neil Kolban | Apache-2.0 (core: LGPL-2.1) |
 
 ### Hardware & references
 

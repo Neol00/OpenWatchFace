@@ -334,8 +334,12 @@ static void ancs_parse_and_store(void) {
   // append to the archive — na_append() is append-only with NO de-dup of its own, so
   // gating it here is what stops the archive accumulating a duplicate line for every
   // backlog replay after each sleep/wake.
+  // Backfill BEFORE the cache add (as notif_net.h does). After it, the cache already holds this
+  // notification, so an empty archive was backfilled WITH it and na_append() then wrote it a
+  // second time: one notification arriving on an empty archive showed up twice.
+  if (na_available()) na_backfill_from_cache();
   bool added = notif_store_add(id, title, body, cat);
-  if (added && na_available()) { na_backfill_from_cache(); na_append(id, title, body, cat); }   // full history (SD or FFat)
+  if (added && na_available()) na_append(id, title, body, cat);   // full history (SD or FFat)
   if (added) {
     notif_store_save();
     // Stash newest for the popup card, same as the HTTP path does.

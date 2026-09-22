@@ -207,8 +207,12 @@ static int s_bl_valid;
 int panel_reinit_after_rail(void)
 {
 #if defined(PLAT_PANEL_RESET_GPIO)
-    tlmm_out(PLAT_PANEL_RESET_GPIO, 0); timer_delay_ms(10u);
-    tlmm_out(PLAT_PANEL_RESET_GPIO, 1); timer_delay_ms(10u);
+#ifndef PLAT_PANEL_RESET_LOW_MS          /* skipjack/tunny reset-sequence <0 10 1 10> */
+#define PLAT_PANEL_RESET_LOW_MS  10u
+#define PLAT_PANEL_RESET_HIGH_MS 10u
+#endif
+    tlmm_out(PLAT_PANEL_RESET_GPIO, 0); timer_delay_ms(PLAT_PANEL_RESET_LOW_MS);
+    tlmm_out(PLAT_PANEL_RESET_GPIO, 1); timer_delay_ms(PLAT_PANEL_RESET_HIGH_MS);
 #endif
     if (panel_on() < 0) return -1;
     dsi_dcs_ctrl_display_resend();

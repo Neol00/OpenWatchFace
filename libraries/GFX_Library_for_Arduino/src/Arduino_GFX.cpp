@@ -1949,12 +1949,19 @@ void Arduino_GFX::u8g2_font_decode_len(uint8_t len, uint8_t is_foreground, uint1
       y = _u8g2_target_y + ly;
 
       /* draw foreground and background (if required) */
-      if ((x <= _max_text_x) && (y <= _max_text_y))
+      if ((x <= _max_text_x) && (y <= _max_text_y) && (y >= _min_text_y))
       {
         curW = current;
         if ((x + curW - 1) > _max_text_x)
         {
           curW = _max_text_x - x + 1;
+        }
+        if (x < _min_text_x)
+        { 
+	  // Clip left margin, i.e. characters partially to the left of
+	  // edge of the text bound
+          curW = max(0,(curW - (_min_text_x - x)));
+          x = _min_text_x;
         }
         if (is_foreground)
         {
@@ -1973,12 +1980,19 @@ void Arduino_GFX::u8g2_font_decode_len(uint8_t len, uint8_t is_foreground, uint1
       y = _u8g2_target_y + (ly * textsize_y);
 
       /* draw foreground and background (if required) */
-      if (((x + textsize_x - 1) <= _max_text_x) && ((y + textsize_y - 1) <= _max_text_y))
+      if (((x + textsize_x - 1) <= _max_text_x) && ((y + textsize_y - 1) <= _max_text_y) && (y + textsize_y -1) >= _min_text_y) 
       {
         curW = current * textsize_x;
         while ((x + curW - 1) > _max_text_x)
         {
           curW -= textsize_x;
+        }
+        if (x < _min_text_x)
+        { 
+	  // Clip left margin, i.e. characters partially to the left of
+	  // edge of the text bound
+          curW = max(0,(curW - (_min_text_x - x)));
+          x = _min_text_x;
         }
         if (is_foreground)
         {
@@ -2105,7 +2119,7 @@ void Arduino_GFX::drawChar(int16_t x, int16_t y, unsigned char c,
             {
               if (bits & 0x80)
               {
-                writePixelPreclipped(curX, curY, color);
+                writePixel(curX, curY, color);
               }
             }
           }
@@ -2156,6 +2170,10 @@ void Arduino_GFX::drawChar(int16_t x, int16_t y, unsigned char c,
 
       _u8g2_target_x = x + (_u8g2_char_x * textsize_x);
       // log_d("_u8g2_target_x: %d, _u8g2_target_y: %d", _u8g2_target_x, _u8g2_target_y);
+      if (_u8g2_target_x + _u8g2_char_width < _min_text_x) {
+	// Clip left, i.e. characters entirely to the left of the left text bound
+        return;
+      }
 
       /* reset local x/y position */
       _u8g2_dx = 0;
@@ -2201,12 +2219,12 @@ void Arduino_GFX::drawChar(int16_t x, int16_t y, unsigned char c,
       for (int8_t i = 0; i < 5; ++i, ++curX) // Char bitmap = 5 columns
       {
         uint8_t line = pgm_read_byte(&font[c * 5 + i]);
-        if (curX <= _max_text_x)
+        if ((curX >= _min_text_x) && (curX <= _max_text_x))
         {
           curY = y;
           for (int8_t j = 0; j < 8; ++j, ++curY, line >>= 1)
           {
-            if (curY <= _max_text_y)
+            if ((curY >= _min_text_y) && (curY <= _max_text_y))
             {
               if (line & 1)
               {
@@ -3007,7 +3025,9 @@ void Arduino_GFX::getTextBounds(const __FlashStringHelper *str,
   int16_t minx = _max_text_x, miny = _max_text_y, maxx = _min_text_x, maxy = _min_text_y;
 
   while ((c = pgm_read_byte(s++)))
+  {
     charBounds(c, &x, &y, &minx, &miny, &maxx, &maxy);
+  }
 
   if (maxx >= minx)
   {
@@ -3019,6 +3039,58 @@ void Arduino_GFX::getTextBounds(const __FlashStringHelper *str,
     *y1 = miny;
     *h = maxy - miny + 1;
   }
+}
+
+/**************************************************************************/
+/*!
+  @brief  Helper to determine size of a string with current font/size. Pass string and a cursor position, returns UL corner and W,H.
+  @param  str The ascii string to measure
+  @param  x   The current cursor X
+  @param  y   The current cursor Y
+*/
+/**************************************************************************/
+void Arduino_GFX::printCenterText(const char *str, int16_t x, int16_t y)
+{
+  int16_t x1, y1;
+  uint16_t w, h;
+  getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+  setCursor(x - (w / 2), y - (h /2));
+  print(str);
+}
+
+/**************************************************************************/
+/*!
+  @brief  Helper to determine size of a string with current font/size. Pass string and a cursor position, returns UL corner and W,H.
+  @param  str The ascii string to measure (as an arduino String() class)
+  @param  x   The current cursor X
+  @param  y   The current cursor Y
+*/
+/**************************************************************************/
+void Arduino_GFX::printCenterText(const String &str, int16_t x, int16_t y)
+{
+  int16_t x1, y1;
+  uint16_t w, h;
+  getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+  setCursor(x - (w / 2), y - (h /2));
+  print(str);
+}
+
+/**************************************************************************/
+/*!
+  @brief  Helper to determine size of a PROGMEM string with current font/size. Pass string and a cursor position, returns UL corner and W,H.
+  @param  str The flash-memory ascii string to measure
+  @param  x   The current cursor X
+  @param  y   The current cursor Y
+*/
+/**************************************************************************/
+void Arduino_GFX::printCenterText(const __FlashStringHelper *str,
+                                int16_t x, int16_t y)
+{
+  int16_t x1, y1;
+  uint16_t w, h;
+  getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+  setCursor(x - (w / 2), y - (h /2));
+  print(str);
 }
 
 /**************************************************************************/

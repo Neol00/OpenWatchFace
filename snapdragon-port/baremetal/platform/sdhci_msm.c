@@ -655,6 +655,46 @@ static void emmc_unlock(void)
     if (s_emmc_lock) xSemaphoreGiveRecursive(s_emmc_lock);
 }
 
+/* ---- eMMC OFF FOR THE SLEEP (2026-09-22, -DSLEEP_RAILS_OFF bit 8 = l8, the card's VCC) ----
+ * Stock has 8916_l8 off with the screen off; we voted it ON in the sleep set because nothing
+ * here could bring the card back. An eMMC may only lose VCC (VCCQ = l5 stays) from the SLEEP
+ * state, so: deselect (CMD7, rca 0, no response), CMD5 with bit 15 = sleep, then the rail
+ * goes. CMD0 is legal from sleep and emmc_init() always cold-inits, so wake is just
+ * emmc_init() once l8 is back. The controller mutex is HELD across the whole sleep: another
+ * task (rmtfs, the net task) that wants the card blocks until the card exists again instead
+ * of getting an error. The suspending task itself recurses through the mutex, so its own
+ * callers see s_emmc_ok == 0 -- and logfile.c asks emmc_is_suspended() first, because a
+ * failed write there is sticky for the rest of the boot. The log is not lost: every line is
+ * in the ramlog ring already and the file catches up on the first flush after wake. */
+static int s_emmc_suspended;
+int emmc_is_suspended(void) { return s_emmc_suspended; }
+int emmc_sleep_enter(void)
+{
+    if (!s_emmc_ok) return -1;
+    emmc_lock();
+    s_emmc_suspended = 1;
+    int rc = emmc_cmd_rt(MMC_SELECT_CARD, 0u, 0x00u, 0);                     /* deselect -> standby */
+    if (rc == 0) rc = emmc_cmd(MMC_SLEEP_AWAKE, (s_rca << 16) | (1u << 15), 1, 0);
+    if (rc < 0) {
+        /* Not asleep: VCC must stay. Put the card back the sure way and tell the caller. */
+        con_puts("emmc: sleep command refused - l8 stays on this sleep\n");
+        (void)emmc_init();
+        s_emmc_suspended = 0;
+        emmc_unlock();
+        return -1;
+    }
+    s_emmc_ok = 0;
+    return 0;
+}
+void emmc_sleep_exit(void)
+{
+    if (!s_emmc_suspended) return;
+    timer_delay_ms(10u);                                                      /* l8 ramp + card power-up */
+    if (emmc_init() < 0) { timer_delay_ms(50u); if (emmc_init() < 0) con_puts("emmc: RE-INIT AFTER SLEEP FAILED - storage is gone until reboot\n"); }
+    s_emmc_suspended = 0;
+    emmc_unlock();
+}
+
 static int emmc_read_block_unlocked(uint32_t lba, void *dst);
 int emmc_read_block(uint32_t lba, void *dst)
 {

@@ -12,6 +12,12 @@
 
 #include "../sw/lv_draw_sw.h"
 #include "../../misc/lv_area_private.h"
+#include "../lv_draw_buf_private.h"
+
+#if defined(__ZEPHYR__) && LV_USE_DRAW_DMA2D_INTERRUPT
+    #include <zephyr/kernel.h>
+    #include <zephyr/irq.h>
+#endif
 
 #if !LV_DRAW_DMA2D_ASYNC && LV_USE_DRAW_DMA2D_INTERRUPT
     #warning LV_USE_DRAW_DMA2D_INTERRUPT is 1 but has no effect because LV_USE_OS is LV_OS_NONE
@@ -46,10 +52,14 @@ static int32_t delete_cb(lv_draw_unit_t * draw_unit);
 #if LV_DRAW_DMA2D_ASYNC
     static int32_t wait_finish_cb(lv_draw_unit_t * u);
 #endif
-#if !LV_DRAW_DMA2D_ASYNC
-    static bool check_transfer_completion(void);
-#endif
 static void post_transfer_tasks(lv_draw_dma2d_unit_t * u);
+#if defined(__ZEPHYR__) && LV_USE_DRAW_DMA2D_INTERRUPT
+    static void zephyr_dma2d_irq_handler(void *);
+#endif
+#if LV_DRAW_DMA2D_CACHE
+    static void invalidate_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area);
+    static void flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area);
+#endif
 
 /**********************
  *  STATIC VARIABLES
@@ -66,9 +76,24 @@ static void post_transfer_tasks(lv_draw_dma2d_unit_t * u);
 /**********************
  *   GLOBAL FUNCTIONS
  **********************/
+void lv_draw_buf_dma2d_init_handlers(void)
+{
+#if LV_DRAW_DMA2D_CACHE
+    lv_draw_buf_handlers_t * handlers = lv_draw_buf_get_handlers();
+    lv_draw_buf_handlers_t * font_handlers = lv_draw_buf_get_font_handlers();
+    lv_draw_buf_handlers_t * image_handlers = lv_draw_buf_get_image_handlers();
+    handlers->invalidate_cache_cb = invalidate_cache;
+    handlers->flush_cache_cb = flush_cache;
+    font_handlers->invalidate_cache_cb = invalidate_cache;
+    font_handlers->flush_cache_cb = flush_cache;
+    image_handlers->invalidate_cache_cb = invalidate_cache;
+    image_handlers->flush_cache_cb = flush_cache;
+#endif
+}
 
 void lv_draw_dma2d_init(void)
 {
+    lv_draw_buf_dma2d_init_handlers();
     lv_draw_dma2d_unit_t * draw_dma2d_unit = lv_draw_create_unit(sizeof(lv_draw_dma2d_unit_t));
     draw_dma2d_unit->base_unit.evaluate_cb = evaluate_cb;
     draw_dma2d_unit->base_unit.dispatch_cb = dispatch_cb;
@@ -90,10 +115,15 @@ void lv_draw_dma2d_init(void)
     /* enable the DMA2D clock */
 #if defined(STM32F4) || defined(STM32F7) || defined(STM32U5) || defined(STM32L4)
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2DEN;
+#if defined(STM32F4) || defined(STM32F7)
+    RCC->AHB1LPENR |= RCC_AHB1LPENR_DMA2DLPEN;
+#endif
 #elif defined(STM32H7)
     RCC->AHB3ENR |= RCC_AHB3ENR_DMA2DEN;
+    RCC->AHB3LPENR |= RCC_AHB3LPENR_DMA2DLPEN;
 #elif defined(STM32H7RS) || defined(STM32N6)
     RCC->AHB5ENR |= RCC_AHB5ENR_DMA2DEN;
+    RCC->AHB5LPENR |= RCC_AHB5LPENR_DMA2DLPEN;
 #else
 #warning "LVGL can't enable the clock for DMA2D"
 #endif
@@ -101,8 +131,13 @@ void lv_draw_dma2d_init(void)
     /* disable dead time */
     DMA2D->AMTCR = 0;
 
+#if defined(__ZEPHYR__) && LV_USE_DRAW_DMA2D_INTERRUPT
+    IRQ_CONNECT(DT_IRQN(DT_NODELABEL(dma2d)), DT_IRQ(DT_NODELABEL(dma2d), priority), zephyr_dma2d_irq_handler, NULL, 0);
+    irq_enable(DT_IRQN(DT_NODELABEL(dma2d)));
+#else
     /* enable the interrupt */
     NVIC_EnableIRQ(DMA2D_IRQn);
+#endif
 #endif /* OWF_TUYA_DMA2D_BACKEND */
 }
 
@@ -186,6 +221,41 @@ void lv_draw_dma2d_configure_and_start_transfer(const lv_draw_dma2d_configuratio
     owf_dma2d_backend_start(conf);
 }
 #else
+    /* Check that addresses are valid regarding to alignment constraints */
+    if(((conf->output_cf == LV_DRAW_DMA2D_OUTPUT_CF_ARGB8888) &&
+        (((uint32_t)(lv_uintptr_t) conf->output_address) & 0x03)) ||
+       ((conf->output_cf == LV_DRAW_DMA2D_OUTPUT_CF_RGB888) &&
+        (((uint32_t)(lv_uintptr_t) conf->output_address) & 0x03)) ||
+       ((conf->output_cf == LV_DRAW_DMA2D_OUTPUT_CF_RGB565) &&
+        (((uint32_t)(lv_uintptr_t) conf->output_address) & 0x01)) ||
+       ((conf->output_cf == LV_DRAW_DMA2D_OUTPUT_CF_ARGB1555) &&
+        (((uint32_t)(lv_uintptr_t) conf->output_address) & 0x01))) {
+        LV_LOG_WARN("Incompatible output address %p and format 0x%x",
+                    conf->output_address, conf->output_cf);
+    }
+    if(((conf->fg_cf == LV_DRAW_DMA2D_FGBG_CF_ARGB8888) &&
+        (((uint32_t)(lv_uintptr_t) conf->fg_address) & 0x03)) ||
+       ((conf->fg_cf == LV_DRAW_DMA2D_FGBG_CF_RGB888) &&
+        (((uint32_t)(lv_uintptr_t) conf->fg_address) & 0x03)) ||
+       ((conf->fg_cf == LV_DRAW_DMA2D_FGBG_CF_RGB565) &&
+        (((uint32_t)(lv_uintptr_t) conf->fg_address) & 0x01)) ||
+       ((conf->fg_cf == LV_DRAW_DMA2D_FGBG_CF_ARGB1555) &&
+        (((uint32_t)(lv_uintptr_t) conf->fg_address) & 0x01))) {
+        LV_LOG_WARN("Incompatible foreground address %p and format 0x%x",
+                    conf->fg_address, conf->fg_cf);
+    }
+    if(((conf->bg_cf == LV_DRAW_DMA2D_FGBG_CF_ARGB8888) &&
+        (((uint32_t)(lv_uintptr_t) conf->bg_address) & 0x03)) ||
+       ((conf->bg_cf == LV_DRAW_DMA2D_FGBG_CF_RGB888) &&
+        (((uint32_t)(lv_uintptr_t) conf->bg_address) & 0x03)) ||
+       ((conf->bg_cf == LV_DRAW_DMA2D_FGBG_CF_RGB565) &&
+        (((uint32_t)(lv_uintptr_t) conf->bg_address) & 0x01)) ||
+       ((conf->bg_cf == LV_DRAW_DMA2D_FGBG_CF_ARGB1555) &&
+        (((uint32_t)(lv_uintptr_t) conf->bg_address) & 0x01))) {
+        LV_LOG_WARN("Incompatible background address %p and format 0x%x",
+                    conf->bg_address, conf->bg_cf);
+    }
+
     /* number of lines register */
     DMA2D->NLR = (conf->w << DMA2D_NLR_PL_Pos) | (conf->h << DMA2D_NLR_NL_Pos);
 
@@ -235,27 +305,79 @@ void lv_draw_dma2d_configure_and_start_transfer(const lv_draw_dma2d_configuratio
 }
 #endif /* OWF_TUYA_DMA2D_BACKEND */
 
+
 #if LV_DRAW_DMA2D_CACHE
-void lv_draw_dma2d_invalidate_cache(const lv_draw_dma2d_cache_area_t * mem_area)
+static void __invalidate_flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area,
+                                     bool flush)
 {
-    if(SCB->CCR & SCB_CCR_DC_Msk) {
-        SCB_InvalidateDCache_by_Addr((uint32_t *)mem_area->first_byte,
-                                     mem_area->stride * mem_area->height);
+    LV_ASSERT(draw_buf != NULL);
+    LV_ASSERT(area != NULL);
+
+    const lv_image_header_t * header = &draw_buf->header;
+    uint32_t stride = header->stride;
+    lv_color_format_t cf = header->cf;
+
+    uint32_t bpp = lv_color_format_get_bpp(cf);
+    int32_t lines = lv_area_get_height(area);
+
+    if(lines <= 0 || bpp == 0U || stride == 0U) {
+        return;
+    }
+
+    /* As area coordinates, x1, x2 and y1 are always expected to be values > 0 */
+    LV_ASSERT(area->x1 >= 0);
+    LV_ASSERT(area->x2 >= 0);
+    LV_ASSERT(area->y1 >= 0);
+    LV_ASSERT(area->x2 >= area->x1);
+
+    uint64_t start_bit = (uint64_t)(uint32_t)area->x1 * (uint64_t)bpp;
+    uint64_t end_bit = (uint64_t)((uint32_t)area->x2 + 1U) * (uint64_t)bpp;
+    uint32_t start_byte = (uint32_t)(start_bit >> 3);
+    uint32_t end_byte = (uint32_t)((end_bit + 7U) >> 3);
+    int32_t bytes_to_flush_per_line = (int32_t)(end_byte - start_byte);
+    uint8_t * address = draw_buf->data + start_byte + (stride * (uint32_t)area->y1);
+    int32_t i = 0;
+
+    if(bytes_to_flush_per_line <= 0) {
+        return;
+    }
+
+    for(i = 0; i < lines; i++) {
+        if(SCB->CCR & SCB_CCR_DC_Msk) {
+            if(flush) {
+                SCB_CleanDCache_by_Addr(address, bytes_to_flush_per_line);
+            }
+            else {
+                SCB_InvalidateDCache_by_Addr(address, bytes_to_flush_per_line);
+            }
+        }
+        address += stride;
     }
 }
 
-void lv_draw_dma2d_clean_cache(const lv_draw_dma2d_cache_area_t * mem_area)
+static void invalidate_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area)
 {
-    if(SCB->CCR & SCB_CCR_DC_Msk) {
-        SCB_CleanDCache_by_Addr((uint32_t *)mem_area->first_byte,
-                                mem_area->stride * mem_area->height);
-    }
+    __invalidate_flush_cache(draw_buf, area, false);
+}
+
+static void flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area)
+{
+    __invalidate_flush_cache(draw_buf, area, true);
 }
 #endif
 
 /**********************
  *   STATIC FUNCTIONS
  **********************/
+#if defined(__ZEPHYR__) && LV_USE_DRAW_DMA2D_INTERRUPT
+static void zephyr_dma2d_irq_handler(void *)
+{
+    /* Clear Transfer Complete flag */
+    DMA2D->IFCR = DMA2D_IFCR_CTCIF;
+
+    lv_draw_dma2d_transfer_complete_interrupt_handler();
+}
+#endif
 
 static int32_t evaluate_cb(lv_draw_unit_t * draw_unit, lv_draw_task_t * task)
 {
@@ -291,8 +413,8 @@ static int32_t evaluate_cb(lv_draw_unit_t * draw_unit, lv_draw_task_t * task)
                      && dsc->recolor_opa <= LV_OPA_MIN
                      && dsc->skew_y == 0
                      && dsc->skew_x == 0
-                     && dsc->scale_x == 256
-                     && dsc->scale_y == 256
+                     && dsc->scale_x == LV_SCALE_NONE
+                     && dsc->scale_y == LV_SCALE_NONE
                      && dsc->rotation == 0
                      && lv_image_src_get_type(dsc->src) == LV_IMAGE_SRC_VARIABLE
 #if OWF_TUYA_DMA2D_BACKEND
@@ -333,15 +455,8 @@ static int32_t dispatch_cb(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
     lv_draw_dma2d_unit_t * draw_dma2d_unit = (lv_draw_dma2d_unit_t *) draw_unit;
 
     if(draw_dma2d_unit->task_act) {
-#if LV_DRAW_DMA2D_ASYNC
         /*Return immediately if it's busy with draw task*/
         return LV_DRAW_UNIT_IDLE;
-#else
-        if(!check_transfer_completion()) {
-            return LV_DRAW_UNIT_IDLE;
-        }
-        post_transfer_tasks(draw_dma2d_unit);
-#endif
     }
 
     lv_draw_task_t * t = lv_draw_get_available_task(layer, NULL, DRAW_UNIT_ID_DMA2D);
@@ -351,6 +466,7 @@ static int32_t dispatch_cb(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
 
     void * buf = lv_draw_layer_alloc_buf(layer);
     if(buf == NULL) {
+        t->state = LV_DRAW_TASK_STATE_FAILED;
         return LV_DRAW_UNIT_IDLE;
     }
 
@@ -358,52 +474,56 @@ static int32_t dispatch_cb(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
     t->draw_unit = draw_unit;
     draw_dma2d_unit->task_act = t;
 
+    /* Abort rapidly if nothing to do */
+    lv_area_t clipped_coords;
+    if(!lv_area_intersect(&clipped_coords, &t->area, &t->clip_area)) {
+        draw_dma2d_unit->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
+        draw_dma2d_unit->task_act = NULL;
+
+        lv_draw_dispatch_request();
+        return 1;
+    }
+
+    int32_t x = 0 - t->target_layer->buf_area.x1;
+    int32_t y = 0 - t->target_layer->buf_area.y1;
+
+    draw_dma2d_unit->last_clipped_area = clipped_coords;
+    lv_area_move(&draw_dma2d_unit->last_clipped_area, x, y);
+
+    /* Flush cache before drawing. This is a no-op when DMA2D_CACHE is disabled */
+    lv_draw_buf_flush_cache(layer->draw_buf, &draw_dma2d_unit->last_clipped_area);
+
     if(t->type == LV_DRAW_TASK_TYPE_FILL) {
         lv_draw_fill_dsc_t * dsc = t->draw_dsc;
-        const lv_area_t * coords = &t->area;
-        lv_area_t clipped_coords;
-        if(!lv_area_intersect(&clipped_coords, coords, &t->clip_area)) {
-            return LV_DRAW_UNIT_IDLE;
-        }
 
-        void * dest = lv_draw_layer_go_to_xy(layer,
-                                             clipped_coords.x1 - layer->buf_area.x1,
-                                             clipped_coords.y1 - layer->buf_area.y1);
+        void * dest = lv_draw_layer_go_to_xy(layer, draw_dma2d_unit->last_clipped_area.x1,
+                                             draw_dma2d_unit->last_clipped_area.y1);
 
-        if(dsc->opa >= LV_OPA_MAX) {
-            lv_draw_dma2d_opaque_fill(t,
-                                      dest,
-                                      lv_area_get_width(&clipped_coords),
-                                      lv_area_get_height(&clipped_coords),
-                                      lv_draw_buf_width_to_stride(lv_area_get_width(&layer->buf_area), dsc->base.layer->color_format));
-        }
-        else {
-            lv_draw_dma2d_fill(t,
-                               dest,
-                               lv_area_get_width(&clipped_coords),
-                               lv_area_get_height(&clipped_coords),
-                               lv_draw_buf_width_to_stride(lv_area_get_width(&layer->buf_area), dsc->base.layer->color_format));
-        }
+        lv_draw_dma2d_fill(t, dest,
+                           lv_area_get_width(&clipped_coords),
+                           lv_area_get_height(&clipped_coords),
+                           lv_draw_buf_width_to_stride(lv_area_get_width(&layer->buf_area),
+                                                       dsc->base.layer->color_format));
     }
     else if(t->type == LV_DRAW_TASK_TYPE_IMAGE) {
-        lv_draw_image_dsc_t * dsc = t->draw_dsc;
-        const lv_area_t * coords = &t->area;
-        lv_area_t clipped_coords;
-        if(!lv_area_intersect(&clipped_coords, coords, &t->clip_area)) {
-            return LV_DRAW_UNIT_IDLE;
-        }
-
-        if(dsc->opa >= LV_OPA_MAX) {
-            lv_draw_dma2d_opaque_image(t, dsc, &t->area);
-        }
-        else {
-            lv_draw_dma2d_image(t, dsc, &t->area);
-        }
+        lv_draw_dma2d_image(t, t->draw_dsc, &t->area);
     }
+
+#if LV_DRAW_DMA2D_ASYNC
+    return LV_DRAW_UNIT_IDLE;
+#else
+#if OWF_TUYA_DMA2D_BACKEND
+    while(owf_dma2d_backend_busy());   /* OWF LOCAL PATCH: 9.6.0 polls the STM32 register inline here */
+#else
+    while(DMA2D->CR & DMA2D_CR_START);
+#endif
+
+    post_transfer_tasks(draw_dma2d_unit);
 
     lv_draw_dispatch_request();
 
     return 1;
+#endif
 }
 
 static int32_t delete_cb(lv_draw_unit_t * draw_unit)
@@ -416,6 +536,9 @@ static int32_t wait_finish_cb(lv_draw_unit_t * draw_unit)
 {
     lv_draw_dma2d_unit_t * u = (lv_draw_dma2d_unit_t *) draw_unit;
 
+    /* No need to wait if the DMA2D doesn't have task to complete */
+    if(u->task_act == NULL) return 0;
+
     /* If a DMA2D task has been dispatched, wait its interrupt */
     lv_thread_sync_wait(&u->interrupt_signal);
 
@@ -425,22 +548,11 @@ static int32_t wait_finish_cb(lv_draw_unit_t * draw_unit)
 }
 #endif /*LV_DRAW_DMA2D_ASYNC*/
 
-#if !LV_DRAW_DMA2D_ASYNC
-static bool check_transfer_completion(void)
-{
-#if OWF_TUYA_DMA2D_BACKEND
-    return !owf_dma2d_backend_busy();
-#else
-    return !(DMA2D->CR & DMA2D_CR_START);
-#endif
-}
-#endif
-
 static void post_transfer_tasks(lv_draw_dma2d_unit_t * u)
 {
-#if LV_DRAW_DMA2D_CACHE
-    lv_draw_dma2d_invalidate_cache(&u->writing_area);
-#endif
+    /* Invalidate cache after drawing. This is a no-op when DMA2D_CACHE is disabled */
+    lv_draw_buf_invalidate_cache(u->task_act->target_layer->draw_buf, &u->last_clipped_area);
+
     u->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
     u->task_act = NULL;
 }

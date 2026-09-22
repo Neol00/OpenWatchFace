@@ -3,6 +3,6 @@
 // each library.properties. Regenerate after bumping a library:
 //     python tools/gen_lib_versions.py
 #pragma once
-#define LIBVER_GFX        "1.6.5"
+#define LIBVER_GFX        "1.6.8"
 #define LIBVER_SENSORLIB  "0.4.1"
 #define LIBVER_DRIVEBUS   "1.0.1"

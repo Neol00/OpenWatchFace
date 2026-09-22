@@ -10,17 +10,15 @@
 #include "../lv_draw_private.h"
 #if LV_USE_DRAW_SW
 
-#include "../../core/lv_refr.h"
 #include "../../display/lv_display_private.h"
-#include "../../stdlib/lv_string.h"
 #include "../../core/lv_global.h"
 #include "../../misc/lv_area_private.h"
 
-#if LV_USE_VECTOR_GRAPHIC && LV_USE_THORVG
-    #if LV_USE_THORVG_EXTERNAL
-        #include <thorvg_capi.h>
-    #else
+#if LV_USE_THORVG
+    #if LV_USE_THORVG_INTERNAL
         #include "../../libs/thorvg/thorvg_capi.h"
+    #else
+        #include <thorvg_capi.h>
     #endif
 #endif
 
@@ -54,6 +52,7 @@ extern lv_mutex_t lv_draw_watch_task_mutex;
  **********************/
 #if LV_USE_OS
     static void render_thread_cb(void * ptr);
+    static int32_t wait_for_finish(lv_draw_unit_t * draw_unit);
 #endif
 
 static void execute_drawing(lv_draw_task_t * t);
@@ -88,9 +87,23 @@ void lv_draw_sw_init(void)
     lv_draw_sw_unit_t * draw_sw_unit = lv_draw_create_unit(sizeof(lv_draw_sw_unit_t));
     draw_sw_unit->base_unit.dispatch_cb = dispatch;
     draw_sw_unit->base_unit.evaluate_cb = evaluate;
+#if LV_USE_OS != LV_OS_NONE
+    draw_sw_unit->base_unit.wait_for_finish_cb = wait_for_finish;
+#endif /*LV_USE_OS*/
     draw_sw_unit->base_unit.delete_cb = LV_USE_OS ? lv_draw_sw_delete : NULL;
-#if LV_USE_DRAW_ARM2D_SYNC
+
+#if LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_NEON
+    draw_sw_unit->base_unit.name = "SW_NEON";
+#elif LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_HELIUM && LV_USE_DRAW_ARM2D_SYNC
     draw_sw_unit->base_unit.name = "SW_ARM2D";
+#elif LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_HELIUM
+    draw_sw_unit->base_unit.name = "SW_HELIUM";
+#elif LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_RISCV_V
+    draw_sw_unit->base_unit.name = "SW_RISCV_V";
+#elif LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_SVE2
+    draw_sw_unit->base_unit.name = "SW_SVE2";
+#elif LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_CUSTOM
+    draw_sw_unit->base_unit.name = "SW_CUSTOM";
 #else
     draw_sw_unit->base_unit.name = "SW";
 #endif
@@ -101,6 +114,8 @@ void lv_draw_sw_init(void)
         lv_draw_sw_thread_dsc_t * thread_dsc = &draw_sw_unit->thread_dscs[i];
         thread_dsc->idx = i;
         thread_dsc->draw_unit = (void *) draw_sw_unit;
+        lv_thread_sync_init(&thread_dsc->new_task_sync);
+        lv_thread_sync_init(&thread_dsc->task_done_sync);
         lv_thread_init(&thread_dsc->thread, "swdraw", LV_DRAW_THREAD_PRIO, render_thread_cb,
                        LV_DRAW_THREAD_STACK_SIZE, thread_dsc);
     }
@@ -141,10 +156,10 @@ static int32_t lv_draw_sw_delete(lv_draw_unit_t * draw_unit)
         LV_LOG_INFO("cancel software rendering thread");
         thread_dsc->exit_status = true;
 
-        if(thread_dsc->inited) {
-            lv_thread_sync_signal(&thread_dsc->sync);
-        }
+        lv_thread_sync_signal(&thread_dsc->new_task_sync);
         lv_thread_delete(&thread_dsc->thread);
+        lv_thread_sync_delete(&thread_dsc->new_task_sync);
+        lv_thread_sync_delete(&thread_dsc->task_done_sync);
     }
 
     return 0;
@@ -302,7 +317,10 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
         /*Allocate a buffer if not done yet.*/
         void * buf = lv_draw_layer_alloc_buf(layer);
         /*Do not return is failed. The other thread might already have a buffer can do something. */
-        if(buf == NULL) continue;
+        if(buf == NULL) {
+            t->state = LV_DRAW_TASK_STATE_FAILED;
+            continue;
+        }
 
         /*Take the task*/
         all_idle = false;
@@ -311,7 +329,7 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
         thread_dsc->task_act = t;
 
         /*Let the render thread work*/
-        if(thread_dsc->inited) lv_thread_sync_signal(&thread_dsc->sync);
+        lv_thread_sync_signal(&thread_dsc->new_task_sync);
     }
 
     lv_mutex_unlock(&lv_draw_watch_task_mutex);
@@ -335,6 +353,7 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
 
     void * buf = lv_draw_layer_alloc_buf(layer);
     if(buf == NULL) {
+        t->state = LV_DRAW_TASK_STATE_FAILED;
         LV_PROFILER_DRAW_END;
         return LV_DRAW_UNIT_IDLE;  /*Couldn't start rendering*/
     }
@@ -360,15 +379,12 @@ static void render_thread_cb(void * ptr)
 {
     lv_draw_sw_thread_dsc_t * thread_dsc = ptr;
 
-    lv_thread_sync_init(&thread_dsc->sync);
-    thread_dsc->inited = true;
-
     while(1) {
         while(thread_dsc->task_act == NULL) {
             if(thread_dsc->exit_status) {
                 break;
             }
-            lv_thread_sync_wait(&thread_dsc->sync);
+            lv_thread_sync_wait(&thread_dsc->new_task_sync);
         }
 
         if(thread_dsc->exit_status) {
@@ -376,7 +392,7 @@ static void render_thread_cb(void * ptr)
             break;
         }
 
-        execute_drawing(thread_dsc->task_act);
+        execute_drawing((lv_draw_task_t *)thread_dsc->task_act);
 #if LV_USE_PARALLEL_DRAW_DEBUG
         parallel_debug_draw(thread_dsc->task_act, thread_dsc->idx);
 #endif
@@ -418,17 +434,22 @@ static void render_thread_cb(void * ptr)
                     uint32_t s;
                     for(s = 0; s < LV_DRAW_SW_DRAW_UNIT_CNT; s++) {
                         lv_draw_sw_thread_dsc_t * sib = &u_self->thread_dscs[s];
-                        if(sib == thread_dsc || sib->task_act != NULL || !sib->inited || sib->exit_status) continue;
+                        if(sib == thread_dsc || sib->task_act != NULL || sib->exit_status) continue;
                         lv_draw_task_t * t_sib = lv_draw_get_next_available_task(task_layer, NULL, DRAW_UNIT_ID_SW);
                         if(t_sib == NULL) break;
                         t_sib->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
                         sib->task_act = t_sib;
-                        lv_thread_sync_signal(&sib->sync);
+                        lv_thread_sync_signal(&sib->new_task_sync);
                     }
                 }
             }
             lv_mutex_unlock(&lv_draw_watch_task_mutex);
         }
+
+
+        /*9.6.0: wait_for_finish() sleeps on this; it re-checks task_act, so signalling while we
+         *already hold the next (self-dispatched) task only costs it one extra loop.*/
+        lv_thread_sync_signal(&thread_dsc->task_done_sync);
 
         /*Wake the refr thread for cleanup of finished tasks, layer blending
          *and refresh progression (and dispatching if we found nothing).*/
@@ -436,9 +457,20 @@ static void render_thread_cb(void * ptr)
 
     }
 
-    thread_dsc->inited = false;
-    lv_thread_sync_delete(&thread_dsc->sync);
     LV_LOG_INFO("exit software rendering thread");
+}
+
+static int32_t wait_for_finish(lv_draw_unit_t * draw_unit)
+{
+    lv_draw_sw_unit_t * draw_sw_unit = (lv_draw_sw_unit_t *) draw_unit;
+
+    for(uint32_t i = 0; i < LV_DRAW_SW_DRAW_UNIT_CNT; i++) {
+        lv_draw_sw_thread_dsc_t * thread_dsc = &draw_sw_unit->thread_dscs[i];
+        while(thread_dsc->task_act) {
+            lv_thread_sync_wait(&thread_dsc->task_done_sync);
+        }
+    }
+    return 0;
 }
 #endif
 

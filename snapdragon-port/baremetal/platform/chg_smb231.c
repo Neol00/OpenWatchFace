@@ -518,12 +518,89 @@ int smb231_ready(void)
      * soc unavailable rc 1") marked charger + gauge absent for the whole run. Retry up to 8 times,
      * 3 s apart, and log every attempt. */
     static uint32_t s_tries, s_next_ms;
-    if (s_state == 0 || (s_state == -1 && s_tries < 8u && (int32_t)(timer_ms() - s_next_ms) >= 0)) {
-        s_tries++; s_next_ms = timer_ms() + 3000u;
+    /* 2026-09-22: eight tries was still a limit -- "sleep-gauge: soc unavailable (entry rc 1 exit
+     * rc 1)" after a 43 min sleep means the probe had given up for the boot. It never gives up
+     * now: 3 s apart for the first 8, then once a minute. */
+    if (s_state == 0 || (s_state == -1 && (int32_t)(timer_ms() - s_next_ms) >= 0)) {
+        s_tries++; s_next_ms = timer_ms() + (s_tries < 8u ? 3000u : 60000u);
         if (s_tries > 1u) { con_puts("smb231: probe retry "); con_putdec(s_tries); con_puts("\n"); }
         smb231_probe();
     }
     return s_state == 1;
+}
+
+/* READ-ONLY register dump (2026-09-22). User, measured on the gauge: plugging the cable in
+ * charges at ~100 mA; rebooting ON the cable gives ~350 mA (LK programs the part); unplug and
+ * replug and it is 100 mA again. So LK writes something the part drops with its input, and
+ * nothing here puts it back. Two dumps -- one after a boot on the cable, one after a replug --
+ * and the difference is what to write. Nothing is written until that diff exists. */
+static void smb231_regdump(const char *why)
+{
+    static const uint8_t k_r[] = { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x30,0x31,0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F };
+    con_puts("smb231-dump["); con_puts(why); con_puts("]:");
+    /* two hex digits each: con_puthex prints 0x%08x and the console cut the line at ~200 chars */
+    for (unsigned i = 0; i < sizeof k_r; i++) {
+        static const char k_h[] = "0123456789abcdef";
+        uint8_t v = 0; char t[8]; unsigned p = 0;
+        t[p++] = ' '; t[p++] = k_h[k_r[i] >> 4]; t[p++] = k_h[k_r[i] & 15u]; t[p++] = '=';
+        if (rd8(SMB231_ADDR, k_r[i], &v) < 0) { t[p++] = '?'; t[p++] = '?'; }
+        else { t[p++] = k_h[v >> 4]; t[p++] = k_h[v & 15u]; }
+        t[p] = 0; con_puts(t);
+    }
+    con_puts("\n"); con_flush();
+}
+
+/* REPLUG FIX (2026-09-22). Measured by the user on the gauge: a boot on the cable charges at
+ * ~350 mA (LK programmed the part), any later plug-in at ~100 mA until the next reboot. The
+ * part reloads its defaults when the input goes away and nothing here put LK's setup back.
+ * The values below are NOT derived from a datasheet: they are the config block read out of
+ * the part in the working 350 mA state (smb231-dump[boot, cable in], this watch). On every
+ * plug-in each register that no longer matches is written back, then CHARGE_EN and the JEITA
+ * float/current are re-applied as at probe. cfg2/cfg3 are left to smb231_apply_jeita().
+ * cfg7 0x08 is LK's value too; the v484 breakage was clearing its pin-control bits WITHOUT
+ * writing CHARGE_EN, and smb231_apply_input_cfg() writes CHARGE_EN right after this. */
+static int smb231_restore_after_plug(void)
+{
+    int changed = 0;
+    static const uint8_t k_good[][2] = {
+        { 0x00, 0x54 }, { 0x01, 0x70 }, { 0x04, 0x10 }, { 0x05, 0x07 },
+        { 0x06, 0x0b }, { 0x08, 0x44 }, { 0x07, 0x08 },
+    };
+    con_puts("smb231: plug-in restore, changed:");
+    for (unsigned i = 0; i < sizeof k_good / sizeof k_good[0]; i++) {
+        uint8_t cur = 0;
+        if (rd8(SMB231_ADDR, k_good[i][0], &cur) < 0 || cur == k_good[i][1]) continue;
+        con_puts(" r"); con_putdec(k_good[i][0]); con_puts(":"); con_puthex(cur);
+        changed++;
+        (void)smb_cfg_write(k_good[i][0], 0xFFu, k_good[i][1]);
+    }
+    con_puts("\n");
+    smb231_apply_input_cfg();
+    s_jeita_zone = 0xFF;
+    smb231_apply_jeita(1);
+    return changed;
+}
+
+/* -DSLEEP_STC_OFF test (2026-09-22, user): put the STC3117 in STANDBY for the sleep (MODE with
+ * GG_RUN clear: the datasheet's ~2 uA state, no conversions) and judge the sleep by the cell
+ * voltage instead. At wake smb231_soc_x512() sees GG_RUN clear and restarts the engine, so the
+ * sleep-gauge line prints "unavailable ... 3 GG_RUN was clear" -- expected in this build. */
+void smb231_gauge_standby(void)
+{
+    if (s_state != 1 || !s_stc_ok) return;
+    uint8_t m[2] = { STC_REG_MODE, 0x00u };
+    int rc = qup4_xfer(STC3117_ADDR, m, 2u, 0, 0u);
+    uint8_t rb = 0xFF; (void)rd8(STC3117_ADDR, STC_REG_MODE, &rb);
+    con_puts("stc3117: STANDBY for the sleep, rc "); con_putdec((uint32_t)(rc < 0 ? -rc : rc)); con_puts(" mode="); con_puthex(rb); con_puts("\n");
+}
+
+/* Cell voltage from the STC3117 (2.2 mV/LSB), converted every ~4 s while the engine runs. The
+ * PM8916 BMS sample fg_batt_mv() returns did not refresh within 4 s of a wake. */
+int smb231_stc_mv(void)
+{
+    uint16_t mv = 0;
+    if (s_state != 1 || !s_stc_ok || rd16(STC3117_ADDR, STC_REG_VOLTAGE, &mv) < 0) return -1;
+    return (int)(((uint32_t)mv * 22u) / 10u);
 }
 
 /* 1 = VBUS on the pads, 0 = not, -1 = no charger / read failed. */
@@ -532,7 +609,30 @@ int smb231_usb_present(void)
     uint8_t a = 0;
     if (!smb231_ready()) return -1;
     if (rd8(SMB231_ADDR, SMB_STATUS_A, &a) < 0) return -1;
-    return (a & (USBIN_OV_BIT | USBIN_UV_BIT)) ? 0 : 1;
+    { int now = (a & (USBIN_OV_BIT | USBIN_UV_BIT)) ? 0 : 1;
+      static int s_last = -1;
+      /* The replug itself drops the USB console and the line was lost with it, so the dump
+       * repeats 15 s, 30 s and 60 s after the plug, when the console is open again. */
+      static uint32_t s_plug_ms; static uint8_t s_again;
+      /* WHEN (2026-09-22, second attempt): restoring at plug-in left it at 100 mA. The part
+       * reloads its defaults at UNPLUG (NV_CFG UNPLUG_RELOAD) -- 05=ba: AICL_EN clear, vs 07
+       * in the 350 mA state -- and stock's reconfig_upon_unplug() re-runs hw_init right then,
+       * so the setup is already in place when the next insertion runs APSD/AICL. Same here:
+       * restore on the unplug edge and on the first poll of a boot. If the cable is already
+       * in when registers had to change, the input is suspended for a moment so the part
+       * qualifies the input again with AICL enabled. */
+      if (now != s_last) {
+          int changed = smb231_restore_after_plug();
+          if (changed && now == 1) { smb231_charger_suspend(1); timer_delay_ms(100u); smb231_charger_suspend(0); }
+      }
+      if (now == 1 && s_last != 1) { smb231_regdump(s_last < 0 ? "boot, cable in" : "cable plugged"); s_plug_ms = timer_ms(); s_again = (s_last < 0) ? 0u : 3u; }
+      if (now == 1 && s_again) {
+          static const uint32_t k_at[3] = { 60000u, 30000u, 15000u };
+          if ((uint32_t)(timer_ms() - s_plug_ms) >= k_at[s_again - 1u]) { smb231_regdump("after replug, repeat"); s_again--; }
+      }
+      if (!now) s_again = 0u;
+      s_last = now;
+      return now; }
 }
 
 /* 1 = the charger is pushing current (pre/fast/taper), 0 = not, -1 = unknown. */

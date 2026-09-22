@@ -118,7 +118,7 @@ Two commands, and the second one's DTB argument is **not** optional:
 cd snapdragon-port/baremetal
 
 # 1. compile + link
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES" sh build-owf-image-gen4.sh
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES -DSLEEP_RAILS_OFF=0x1B40" sh build-owf-image-gen4.sh
 
 # 2. pack into an Android boot image, WITH the stock DTB appended
 sh tools/mk-bootimg.sh build/gen4-owf/owf.bin ../dtbs/firefish-stock.dtb
@@ -375,7 +375,7 @@ failures always print.
 ### Recommended (what the release images are built with)
 
 ```
-CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES"
+CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_SAW_AP_ENABLE -DSYS_PC_XO_SHUTDOWN -DMSS_BOOT -DMSS_PROXY_VOTES -DSLEEP_RAILS_OFF=0x1B40"
 ```
 
 | Flag | What it does |
@@ -388,6 +388,7 @@ CFLAGS_EXTRA="-DWDOG_TRACE -DSLEEP_NO_WDOG -DSYS_PC_8909 -DSYS_PC_STAGE=6 -DL2_S
 | `-DSYS_PC_XO_SHUTDOWN` | Drops the crystal vote from the sleep set so the RPM can enter XO shutdown / Vdd-min. Measured on the C2: 37 mA without it, **about 6 mA** with it. |
 | `-DMSS_BOOT` | Loads and authenticates the modem image from the `modem` partition behind the loading screen, and runs the host services it needs (rmtfs, RFSA, memshare, sensor registry). The modem loads before WiFi and the rest of the app. |
 | `-DMSS_PROXY_VOTES` | Holds the modem's CX/MX and bus votes through the RPM during the load and releases them afterwards. Without the release the RPM keeps those rails and bus clocks up through every collapse, which costs ~15 mA asleep. |
+| `-DSLEEP_RAILS_OFF=0x1B40` | Switches PMIC rails `l6`, `l8`, `l9`, `l11` and `l12` off for every deep sleep and back on first thing at wake (tested on the Gen 4, 2026-09-22). See [Switching individual rails off](#switching-individual-rails-off--dsleep_rails_off). |
 
 **`MSS_OPEN_MASK` is not passed on this watch** — `boards/fossil_gen4.h`
 defaults it to `0x6D` and you should leave it alone. It selects which SMD
@@ -453,8 +454,32 @@ measuring the sleep floor.
 | `-DPC_TRACE` | One flash write per power-collapse breadcrumb during the first attempts of a boot. Bring-up only. |
 | `-DUSB_LOG_V2` / `-DUSB_IRQ_WAKE` | The reworked USB console (tail-first replay, host commands) and USB-as-wake-source. Both broke the live log when tried; off. |
 | `-DSLEEP_FLOOR_STEP_MS=<ms>` | How long each `-DSLEEP_FLOOR` step is held and measured. Default `6000`. |
-| `-DSLEEP_RAILS_OFF=<mask>` | PMIC rails switched off for each deep sleep and back on at wake (bit N = `lN`, bit 24+N = `sN`). **Default `0` on the Gen 4: untested here.** The mask and rail table are the C2's ([details](ticwatch-c2.md#switching-individual-rails-off--dsleep_rails_off)); do **not** include bit 6 (`l6`), because the panel re-init that makes it safe on the C2 only exists for the C2's panel. |
+| `-DSLEEP_RAILS_OFF=<mask>` | PMIC rails switched off for each deep sleep and back on at wake (bit N = `lN`, bit 24+N = `sN`). The recommended line passes `0x1B40`; the board header's own default is still `0` (every rail on). See below. |
 | `-DNO_AUTO_REBOOT` | Disarms the APPS watchdog completely (only when `-DWDOG_TRACE` is **not** passed). For bench sessions where nothing should reset the watch; a hang then needs a forced power-off. |
+
+#### Switching individual rails off: `-DSLEEP_RAILS_OFF`
+
+The recommended mask `0x1B40` cuts these rails for every deep sleep (all tested on a
+Gen 4 on 2026-09-22: the watch wakes normally, the display, touch, storage and the
+step counter all come back):
+
+| Rail | Bit | Mask | What it feeds on the Gen 4 (firefish DT) | What the wake path does |
+|---|---|---|---|---|
+| `l6`  | 6  | `0x40`   | Panel controller I/O (`vddio`) **and the LSM6DS3 IMU** | Panel reset pulse + the AUO h139 on-command table. **Kept on while the pedometer or a sleep session is running**, so steps keep counting through the sleep; cut otherwise. |
+| `l8`  | 8  | `0x100`  | eMMC supply (2.85 V) | The card is sent to sleep before the cut and fully re-initialised at wake (`emmc: FULL re-init OK`). The log file catches up from the RAM ring. |
+| `l9`  | 9  | `0x200`  | WiFi power amplifier | Nothing needed; stock has it off with WiFi off. |
+| `l11` | 11 | `0x800`  | Debug trace blocks + a disabled SD slot | Nothing needed. |
+| `l12` | 12 | `0x1000` | Same blocks, I/O side | Nothing needed. |
+
+Before the cut the panel reset line is driven low, so no current leaks into the unpowered
+panel through its reset pin (with it held high the sleep drew **more** than without any cuts).
+Rails not in the mask: `l18` (panel supply, also the crown sensor: not tried), `l14`/`l16`
+(crown sensor, touch I2C), `l15` (NFC chip). The restore voltage of every cut rail is read
+from the PMIC at sleep entry, so the C2's table values are never applied to this watch.
+`-DSLEEP_RAILS_OFF=0` keeps every rail on.
+
+The remaining sleep draw with this mask is low single-digit mA (one 2 h sleep from a settled
+4.05 V showed no visible drop on the display); a longer measured run is still to be done.
 
 ### Tunables
 

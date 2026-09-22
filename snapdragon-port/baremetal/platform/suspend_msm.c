@@ -66,7 +66,9 @@
  * the watch. */
 static int collapse_blocked(void)
 {
-#if defined(MSS_BOOT)
+#if defined(MSS_BOOT) && (defined(PLAT_BOARD_FOSSIL_GEN5) || defined(COLLAPSE_BLOCK_MODEM_UP))
+    /* Gen 5 only: that is where the runaway was seen. On the C2 this guard turned every
+     * sleep into WFI (residency 0%, pc_ok=0) the moment -DMSS_BOOT joined the release flags. */
     extern int mss_ready(void);
     static int said;
     if (mss_ready()) {
@@ -109,11 +111,17 @@ static int collapse_blocked(void)
 void owf_radio_sleep_hook(int entering) __attribute__((weak));
 int wlan_down(void); int wlan_power_off(void); int wlan_up(void); int wlan_is_up(void);
 static int s_radio_was_up;
+int g_sleep_keep_l8;           /* sleep_floor.c: the card refused CMD5 sleep, leave its VCC on */
 static void s3_check(const char *where)
 {
     uint8_t en = 0xFF; int rc = spmi_read8(1u, 0x1A46u, &en);
     con_puts("s3-check["); con_puts(where); con_puts("]: EN_CTL=");
     if (rc < 0) con_puts("read-failed"); else { con_puthex(en); con_puts(en & 0x80u ? " (ON)" : " (off)"); }
+    /* PMIC XO buffers (sid 0). Stock C2+, WiFi off: bb1 81, bb2/rf1/rf2 00, l9 00. */
+    { static const uint16_t k_a[4] = { 0x5146u, 0x5246u, 0x5446u, 0x5546u };
+      con_puts(" l9="); en = 0xFF; (void)spmi_read8(1u, 0x4846u, &en); con_puthex(en);
+      con_puts(" bb1/bb2/rf1/rf2=");
+      for (unsigned i = 0; i < 4u; i++) { en = 0xFF; (void)spmi_read8(0u, k_a[i], &en); con_puthex(en); if (i < 3u) con_puts("/"); } }
     con_puts("\n");
 }
 #endif
@@ -462,8 +470,16 @@ void plat_suspend(void)
     /* Order matters: everything that still needs a bus goes first, then the
      * buses, then the cluster clock. Wake undoes it in reverse. */
     logfile_flush();                                  /* last eMMC write before its clocks stop */
+#if !defined(PLAT_CHG_SMB231)
+    int batt_mv0 = fg_batt_mv(); uint32_t batt_t0 = timer_ms();   /* no coulomb gauge here: voltage either side */
+#endif
 #if defined(PLAT_CHG_SMB231)
     int soc0 = smb231_soc_x512(); uint32_t soc_t0 = timer_ms();
+    extern int smb231_stc_mv(void);
+    int gauge_mv0 = smb231_stc_mv();
+#if defined(SLEEP_STC_OFF)
+    { extern void smb231_gauge_standby(void); smb231_gauge_standby(); }
+#endif                     /* printed next to the SOC figure: the SOC alone misleads near full */
     /* THE AWAKE WINDOW, which nothing measured until now (2026-09-13).
      *
      * sleep-gauge reports the SLEEP. The periodic notification wake is the
@@ -506,6 +522,11 @@ void plat_suspend(void)
      * watch in the system collapse (PON: PS_HOLD, only with the USB log attached). */
     int usb_cable = usb_is_configured();
     gcc_blsp_sleep(1);                                /* QUP cores: touch, charger, sensors */
+#if defined(SLEEP_RAILS_OFF) && ((SLEEP_RAILS_OFF) & (1u << 8)) && !defined(SLEEP_FLOOR)
+    /* l8 (eMMC VCC) is in the mask: card to SLEEP first; if it refuses, l8 is kept this time. */
+    logfile_flush();
+    g_sleep_keep_l8 = (emmc_sleep_enter() < 0);
+#endif
     gcc_sdcc1_sleep(1);                               /* eMMC */
     gcc_mdss_sleep(1);                                /* MDP + DSI link clocks */
     if (usb_cable) { usb_poll(); usb_irq_arm(1); }   /* cable: USB completions wake the core (USB_IRQ_WAKE builds) */
@@ -527,6 +548,24 @@ void plat_suspend(void)
     sleep_floor_enter(floor_cable);
 #endif
 #if !defined(SLEEP_FLOOR) && defined(SLEEP_RAILS_OFF) && (SLEEP_RAILS_OFF)
+    /* RESET LINES LOW BEFORE THEIR CHIPS LOSE POWER (2026-09-22). With the rails really off
+     * inside the collapse (sleep-set cuts) the C2 drew MORE, not less: 4.29 -> 4.14 V in 2.9 h
+     * at 99 % residency and vmin for the whole sleep, ~18-20 mA against 11 mA when the sleep
+     * set was still switching the rails back on. We held the panel and touch reset lines HIGH
+     * into chips with no supply, which feeds them through their input protection. Stock with
+     * the screen off (notes/c2plus-stock-gpio.txt): gpio25 "out 0", gpio12 "out 0". The wake
+     * path pulses both lines anyway (panel_reinit_after_rail, touch_set_sleep(0)). */
+#if defined(PLAT_PANEL_RESET_GPIO)
+    if ((SLEEP_RAILS_OFF) & (1u << 6)) tlmm_out(PLAT_PANEL_RESET_GPIO, 0);
+#endif
+#if defined(PLAT_BOARD_TICWATCH_C2) && defined(PLAT_TOUCH_RESET_GPIO)
+    if ((SLEEP_RAILS_OFF) & (1u << 11)) {                                       /* l11 = touch vdd on skipjack/tunny only */
+        tlmm_out(PLAT_TOUCH_RESET_GPIO, 0);
+        /* the INT line carries the SoC's internal pull-UP into the unpowered chip; stock's
+         * pmx_ts_int_suspend state is gpio13 bias-pull-down. Restored before the wake reset. */
+        tlmm_cfg(PLAT_TOUCH_IRQ_GPIO, 0u, 1u /* pull down */, 2u, 0);
+    }
+#endif
     sleep_rails_enter();          /* the proven rails only, no ladder */
 #endif
 #if defined(SLEEP_QUIESCE)
@@ -583,7 +622,16 @@ void plat_suspend(void)
         if (!cpu_pc8909_ready() && parks == 0u) con_puts("cpu-pc: not ready (init failed at the 20 s one-shot) - WFI suspend\n");
         if (cpu_pc8909_ready() && !collapse_blocked() && (g_cpu_pc_attempts == 0u || g_cpu_pc_ok)) {
             uint32_t pc_t0 = timer_ms();
-            if (parks == 0u) s3_check("before first collapse");
+            if (parks == 0u) {
+                /* rf_clk1/rf_clk2 read 0x80 at sleep exit with the radio off (stock: 00/00).
+                 * Drop the AP's votes whatever the driver state; if they still read ON it
+                 * is another master's vote. */
+                static const uint32_t k_off[3] = { 0x6e657773u /* "swen" */, 4u, 0u };
+                (void)rpm_smd_request(0u, 0x616B6C63u /* "clka" */, 4u, k_off, sizeof k_off);
+                (void)rpm_smd_request(0u, 0x616B6C63u, 5u, k_off, sizeof k_off);
+                timer_delay_ms(5u);
+                s3_check("before first collapse");
+            }
             did_pc = cpu_pc8909_sleep(park);
             if (parks == 0u) s3_check("after first collapse");
             if (did_pc) { pc_ms += timer_ms() - pc_t0; pc_n++; } else pc_fail++;
@@ -813,6 +861,12 @@ housekeeping:
 #endif
 #if !defined(SLEEP_FLOOR) && defined(SLEEP_RAILS_OFF) && (SLEEP_RAILS_OFF)
     sleep_rails_exit();           /* FIRST: l6 must be up before the panel re-init */
+    /* Did the IMU keep its power through the sleep? Its hardware step counter is 16-bit and
+     * resets to 0 with the chip; WHO_AM_I answers only when it is powered. */
+    if (lsm6ds3_present() && lsm6ds3_running()) {
+        con_puts("imu: after sleep WHO_AM_I "); con_puts(lsm6ds3_alive() ? "ok" : "NOT ANSWERING");
+        con_puts(", steps total "); con_putdec(lsm6ds3_steps_poll()); con_puts("\n");
+    }
 #endif
 #if defined(SLEEP_QUIESCE)
     sleep_quiesce_exit();          /* PLL votes back before any branch re-enable */
@@ -821,6 +875,9 @@ housekeeping:
     if (xo_parked) cpu_clk_sleep_exit();
     gcc_mdss_sleep(0);
     gcc_sdcc1_sleep(0);
+#if defined(SLEEP_RAILS_OFF) && ((SLEEP_RAILS_OFF) & (1u << 8)) && !defined(SLEEP_FLOOR)
+    emmc_sleep_exit();            /* l8 is back (sleep_rails_exit above): cold-init the card */
+#endif
     gcc_blsp_sleep(0);
     /* after the QUP clocks are back: I2C is refused while they are gated */
 #if defined(SLEEP_BATT_DIAG) && defined(PLAT_CHG_SMB231)
@@ -833,6 +890,60 @@ housekeeping:
      * collapses (RPM sleep set applied). Bring the controller up from scratch
      * whenever a cable is present; ~300 ms, host re-enumerates. */
     if (pc_n && (usb_cable || chg_usb_present() == 1)) { con_puts("usb: re-init after the system collapse\n"); (void)usb_dev_reinit(); }
+#endif
+#if defined(SYS_PC_8909)
+    pon_crumb_write(0x40u);
+#endif
+#endif
+#if defined(SLEEP_NO_WDOG)
+    wdog_extend(30u);                /* re-arm only now that we are awake */
+#endif
+    if (s_rtc_alm_ok == 1) rtc_alarm_disarm();
+#if defined(PLAT_BOARD_TICWATCH_C2) && defined(PLAT_TOUCH_IRQ_GPIO) && defined(SLEEP_RAILS_OFF)
+    if ((SLEEP_RAILS_OFF) & (1u << 11)) tlmm_cfg(PLAT_TOUCH_IRQ_GPIO, 0u, 3u /* pull up, as tlmm_touch_setup */, 2u, 0);
+#endif
+    tlmm_irq_mask(0);
+    touch_set_sleep(0);              /* reset pulse: the only way out of hibernate */
+#endif
+    s_last_cause = (why[0] == 't') ? PLAT_WAKE_TIMER : PLAT_WAKE_BUTTON;
+#if defined(SLEEP_RAILS_OFF) && ((SLEEP_RAILS_OFF) & (1u << 6))
+    /* l6 is the DDIC's vddio: it came back at POR. sleep_floor_exit() has
+     * already re-voted the rail. v310 got away with MADCTL alone; with the
+     * modem asleep the chip comes back needing its whole init (v407: black
+     * screen), so run the stock reset + on-command first, then MADCTL. The
+     * table leaves the display OFF (no 0x29) and the chip out of sleep, which
+     * is exactly the state plat_display_on() expects. */
+#if defined(PLAT_BOARD_TICWATCH_C2)
+    if (panel_reinit_after_rail() == 0) { s_panel_off = 1; s_panel_sleeping = 0; }
+    plat_panel_madctl_restore();
+#elif defined(PLAT_BOARD_FOSSIL_GEN4)
+    /* Gen 4 (2026-09-22): same rail, same role (firefish DT: panel supply "vddio" = l6, "vdd" =
+     * l18), reset on the same TLMM 25. The AUO h139 on-table ends with 0x11 + 0x29, so the chip
+     * comes back awake; plat_display_on()'s extra 0x29 is harmless. NO MADCTL here: the stock
+     * table never writes 0x36 on this panel, and the C2's 0xC0 would turn the picture over. */
+    if (panel_reinit_after_rail() == 0) { s_panel_off = 1; s_panel_sleeping = 0; }
+#else
+    plat_panel_madctl_restore();
+#endif
+#endif
+    if (!(s_keep_dark && s_last_cause == PLAT_WAKE_TIMER)) plat_display_on();
+    /* MEASUREMENT LINES AFTER THE PANEL IS LIT (2026-09-22): the fresh-voltage wait (up to 4-5 s)
+     * sat before plat_display_on() and the watch looked dead to a button press -- the user
+     * pressed again ("needs two presses to wake"). Nothing here is needed by the wake itself. */
+#if !defined(PLAT_CHG_SMB231)
+    /* Boards without the STC3117 (Gen 4: pm8916 charger, voltage-only battery reading): the cell
+     * voltage at entry and at wake, both with the panel off. No mA is derived from it here. */
+    { uint32_t dt = timer_ms() - batt_t0;
+#if defined(SLEEP_BATT_FRESH)
+      /* test builds: hold the wake up to 4 s for a sample taken after the sleep */
+      extern int fg_batt_mv_fresh(uint32_t wait_ms, int *fresh);
+      int fresh = 0; int mv1 = fg_batt_mv_fresh(4000u, &fresh);
+#else
+      int fresh = 0; int mv1 = fg_batt_mv();
+#endif
+      con_puts("sleep-batt: "); con_putdec((uint32_t)batt_mv0); con_puts(" mV -> "); con_putdec((uint32_t)mv1);
+      con_puts(" mV over "); con_putdec(dt / 1000u); con_puts(" s");
+      con_puts(fresh ? " (fresh sample)\n" : " (exit value is the BMS's LAST sample and may predate the sleep; -DSLEEP_BATT_FRESH waits for a new one)\n"); }
 #endif
 #if defined(PLAT_CHG_SMB231)
     /* TRUE AVERAGE SLEEP CURRENT (v190): STC3117 SOC delta over the sleep.
@@ -855,35 +966,25 @@ housekeeping:
               int64_t ma100 = (int64_t)d * PLAT_BATT_MAH * 3600000LL * 100 / (512LL * 100 * dt);
               con_puts(" = avg "); if (ma100 < 0) { con_puts("-"); ma100 = -ma100; }
               con_putdec((uint32_t)(ma100 / 100)); con_puts("."); con_putdec((uint32_t)((ma100 % 100) / 10)); con_puts(" mA");
+              /* 2026-09-22: "107.53 -> 88.53 % = 26.1 mA" with the cell voltage barely moved. Above
+               * 100 % the gauge's SOC is off its table (4.4 V cell) and it walks back to the OCV
+               * figure as it rests, so the delta is mostly that correction, not charge drawn. */
+              if (soc0 > 100 * 512) con_puts(" (UNRELIABLE: started above 100 %, SOC was re-converging; judge by the mV)");
           } else con_puts(" (too short for an average)");
       } else { con_puts("unavailable (entry rc "); con_putdec((uint32_t)(soc0 < 0 ? -soc0 : 0)); con_puts(" exit rc "); con_putdec((uint32_t)(soc1 < 0 ? -soc1 : 0)); con_puts(": 1 no gauge, 2 bus, 3 GG_RUN was clear, 4 soc read)"); }
+      /* Same staleness as the Gen 4 line: fg_batt_mv() is the PM8916 BMS's LAST sample, which right
+       * after a collapse still predates the sleep ("4249 -> 4249", real 4.16 V). Wait for a new one. */
+      { extern int fg_batt_mv_fresh(uint32_t wait_ms, int *fresh); int fresh = 0;
+        int mv1 = smb231_stc_mv();
+#if defined(SLEEP_BATT_FRESH)
+        /* the STC3117 converts every ~4 s: wait for the first reading after the wake */
+        { uint32_t t0 = timer_ms(); while ((uint32_t)(timer_ms() - t0) < 5000u) { timer_delay_ms(100u); int m = smb231_stc_mv(); if (m != mv1 && m > 0) { mv1 = m; fresh = 1; break; } } }
+#else
+        (void)fg_batt_mv_fresh;
+#endif
+        con_puts(" | "); con_putdec((uint32_t)gauge_mv0); con_puts(" mV -> "); con_putdec((uint32_t)mv1); con_puts(fresh ? " mV (STC3117, fresh)" : " mV (STC3117, last conversion)"); }
       con_puts("\n"); }
 #endif
-#if defined(SYS_PC_8909)
-    pon_crumb_write(0x40u);
-#endif
-#endif
-#if defined(SLEEP_NO_WDOG)
-    wdog_extend(30u);                /* re-arm only now that we are awake */
-#endif
-    if (s_rtc_alm_ok == 1) rtc_alarm_disarm();
-    tlmm_irq_mask(0);
-    touch_set_sleep(0);              /* reset pulse: the only way out of hibernate */
-#endif
-    s_last_cause = (why[0] == 't') ? PLAT_WAKE_TIMER : PLAT_WAKE_BUTTON;
-#if defined(SLEEP_RAILS_OFF) && ((SLEEP_RAILS_OFF) & (1u << 6))
-    /* l6 is the DDIC's vddio: it came back at POR. sleep_floor_exit() has
-     * already re-voted the rail. v310 got away with MADCTL alone; with the
-     * modem asleep the chip comes back needing its whole init (v407: black
-     * screen), so run the stock reset + on-command first, then MADCTL. The
-     * table leaves the display OFF (no 0x29) and the chip out of sleep, which
-     * is exactly the state plat_display_on() expects. */
-#if defined(PLAT_BOARD_TICWATCH_C2)
-    if (panel_reinit_after_rail() == 0) { s_panel_off = 1; s_panel_sleeping = 0; }
-#endif
-    plat_panel_madctl_restore();
-#endif
-    if (!(s_keep_dark && s_last_cause == PLAT_WAKE_TIMER)) plat_display_on();
 #if !defined(SLEEP_RADIO_IDLE_ONLY)
     if (s_radio_was_up) { con_puts("resume: bringing the radio back (was up before the sleep)\n"); (void)wlan_up(); }
     if (owf_radio_sleep_hook) owf_radio_sleep_hook(0);

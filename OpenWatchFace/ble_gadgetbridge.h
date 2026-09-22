@@ -123,8 +123,9 @@ static void gb_handle_notify(const String &js) {
   uint8_t  cat = notif_cat_from_appid(src.c_str());   // matches friendly names too
 
   store_lock();
+  if (na_available()) na_backfill_from_cache();   // BEFORE the cache add, see ancs_parse_and_store()
   bool added = notif_store_add(id, title.c_str(), body.c_str(), cat);
-  if (added && na_available()) { na_backfill_from_cache(); na_append(id, title.c_str(), body.c_str(), cat); }
+  if (added && na_available()) na_append(id, title.c_str(), body.c_str(), cat);
   if (added) {
     notif_store_save();
     s_pop_id = id;

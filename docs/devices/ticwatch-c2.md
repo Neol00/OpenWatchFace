@@ -538,16 +538,17 @@ switched, because each needs a known restore voltage:
 | Rail | Bit | Mask | Restore | Status |
 |---|---|---|---|---|
 | `l6`  | 6  | `0x40`       | 1.80 V | Works; **switched off by default**. It is the panel DDIC's vddio, so the panel returns at power-on defaults; wake runs the panel re-init + MADCTL restore automatically when bit 6 is set. |
+| `l9`  | 9  | `0x200`      | 3.30 V | Works (tested on the C2, mask `0x61A40`: wakes normally). WiFi PA rail (iris vddpa); stock has it off with WiFi off. Voted back on at wake only if it was on at sleep entry. Not in the default mask. |
 | `l11` | 11 | `0x800`      | 2.95 V | Works; **switched off by default**. FocalTech touch vdd (+ tpiu/qpdi); touch returns via the wake reset pulse. |
 | `l12` | 12 | `0x1000`     | 1.80 V | Works; **switched off by default**. tpiu/qpdi vdd-io (the SD slot on it is disabled). |
 | `l17` | 17 | `0x20000`    | 2.85 V | Works; **switched off by default**. Only disabled touch nodes use it. |
-| `l18` | 18 | `0x40000`    | 2.70 V | Not tested. DSI controller vdd: the panel re-init does not cover the controller, so risky. |
-| `s3`  | 27 | `0x8000000`  | 1.30 V | Vote is lost: Pronto holds it for the resident radio |
+| `l18` | 18 | `0x40000`    | 2.70 V | Works (tested on the C2 together with `l9`, mask `0x61A40`: display, DSI and wake all normal). DSI controller vdd. Not in the default mask. |
+| `s3`  | 27 | `0x8000000`  | 1.30 V | Cannot be cut by any vote: `s3` is the PMIC input supply of `l1`/`l2`/`l3` (pm8916 `vdd_l1_l2_l3`), so the RPM keeps it up while `l2` (DDR 1.2 V) or `l3` (VDD_MX) is on, which is always. Stock's `8916_s3 disabled users=0` is only the kernel's own vote, not the rail. |
 
-To change the set, pass the whole mask. Combine bits by adding them, e.g. the default plus `l18` = `0x61840`:
+To change the set, pass the whole mask. Combine bits by adding them, e.g. the default plus `l9` and `l18` = `0x61A40` (tested on the C2):
 
 ```sh
-CFLAGS_EXTRA="<release flags> -DSLEEP_RAILS_OFF=0x61840" sh build-owf-image-c2.sh
+CFLAGS_EXTRA="<release flags> -DSLEEP_RAILS_OFF=0x61A40" sh build-owf-image-c2.sh
 ```
 
 If a vote fails, the log prints `rails: lN still on` or `off vote failed`. If

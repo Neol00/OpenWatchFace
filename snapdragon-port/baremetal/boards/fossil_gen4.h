@@ -244,6 +244,17 @@
 #define PLAT_PANEL_H        454u
 #endif
 #define PLAT_SCREEN_ROUND   1
+/* Panel reset line, for the re-init after l6 (the panel's vddio) was cut for a sleep.
+ * firefish DT: qcom,platform-reset-gpio = <tlmm 0x19>, AUO h139 qcom,mdss-dsi-reset-sequence =
+ * <0 12  1 22> (low 12 ms, high 22 ms). */
+/* LSM6DS3 supply: l6, the panel vddio rail, as found on the C2 (same IMU, same 1.8 V sensor
+ * rail layout). Not probed on a Gen 4 yet; the sleep_floor.c probe would report a different
+ * rail as "rails: lN feeds the IMU" if this is wrong. While the pedometer or a sleep session
+ * runs, l6 stays on through the sleep so the hardware step counter keeps counting. */
+#define PLAT_IMU_RAIL_BIT (1u << 6)
+#define PLAT_PANEL_RESET_GPIO    25u
+#define PLAT_PANEL_RESET_LOW_MS  12u
+#define PLAT_PANEL_RESET_HIGH_MS 22u
 
 /* ---------------------------------------------------------------------------
  * I2C: BLSP1 QUP masters ("qcom,i2c-msm-v2"). Bases from msm8909.dtsi; the

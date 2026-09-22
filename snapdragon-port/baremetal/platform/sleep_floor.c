@@ -88,9 +88,12 @@ int cpu_volt_mv(void);   /* cpu_volt_a7.c */
  *   l6  (v310) - DSI/panel vddio. Works, but the DDIC loses its state and comes
  *                back at POR: suspend_msm.c re-sends MADCTL. See finding 109.
  *   l12 (v311) - sdhci vdd-io + tpiu. Uneventful, as expected.
- * Target list still open: l11, l17, l18. s3 is NOT reachable by vote (Pronto
- * holds it as iris-vddrfa for the resident WCNSS) and needs the radio actually
- * powered off, which is a different change.
+ * Target list still open: l18. s3 is NOT reachable by vote, and not because of
+ * Pronto: on pm8916 s3 is the input supply of l1/l2/l3 (vdd_l1_l2_l3), and the
+ * RPM keeps a parent buck up while any child LDO is on. l2 is the DDR 1.2 V
+ * and l3 is VDD_MX, so s3 has a holder in every state including vdd-min. The
+ * stock "8916_s3 disabled users=0" line is the kernel's own APSS vote count
+ * (rpm-smd-regulator has no readback), not the rail.
  *
  * RESTORE VOLTAGES ARE DECODED FROM THE HARDWARE, not guessed. pm8916's ULT
  * PLDO has a single range: base 1750000 uV, step 12500 uV (see
@@ -119,6 +122,7 @@ int cpu_volt_mv(void);   /* cpu_volt_a7.c */
  * first line (nothing turns it off), and the census still shows s3:ON. */
 static const struct { uint8_t id; uint8_t smps; uint32_t uv; } k_probe_uv[] = {
     {  6u, 0u, 1800000u },   /* l6  VSET 0x04 */
+    {  9u, 0u, 3300000u },   /* l9  iris vddpa 3.3 V; stock has it off with WiFi off */
     { 11u, 0u, 2950000u },   /* l11 VSET 0x60 */
     { 12u, 0u, 1800000u },   /* l12 VSET 0x04 */
     { 17u, 0u, 2850000u },   /* l17 VSET 0x58 */
@@ -496,10 +500,21 @@ void sleep_floor_exit(void)
 #define SR_BIT(id, sm) ((sm) ? (1u << (24u + (id))) : (1u << (id)))
 /* Keep in step with k_probe_uv[] above (restore uV decoded from VSET). */
 static const struct { uint8_t id; uint8_t smps; uint32_t uv; } k_rail[] = {
-    {  6u, 0u, 1800000u }, { 11u, 0u, 2950000u }, { 12u, 0u, 1800000u },
+    {  6u, 0u, 1800000u }, {  8u, 0u, 2900000u }, {  9u, 0u, 3300000u }, { 11u, 0u, 2950000u }, { 12u, 0u, 1800000u },
     { 17u, 0u, 2850000u }, { 18u, 0u, 2700000u }, {  3u, 1u, 1300000u },
 };
 static uint32_t s_rails_off;
+#if defined(PLAT_IMU_RAIL_BIT)
+static uint32_t s_imu_rail = PLAT_IMU_RAIL_BIT;   /* known from the board header: no probe, no power cycle */
+#else
+static uint32_t s_imu_rail;     /* SR_BIT of the rail found to power the LSM6DS3, 0 = not found yet */
+#endif
+/* Restore voltage per rail, DECODED FROM THE PMIC AT SLEEP ENTRY (2026-09-22): the k_rail[]
+ * figures are the C2's and the Gen 4 has the same rails at other voltages (firefish DT: l8 2.85,
+ * l11 1.8, l18 2.85 V), so a table would restore them wrong there. pm8916 l4..l18 are ULT PLDO,
+ * one range: uV = 1750000 + 12500 * VSET (+0x41) -- the same decode the table came from, so the
+ * C2's values do not move. The table stays as the fallback for a failed read and for bucks. */
+static uint32_t s_rail_uv[sizeof k_rail / sizeof k_rail[0]];
 static uint16_t sr_base(int sm, unsigned n)
 {
     return sm ? (uint16_t)(0x1400u + (n - 1u) * 0x300u) : (uint16_t)(0x4000u + (n - 1u) * 0x100u);
@@ -515,18 +530,62 @@ void sleep_rails_enter(void)
     for (unsigned i = 0; i < sizeof k_rail / sizeof k_rail[0]; i++) {
         uint32_t id = k_rail[i].id; int sm = k_rail[i].smps;
         if (!(SLEEP_RAILS_OFF & SR_BIT(id, sm))) continue;
+#if defined(PLAT_SOC_MSM8909)   /* imu_lsm6ds3.c is built on every 8909 board */
+        if (s_imu_rail == SR_BIT(id, sm)) {
+            con_puts("imu: "); con_puts(sm ? "s" : "l"); con_putdec(id);
+            if (lsm6ds3_running()) { con_puts(" kept ON (pedometer/sleep session running), WHO_AM_I "); con_puts(lsm6ds3_alive() ? "ok\n" : "NOT ANSWERING\n"); continue; }
+            con_puts(" cut (IMU off)\n");
+        }
+#endif
+        { extern int g_sleep_keep_l8; if (!sm && id == 8u && g_sleep_keep_l8) continue; }   /* card not asleep */
         uint8_t en = 0xFF;
         (void)spmi_read8(SR_SID, sr_base(sm, id) + 0x46u, &en);
         if (!(en & 0x80u)) continue;                       /* already off: nothing to restore */
-        uint32_t kv[9] = { SR_SWEN, 4u, 0u, SR_UV, 4u, k_rail[i].uv, SR_MA, 4u, 0u };
+        s_rail_uv[i] = k_rail[i].uv;
+        if (!sm && id >= 4u) { uint8_t vset = 0xFF;
+            if (spmi_read8(SR_SID, sr_base(0, id) + 0x41u, &vset) == 0 && vset <= 0x7Cu) s_rail_uv[i] = 1750000u + 12500u * vset; }
+        uint32_t kv[9] = { SR_SWEN, 4u, 0u, SR_UV, 4u, s_rail_uv[i], SR_MA, 4u, 0u };
         int rc = rpm_smd_request(0u, sm ? SR_SMPA : SR_LDOA, id, kv, sizeof kv);
-        if (sm) (void)rpm_smd_request(1u, SR_SMPA, id, kv, sizeof kv);   /* sleep set too */
+        /* SLEEP SET TOO, for LDOs as well (2026-09-22). sys_pc8909_init() votes l6, l11, l12,
+         * l17 and l18 ON in the sleep set, and the sleep set is what the RPM applies inside
+         * the collapse -- so an active-set-only cut was switched back on for the whole sleep
+         * (16 h at 11.2 mA with every one of these "cut"). Left off in set 1 afterwards:
+         * every later sleep wants them off as well. */
+#ifndef SLEEP_SET_KEEP
+#define SLEEP_SET_KEEP 0u     /* bisect: rails in this mask are cut in the ACTIVE set only, i.e. the
+                               * boot-time sleep set switches them back on inside the collapse */
+#endif
+        if (!(SLEEP_SET_KEEP & SR_BIT(id, sm)))
+            (void)rpm_smd_request(1u, sm ? SR_SMPA : SR_LDOA, id, kv, sizeof kv);
         timer_delay_ms(5u);
         en = 0xFF;
         (void)spmi_read8(SR_SID, sr_base(sm, id) + 0x46u, &en);
         if (!(en & 0x80u)) s_rails_off |= SR_BIT(id, sm);
         else if (rc) sr_fail(" off vote failed\n", sm, id);
         else         sr_fail(" still on (another master holds it)\n", sm, id);
+#if defined(PLAT_SOC_MSM8909)   /* imu_lsm6ds3.c is built on every 8909 board */
+        /* WHICH RAIL FEEDS THE IMU (2026-09-22)? The LSM6DS3 is not in the AP's stock tree (the
+         * modem owns the sensors there), and with the cuts really holding the step counter came
+         * back reset (30 -> hw 0 -> 65536). Find it: after each cut ask WHO_AM_I over the
+         * bit-banged bus. The first rail whose cut silences the chip is the IMU's; it is voted
+         * back on at once and remembered. From then on it is left ON whenever the pedometer or
+         * a sleep session is running (they count through the sleep, as on the other boards) and
+         * cut like the rest when the IMU is off. */
+        if ((s_rails_off & SR_BIT(id, sm)) && s_imu_rail == 0u && lsm6ds3_present()) {
+            timer_delay_ms(10u);
+            if (!lsm6ds3_alive()) {
+                s_imu_rail = SR_BIT(id, sm);
+                con_puts("rails: "); con_puts(sm ? "s" : "l"); con_putdec(id); con_puts(" feeds the IMU (WHO_AM_I lost when it was cut)");
+                con_puts(lsm6ds3_running() ? " - back ON, pedometer/sleep session running\n" : " - left off this time, IMU is idle\n");
+                if (lsm6ds3_running()) {
+                    uint32_t on[9] = { SR_SWEN, 4u, 1u, SR_UV, 4u, s_rail_uv[i], SR_MA, 4u, 10u };
+                    (void)rpm_smd_request(0u, sm ? SR_SMPA : SR_LDOA, id, on, sizeof on);
+                    (void)rpm_smd_request(1u, sm ? SR_SMPA : SR_LDOA, id, on, sizeof on);
+                    s_rails_off &= ~SR_BIT(id, sm);
+                }
+            }
+        }
+#endif
     }
 }
 void sleep_rails_exit(void)
@@ -535,7 +594,7 @@ void sleep_rails_exit(void)
     for (unsigned i = 0; i < sizeof k_rail / sizeof k_rail[0]; i++) {
         uint32_t id = k_rail[i].id; int sm = k_rail[i].smps;
         if (!(s_rails_off & SR_BIT(id, sm))) continue;
-        uint32_t kv[9] = { SR_SWEN, 4u, 1u, SR_UV, 4u, k_rail[i].uv, SR_MA, 4u, sm ? 100u : 10u };
+        uint32_t kv[9] = { SR_SWEN, 4u, 1u, SR_UV, 4u, s_rail_uv[i], SR_MA, 4u, sm ? 100u : 10u };
         if (rpm_smd_request(0u, sm ? SR_SMPA : SR_LDOA, id, kv, sizeof kv))
             sr_fail(" ON vote failed\n", sm, id);
         if (sm) (void)rpm_smd_request(1u, SR_SMPA, id, kv, sizeof kv);

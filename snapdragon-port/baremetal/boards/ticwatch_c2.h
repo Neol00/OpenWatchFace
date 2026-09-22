@@ -405,6 +405,11 @@
  *   l17 - only disabled touch nodes (synaptics, it7260) in the stock tree.
  * Inherited by the S2, confirmed there too (it only needs its own MADCTL,
  * see ticwatch_s2.h). -DSLEEP_RAILS_OFF=0 keeps every rail on. */
+/* The LSM6DS3 (bit-banged SPI, gpio8-11) is fed from l6 -- the same 1.8 V rail as the panel
+ * DDIC's vddio. Found 2026-09-22 by probing WHO_AM_I after each rail cut (the sensor is not in
+ * the AP's stock tree). While the pedometer or a sleep session runs, l6 stays ON through the
+ * sleep so the hardware step counter keeps counting; it is cut like the rest when the IMU is off. */
+#define PLAT_IMU_RAIL_BIT (1u << 6)
 #ifndef SLEEP_RAILS_OFF
 #define SLEEP_RAILS_OFF 0x21840u
 #endif

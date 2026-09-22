@@ -66,6 +66,11 @@ static void rd(uint8_t reg, uint8_t *buf, unsigned n)
 }
 
 int lsm6ds3_present(void) { return s_present; }
+/* Is the chip powered and answering right now? (WHO_AM_I over the bit-banged bus.) */
+int lsm6ds3_alive(void) { uint8_t id = 0; if (!s_present) return 0; rd(R_WHO_AM_I, &id, 1); return id == WHO_AM_I_LSM6DS3; }
+/* Set while the pedometer or the accel is on (steps_start / accel_on .. stop). */
+static int s_on;
+int lsm6ds3_running(void) { return s_on; }
 
 /* Probe + reset. Leaves the accelerometer OFF. Returns 1 when the chip answers. */
 int lsm6ds3_init(void)
@@ -90,6 +95,7 @@ int lsm6ds3_init(void)
  * 16-bit step register; the software total is untouched. */
 void lsm6ds3_steps_start(void)
 {
+    s_on = 1;
     if (!s_present) return;
     wr(R_CTRL1_XL, 0x20);                  /* ODR 26 Hz, +-2 g */
     wr(R_TAP_CFG, 0x40);                   /* PEDO_EN */
@@ -102,6 +108,7 @@ void lsm6ds3_steps_start(void)
 /* Accelerometer only (26 Hz, 2 g), no pedometer: the sleep-tracking session. */
 void lsm6ds3_accel_on(void)
 {
+    s_on = 1;
     if (!s_present) return;
     wr(R_CTRL10_C, 0x00);
     wr(R_TAP_CFG, 0x00);
@@ -111,6 +118,7 @@ void lsm6ds3_accel_on(void)
 /* Everything off: pedometer, accel. */
 void lsm6ds3_stop(void)
 {
+    s_on = 0;
     if (!s_present) return;
     wr(R_CTRL10_C, 0x00);
     wr(R_TAP_CFG, 0x00);
@@ -124,7 +132,15 @@ uint32_t lsm6ds3_steps_poll(void)
     if (!s_present) return s_total;
     rd(R_STEP_COUNTER_L, b, 2);
     uint16_t hw = (uint16_t)(b[0] | (b[1] << 8));
-    s_total += (uint16_t)(hw - (uint16_t)s_last_hw);
+    /* 2026-09-22: after a deep sleep the total jumped to 65536. A bit-banged SPI read that gets
+     * no answer (chip reset by a rail cut, or the bus pins parked) returns all ones = 0xFFFF,
+     * and (0xFFFF - last) then adds ~65535 steps. 0xFFFF is also a legal counter value, but a
+     * jump of more than 20000 steps between two polls a few seconds or one sleep apart is not:
+     * re-base on it instead of adding it. The chip's own counter reset (POR) reads 0 and the
+     * same rule keeps the total from going backwards. */
+    uint16_t delta = (uint16_t)(hw - (uint16_t)s_last_hw);
+    if (hw == 0xFFFFu || delta > 20000u) { s_last_hw = hw; return s_total; }
+    s_total += delta;
     s_last_hw = hw;
     return s_total;
 }

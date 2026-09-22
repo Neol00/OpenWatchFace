@@ -206,8 +206,25 @@ static void mss_saw_scan(void)
 #endif
 
 #if !defined(SYS_PC_NO_SLEEP_SET)
+/* LOAD VOTED WITH EVERY SLEEP-SET RAIL = THE STOCK KERNEL'S OWN LOW-POWER VOTE (2026-09-22).
+ * rpm-smd-regulator.c (skipjack 3.18): a regulator is in HPM when its "ma" vote is >=
+ * qcom,hpm-min-load, and when the kernel asks for LPM it votes hpm_min_load - 1000 uA
+ * (rpm_vreg_lpm_max_uA, LOAD_THRESHOLD_STEP). skipjack-stock.dts: hpm-min-load is 10000 uA for
+ * l1..l12, l17, l18 and 5000 uA for l13..l16. So the stock LPM votes are 9 mA and 4 mA, and
+ * those are what is sent here -- not the 10 mA this file used to send (= the HPM threshold on
+ * most rails, above it on l13/l16) and not an invented 1 mA. -DSYS_PC_SLEEP_MA=<n> forces one
+ * value on every rail (10 = the old behaviour). */
+static uint32_t sleep_ma_for(uint32_t id)
+{
+#if defined(SYS_PC_SLEEP_MA)
+    (void)id; return (uint32_t)(SYS_PC_SLEEP_MA);
+#else
+    return (id >= 13u && id <= 16u) ? 4u : 9u;
+#endif
+}
 static int sleep_vote_ldo(const char *what, uint32_t id, uint32_t uv, uint32_t ma)
 {
+    ma = sleep_ma_for(id);
     uint32_t kv[9] = { K_SWEN, 4, 1, K_UV, 4, uv, K_MA, 4, ma };
     int rc = rpm_smd_request(RPM_SET_SLEEP, T_LDOA, id, kv, sizeof kv);
     con_puts("sys-pc: sleep-set "); con_puts(what); con_puts(" rc "); con_putdec((uint32_t)(rc < 0 ? -rc : rc)); con_puts(rc ? " (neg)\n" : "\n");

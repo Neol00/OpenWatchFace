@@ -172,6 +172,8 @@ void     cpu_pc8909_report(void);
 /* imu_lsm6ds3.c: LSM6DS3 on bit-banged SPI gpio8-11 (Gen 4 / C2), hardware pedometer */
 int      lsm6ds3_init(void);
 int      lsm6ds3_present(void);
+int      lsm6ds3_alive(void);
+int      lsm6ds3_running(void);
 void     lsm6ds3_steps_start(void);
 void     lsm6ds3_accel_on(void);
 void     lsm6ds3_stop(void);
@@ -540,6 +542,7 @@ void smb231_charger_suspend(int on); /* SUSP pin: 1 = run from battery with VBUS
 void bt_hci_drop(void);                          /* bt_hci.c: forget channels after a PAS shutdown */
 int  cpu_clk_sleep_enter(void);                  /* cpu_clk_a7.c: cluster clock -> XO for the sleep */
 int  cpu_clk_sleep_exit(void);
+int  emmc_is_suspended(void); int emmc_sleep_enter(void); void emmc_sleep_exit(void);   /* sdhci_msm.c: l8 off for the sleep */
 void logfile_flush(void);                        /* logfile.c */
 void gcc_mdss_sleep(int on);                     /* gate/ungate MDSS branches (GDSC + PLL kept) */
 void gcc_sdcc1_sleep(int on);                    /* gate/ungate eMMC clocks */

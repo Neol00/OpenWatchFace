@@ -1,0 +1,943 @@
+diff -ruN lvgl-9.5.0/src/draw/dma2d/lv_draw_dma2d.c mine/src/draw/dma2d/lv_draw_dma2d.c
+--- lvgl-9.5.0/src/draw/dma2d/lv_draw_dma2d.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/dma2d/lv_draw_dma2d.c	2026-09-21 22:55:25.795551301 +0200
+@@ -23,6 +23,15 @@
+ 
+ #define DRAW_UNIT_ID_DMA2D 5
+ 
++#if OWF_TUYA_DMA2D_BACKEND
++/* Beken BK7258 backend bridge (implemented in owf_tuya_dma2d_backend.cpp). Declared here
++ * because the LVGL headers don't know about it. */
++void owf_dma2d_backend_init(void);
++void owf_dma2d_backend_deinit(void);
++void owf_dma2d_backend_start(const void * conf);
++bool owf_dma2d_backend_busy(void);
++#endif
++
+ /**********************
+  *      TYPEDEFS
+  **********************/
+@@ -74,6 +83,10 @@
+     lv_thread_sync_init(&draw_dma2d_unit->interrupt_signal);
+ #endif
+ 
++#if OWF_TUYA_DMA2D_BACKEND
++    /* Beken BK7258: bring up the DMA2D engine + ISR via the driver (no STM32 RCC/NVIC). */
++    owf_dma2d_backend_init();
++#else
+     /* enable the DMA2D clock */
+ #if defined(STM32F4) || defined(STM32F7) || defined(STM32U5) || defined(STM32L4)
+     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2DEN;
+@@ -90,10 +103,14 @@
+ 
+     /* enable the interrupt */
+     NVIC_EnableIRQ(DMA2D_IRQn);
++#endif /* OWF_TUYA_DMA2D_BACKEND */
+ }
+ 
+ void lv_draw_dma2d_deinit(void)
+ {
++#if OWF_TUYA_DMA2D_BACKEND
++    owf_dma2d_backend_deinit();
++#else
+     /* disable the interrupt */
+     NVIC_DisableIRQ(DMA2D_IRQn);
+ 
+@@ -105,6 +122,7 @@
+ #elif defined(STM32H7RS) || defined(STM32N6)
+     RCC->AHB5ENR &= ~RCC_AHB5ENR_DMA2DEN;
+ #endif
++#endif /* OWF_TUYA_DMA2D_BACKEND */
+ 
+ #if LV_DRAW_DMA2D_ASYNC
+     lv_result_t res = lv_thread_sync_delete(&g_unit->interrupt_signal);
+@@ -132,6 +150,12 @@
+         case LV_COLOR_FORMAT_RGB888:
+             return LV_DRAW_DMA2D_OUTPUT_CF_RGB888;
+         case LV_COLOR_FORMAT_RGB565:
++#if OWF_TUYA_DMA2D_BACKEND
++        /* Tuya T5 renders in RGB565_SWAPPED (panel byte order). The pixel layout is the
++         * same RGB565; the byte order is handled by the Beken DMA2D output byte-reverse,
++         * set in the backend. So map SWAPPED to the same RGB565 output enum here. */
++        case LV_COLOR_FORMAT_RGB565_SWAPPED:
++#endif
+             return LV_DRAW_DMA2D_OUTPUT_CF_RGB565;
+         case LV_COLOR_FORMAT_ARGB1555:
+             return LV_DRAW_DMA2D_OUTPUT_CF_ARGB1555;
+@@ -157,6 +181,11 @@
+ 
+ void lv_draw_dma2d_configure_and_start_transfer(const lv_draw_dma2d_configuration_t * conf)
+ {
++#if OWF_TUYA_DMA2D_BACKEND
++    /* Beken BK7258: translate the config to the driver API and start (async). */
++    owf_dma2d_backend_start(conf);
++}
++#else
+     /* number of lines register */
+     DMA2D->NLR = (conf->w << DMA2D_NLR_PL_Pos) | (conf->h << DMA2D_NLR_NL_Pos);
+ 
+@@ -204,6 +233,7 @@
+ #endif
+                 ;
+ }
++#endif /* OWF_TUYA_DMA2D_BACKEND */
+ 
+ #if LV_DRAW_DMA2D_CACHE
+ void lv_draw_dma2d_invalidate_cache(const lv_draw_dma2d_cache_area_t * mem_area)
+@@ -234,6 +264,14 @@
+                 lv_draw_fill_dsc_t * dsc = task->draw_dsc;
+                 if(!(dsc->radius == 0
+                      && dsc->grad.dir == LV_GRAD_DIR_NONE
++#if OWF_TUYA_DMA2D_BACKEND
++                     /* OPAQUE-ONLY on the Beken backend: only fully-opaque solid fills go to
++                      * DMA2D (a register-to-memory colour write, no background read). LVGL's
++                      * alpha fill uses an STM32-specific fake-A8 blend idiom that doesn't map
++                      * to Beken's blend HW (caused dropped glyphs + crashes) — let the software
++                      * draw unit handle anything with opacity < max. */
++                     && dsc->opa >= LV_OPA_MAX
++#endif
+                      && (dsc->base.layer->color_format == LV_COLOR_FORMAT_ARGB8888
+                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_XRGB8888
+                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_RGB888
+@@ -257,11 +295,21 @@
+                      && dsc->scale_y == 256
+                      && dsc->rotation == 0
+                      && lv_image_src_get_type(dsc->src) == LV_IMAGE_SRC_VARIABLE
++#if OWF_TUYA_DMA2D_BACKEND
++                     /* OPAQUE-ONLY: fully opaque, and a source with NO alpha channel (so the
++                      * copy is a straight M2M pixel-format convert, never a blend that would
++                      * read the background). Excludes ARGB8888/ARGB1555 sources. */
++                     && dsc->opa >= LV_OPA_MAX
++                     && (dsc->header.cf == LV_COLOR_FORMAT_XRGB8888
++                         || dsc->header.cf == LV_COLOR_FORMAT_RGB888
++                         || dsc->header.cf == LV_COLOR_FORMAT_RGB565)
++#else
+                      && (dsc->header.cf == LV_COLOR_FORMAT_ARGB8888
+                          || dsc->header.cf == LV_COLOR_FORMAT_XRGB8888
+                          || dsc->header.cf == LV_COLOR_FORMAT_RGB888
+                          || dsc->header.cf == LV_COLOR_FORMAT_RGB565
+                          || dsc->header.cf == LV_COLOR_FORMAT_ARGB1555)
++#endif
+                      && (dsc->base.layer->color_format == LV_COLOR_FORMAT_ARGB8888
+                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_XRGB8888
+                          || dsc->base.layer->color_format == LV_COLOR_FORMAT_RGB888
+@@ -380,7 +428,11 @@
+ #if !LV_DRAW_DMA2D_ASYNC
+ static bool check_transfer_completion(void)
+ {
++#if OWF_TUYA_DMA2D_BACKEND
++    return !owf_dma2d_backend_busy();
++#else
+     return !(DMA2D->CR & DMA2D_CR_START);
++#endif
+ }
+ #endif
+ 
+diff -ruN lvgl-9.5.0/src/draw/dma2d/owf_tuya_dma2d_hal.h mine/src/draw/dma2d/owf_tuya_dma2d_hal.h
+--- lvgl-9.5.0/src/draw/dma2d/owf_tuya_dma2d_hal.h	1970-01-01 01:00:00.000000000 +0100
++++ mine/src/draw/dma2d/owf_tuya_dma2d_hal.h	2026-09-21 22:55:25.795698101 +0200
+@@ -0,0 +1,58 @@
++/* ============================================================================
++ *  owf_tuya_dma2d_hal.h — LVGL's LV_DRAW_DMA2D_HAL_INCLUDE target on the T5 (BK7258).
++ *
++ *  Lives inside the LVGL source tree (next to the DMA2D draw unit) because lv_draw_dma2d.c
++ *  includes this via LV_DRAW_DMA2D_HAL_INCLUDE, and only LVGL's own src/ include roots are
++ *  reliably on that compile's -I — not the sketch's tuya/compat/. Referenced from lv_conf.h
++ *  as "draw/dma2d/owf_tuya_dma2d_hal.h" (relative to lvgl/src, which Arduino adds as -I).
++ *
++ *  WHY THIS EXISTS: LVGL's DMA2D draw unit is written for the STM32 DMA2D peripheral — it
++ *  #include's an STM32 HAL header and writes STM32 registers directly (DMA2D->NLR,
++ *  RCC->AHB1ENR, NVIC_EnableIRQ(DMA2D_IRQn), ...). The BK7258 has a DMA2D engine too, but
++ *  a DIFFERENT register map driven through a driver API (bk_dma2d_*, in libdriver.a —
++ *  verified present via nm). So LV_DRAW_DMA2D_HAL_INCLUDE points here instead of
++ *  "stm32h7xx_hal.h", and the STM32 register pokes in lv_draw_dma2d.c are wrapped in
++ *  `#if OWF_TUYA_DMA2D_BACKEND` blocks that call the bridge functions declared below
++ *  (implemented in the sketch's owf_tuya_dma2d_backend.cpp).
++ * ========================================================================== */
++#ifndef OWF_TUYA_DMA2D_HAL_H
++#define OWF_TUYA_DMA2D_HAL_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/* Marker the LVGL DMA2D draw unit gates on. Because lv_draw_dma2d.c includes this header
++ * (via LV_DRAW_DMA2D_HAL_INCLUDE), defining it here makes the symbol visible inside the
++ * LVGL library TU — where BOARD_PLATFORM_TUYA (a sketch-level define) is NOT visible. The
++ * STM32 register code in lv_draw_dma2d.c is wrapped in `#if OWF_TUYA_DMA2D_BACKEND`. */
++#define OWF_TUYA_DMA2D_BACKEND 1
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The LVGL config struct (lv_draw_dma2d_configuration_t) is defined in
++ * lv_draw_dma2d_private.h, which is included AFTER this header. lv_draw_dma2d.c calls our
++ * bridge from inside functions where that type is in scope, so we take it as an opaque
++ * pointer here (void*) to avoid an include cycle, and cast in the backend .cpp (which
++ * includes the LVGL private header). */
++
++/* Bring up / tear down the Beken DMA2D engine (clock/power vote + ISR register). Called
++ * from lv_draw_dma2d_init/deinit. */
++void owf_dma2d_backend_init(void);
++void owf_dma2d_backend_deinit(void);
++
++/* Translate one LVGL DMA2D configuration into the Beken driver calls and START the
++ * transfer (asynchronous — completion arrives via the DMA2D interrupt). `conf` is a
++ * `const lv_draw_dma2d_configuration_t *`. */
++void owf_dma2d_backend_start(const void *conf);
++
++/* Poll: true while a transfer is still running (maps to bk_dma2d_is_transfer_busy). Used
++ * by the non-async completion check. */
++bool owf_dma2d_backend_busy(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* OWF_TUYA_DMA2D_HAL_H */
+diff -ruN lvgl-9.5.0/src/draw/lv_draw.c mine/src/draw/lv_draw.c
+--- lvgl-9.5.0/src/draw/lv_draw.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/lv_draw.c	2026-09-21 22:55:25.884905901 +0200
+@@ -22,6 +22,7 @@
+ #include "../core/lv_global.h"
+ #include "../core/lv_refr_private.h"
+ #include "../stdlib/lv_string.h"
++#include "../osal/lv_os.h"
+ 
+ /*********************
+  *      DEFINES
+@@ -37,6 +38,13 @@
+  **********************/
+ static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id);
+ static void cleanup_task(lv_draw_task_t * t, lv_display_t * disp);
++/* ESP32-S3-WatchFace LOCAL PATCH: band-split parallel rendering — see the
++ * implementation above is_independent() for the full story. Only built when the
++ * OS layer is on (dual-core S3-2.06); a single-core no-OS board (C6-1.47) never
++ * calls it, so guarding the definition avoids an unused-function warning. */
++#if LV_USE_OS
++static lv_draw_task_t * band_split_task(lv_draw_task_t * t);
++#endif
+ static inline size_t get_draw_dsc_size(lv_draw_task_type_t type);
+ static lv_draw_task_t * get_first_available_task(lv_layer_t * layer);
+ 
+@@ -51,6 +59,18 @@
+  *  STATIC VARIABLES
+  **********************/
+ 
++#if LV_USE_OS
++/* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): serializes every
++ * claim/removal on the draw-task lists, because render workers now scan and
++ * claim tasks themselves instead of waiting for the refr thread to assign
++ * them. Held by: the workers' finish+claim section (lv_draw_sw.c), the sw
++ * dispatch_cb's assignment loop, the FINISHED-task removal walk in
++ * lv_draw_dispatch_layer, and the task release at the end of
++ * lv_draw_finalize_task_creation. List INSERTIONS stay lock-free: they only
++ * publish fully-built nodes (state BUILDING) with single pointer stores. */
++lv_mutex_t lv_draw_watch_task_mutex;
++#endif
++
+ /**********************
+  *      MACROS
+  **********************/
+@@ -63,6 +83,8 @@
+ {
+ #if LV_USE_OS
+     lv_thread_sync_init(&_draw_info.sync);
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch) */
++    lv_mutex_init(&lv_draw_watch_task_mutex);
+ #endif
+ }
+ 
+@@ -114,7 +136,10 @@
+     new_task->opa = layer->opa;
+     new_task->type = type;
+     new_task->draw_dsc = (uint8_t *)new_task + LV_ALIGN_UP(sizeof(lv_draw_task_t), 8);
+-    new_task->state = LV_DRAW_TASK_STATE_WAITING;
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the dsc is filled in
++     * AFTER this function returns, but workers scan the list concurrently —
++     * publish the task as BUILDING (unclaimable); finalize releases it. */
++    new_task->state = LV_DRAW_TASK_STATE_BUILDING;
+ 
+     /*Find the tail*/
+     if(layer->draw_task_head == NULL) {
+@@ -137,6 +162,22 @@
+     lv_draw_dsc_base_t * base_dsc = t->draw_dsc;
+     base_dsc->layer = layer;
+ 
++    /* ESP32-S3-WatchFace LOCAL PATCH: split big fill/border/arc/label tasks into
++     * two independent clip halves BEFORE evaluation/dispatch, so both SW render
++     * workers can paint one task in parallel. Must happen before any dispatch:
++     * once a worker may hold the task its clip can no longer be shrunk safely.
++     * GATED ON LV_USE_OS: the split exists only to feed a SECOND render worker,
++     * which requires the OS/thread layer. On a single-core, no-OS board (C6-1.47,
++     * LV_USE_OS == LV_OS_NONE) there is no second worker, and running the split
++     * without the worker-dispatch machinery (also LV_USE_OS-gated below) corrupts
++     * the cloned draw task -> store-fault in lv_draw_label's memcpy. So with no OS
++     * we skip the split entirely and use stock LVGL draw. */
++#if LV_USE_OS
++    lv_draw_task_t * t_split = band_split_task(t);
++#else
++    lv_draw_task_t * t_split = NULL;
++#endif
++
+     lv_draw_global_info_t * info = &_draw_info;
+ 
+     /*Send LV_EVENT_DRAW_TASK_ADDED and dispatch only on the "main" draw_task
+@@ -189,6 +230,27 @@
+             u = u->next;
+         }
+     }
++
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the task (and its
++     * band clone) sat in BUILDING state so no worker could claim it while the
++     * dsc was being filled and evaluated. Release it now that it's complete.
++     * If no draw unit took it, retire it AND its clone — a forever-pending
++     * task would stall the layer. The mutex pairs with the workers' claim lock
++     * so the dsc writes above are visible before the task becomes claimable. */
++#if LV_USE_OS
++    lv_mutex_lock(&lv_draw_watch_task_mutex);
++#endif
++    if(t->preferred_draw_unit_id == LV_DRAW_UNIT_NONE) {
++        t->state = LV_DRAW_TASK_STATE_FINISHED;
++        if(t_split) t_split->state = LV_DRAW_TASK_STATE_FINISHED;
++    }
++    else {
++        if(t->state == LV_DRAW_TASK_STATE_BUILDING) t->state = LV_DRAW_TASK_STATE_WAITING;
++        if(t_split && t_split->state == LV_DRAW_TASK_STATE_BUILDING) t_split->state = LV_DRAW_TASK_STATE_WAITING;
++    }
++#if LV_USE_OS
++    lv_mutex_unlock(&lv_draw_watch_task_mutex);
++#endif
+     LV_PROFILER_DRAW_END;
+ }
+ 
+@@ -235,6 +297,12 @@
+ {
+     LV_PROFILER_DRAW_BEGIN;
+     /*Remove the finished tasks first*/
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): unlinking + freeing
++     * must not run under a worker that is scanning the same list — take the
++     * shared task mutex for the removal walk. */
++#if LV_USE_OS
++    lv_mutex_lock(&lv_draw_watch_task_mutex);
++#endif
+     lv_draw_task_t * t_prev = NULL;
+     lv_draw_task_t * t = layer->draw_task_head;
+     lv_draw_task_t * t_next;
+@@ -254,6 +322,9 @@
+         }
+         t = t_next;
+     }
++#if LV_USE_OS
++    lv_mutex_unlock(&lv_draw_watch_task_mutex);
++#endif
+ 
+     bool task_dispatched = false;
+ 
+@@ -340,9 +411,12 @@
+         int32_t hor_res = lv_display_get_horizontal_resolution(lv_refr_get_disp_refreshing());
+         int32_t ver_res = lv_display_get_vertical_resolution(lv_refr_get_disp_refreshing());
+         lv_draw_task_t * t = layer->draw_task_head;
++        /* ESP32-S3-WatchFace LOCAL PATCH: judge by _real_area (area ∩ clip), not
++         * area — a band-split screen fill only OCCUPIES its half, so the other
++         * half's tasks stay available to the second worker. */
+         if(t->state != LV_DRAW_TASK_STATE_WAITING &&
+-           t->area.x1 <= 0 && t->area.x2 >= hor_res - 1 &&
+-           t->area.y1 <= 0 && t->area.y2 >= ver_res - 1) {
++           t->_real_area.x1 <= 0 && t->_real_area.x2 >= hor_res - 1 &&
++           t->_real_area.y1 <= 0 && t->_real_area.y2 >= ver_res - 1) {
+             LV_PROFILER_DRAW_END;
+             return NULL;
+         }
+@@ -375,8 +449,9 @@
+ 
+     lv_draw_task_t * t = t_check->next;
+     while(t) {
++        /* ESP32-S3-WatchFace LOCAL PATCH: _real_area, consistent with is_independent */
+         if((t->state == LV_DRAW_TASK_STATE_WAITING || t->state == LV_DRAW_TASK_STATE_BLOCKED) &&
+-           lv_area_is_on(&t_check->area, &t->area)) {
++           lv_area_is_on(&t_check->_real_area, &t->_real_area)) {
+             cnt++;
+         }
+ 
+@@ -585,6 +660,128 @@
+  * @param draw_unit_id  draw unit ID for which the independence check is called
+  * @return              true: `t_check` is not overlapping with older tasks so it's independent
+  */
++/* ESP32-S3-WatchFace LOCAL PATCH: band-split parallel rendering.
++ *
++ * LVGL's parallelism is per draw TASK, and a task may only run when no earlier
++ * task overlapping it is unfinished. A watch UI is a stack of overlapping
++ * widgets over a full-screen background fill, so the task graph degenerates to
++ * a near-serial chain and the 2nd draw unit mostly waits (measured: FPS flat
++ * with 1 vs 2 workers, neither core saturated).
++ *
++ * Fix: clone a big task and give each sibling one HALF of its effective
++ * (area ∩ clip) region as clip_area/_real_area. A task can only touch
++ * pixels inside its clip, so the halves are truly independent: is_independent()
++ * (which compares _real_area) lets both workers paint the same task at once.
++ * Output is pixel-identical: the geometry (t->area — corners, gradients, text
++ * layout) is untouched, only the clip is halved, and the two clips tile the
++ * original exactly.
++ *
++ * Split policy per task type:
++ *  - FILL / BORDER / ARC: horizontal bands. Pure geometry, dsc owns no heap
++ *    resources (see cleanup_task: only LINE, LAYER and label text do), so a
++ *    memcpy clone is safe to create and free through normal task cleanup.
++ *  - LABEL (80% of render time on this UI): split along the LONGER axis.
++ *    Multi-line (tall) labels band horizontally — whole lines outside the clip
++ *    are skipped before any glyph work. Single-line (wide) labels split
++ *    vertically — draw_letter skips a glyph whose letter area AND bg cell are
++ *    outside the clip BEFORE fetching its bitmap, so each half only pays
++ *    look+fetch+blend for its own glyphs (the straddling boundary glyph is
++ *    fetched twice; the decoded-glyph cache makes that ~15 µs). Two dsc
++ *    fix-ups are required: `hint` points at the widget's shared hint storage
++ *    (both halves would write it concurrently → clone gets NULL), and
++ *    `text_local` text is freed once per task by cleanup_task (clone gets its
++ *    own lv_strdup so each sibling frees its own copy).
++ *  - NOT split: IMAGE (raw blits are bandwidth-bound like fills = no gain, and
++ *    decoded sources would decode twice), BOX_SHADOW (each half would redo the
++ *    full blur), LINE (dsc heap ownership), LAYER (blend ordering). */
++#if LV_USE_OS
++static lv_draw_task_t * band_split_task(lv_draw_task_t * t)
++{
++    /* NOTE: _draw_info.unit_cnt counts registered draw UNITS and the sw renderer
++     * registers ONE unit owning LV_DRAW_SW_DRAW_UNIT_CNT worker THREADS — gating
++     * on unit_cnt silently disabled this whole patch. Gate on the thread count. */
++#if !defined(LV_DRAW_SW_DRAW_UNIT_CNT) || LV_DRAW_SW_DRAW_UNIT_CNT < 2
++    return NULL;
++#endif
++
++    switch(t->type) {
++        case LV_DRAW_TASK_TYPE_FILL:
++        case LV_DRAW_TASK_TYPE_BORDER:
++        case LV_DRAW_TASK_TYPE_ARC:
++        case LV_DRAW_TASK_TYPE_LABEL:
++            break;
++        default:
++            return NULL;
++    }
++
++    /* LV_EVENT_DRAW_TASK_ADDED handlers may mutate the dsc after cloning,
++     * which would let the halves diverge — don't split those objects' tasks. */
++    lv_draw_dsc_base_t * base_dsc = t->draw_dsc;
++    if(base_dsc->obj && lv_obj_has_flag(base_dsc->obj, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS)) return NULL;
++
++    lv_area_t eff;
++    if(!lv_area_intersect(&eff, &t->area, &t->clip_area)) return NULL;
++    int32_t eff_w = lv_area_get_width(&eff);
++    int32_t eff_h = lv_area_get_height(&eff);
++
++    bool vertical = false;   /* split into left/right instead of top/bottom */
++    if(t->type == LV_DRAW_TASK_TYPE_LABEL) {
++        /* Labels are ~1 ms each and the serial bottleneck, so split much
++         * smaller ones than fills — but each half re-runs the line layout,
++         * so don't split below the dispatch+layout overhead. */
++        if(eff_w * eff_h < 4096) return NULL;
++        vertical = eff_w > eff_h;
++        if(vertical ? eff_w < 64 : eff_h < 32) return NULL;  /* halves too thin */
++    }
++    else {
++        if(eff_h < 16) return NULL;                  /* too thin to band */
++        if(eff_w * eff_h < 16384) return NULL;       /* not worth 2 dispatches */
++    }
++
++    size_t size = LV_ALIGN_UP(sizeof(lv_draw_task_t), 8) + get_draw_dsc_size(t->type);
++    lv_draw_task_t * c = lv_malloc(size);
++    if(c == NULL) return NULL;
++    lv_memcpy(c, t, size);
++    c->draw_dsc = (uint8_t *)c + LV_ALIGN_UP(sizeof(lv_draw_task_t), 8);
++    c->preference_score = 100;
++    c->preferred_draw_unit_id = LV_DRAW_UNIT_NONE;   /* any worker may take it */
++
++    if(t->type == LV_DRAW_TASK_TYPE_LABEL) {
++        lv_draw_label_dsc_t * ld = (lv_draw_label_dsc_t *)c->draw_dsc;
++        ld->hint = NULL;                 /* shared widget storage — not thread-safe */
++        if(ld->text_local) {
++            char * dup = lv_strdup(ld->text);   /* cleanup_task frees per task */
++            if(dup == NULL) {
++                lv_free(c);
++                return NULL;
++            }
++            ld->text = dup;
++        }
++    }
++
++    if(vertical) {
++        int32_t x_mid = (eff.x1 + eff.x2) >> 1;
++        t->clip_area = eff;
++        t->clip_area.x2 = x_mid;                      /* original: left half */
++        c->clip_area = eff;
++        c->clip_area.x1 = x_mid + 1;                  /* clone: right half */
++    }
++    else {
++        int32_t y_mid = (eff.y1 + eff.y2) >> 1;
++        t->clip_area = eff;
++        t->clip_area.y2 = y_mid;                      /* original: top band */
++        c->clip_area = eff;
++        c->clip_area.y1 = y_mid + 1;                  /* clone: bottom band */
++    }
++    t->_real_area = t->clip_area;
++    c->_real_area = c->clip_area;
++
++    c->next = t->next;                                /* insert right after t */
++    t->next = c;
++    return c;
++}
++#endif  /* LV_USE_OS — band_split_task */
++
+ static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id)
+ {
+     LV_PROFILER_DRAW_BEGIN;
+diff -ruN lvgl-9.5.0/src/draw/lv_draw.h mine/src/draw/lv_draw.h
+--- lvgl-9.5.0/src/draw/lv_draw.h	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/lv_draw.h	2026-09-21 22:55:25.884384201 +0200
+@@ -91,6 +91,15 @@
+     /** The draw task is rendered. It will be removed from the draw task list of the layer
+      * and freed automatically. */
+     LV_DRAW_TASK_STATE_FINISHED,
++
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the task is already
++     * linked into the layer's task list but its draw dsc is still being filled in
++     * by the UI thread (between lv_draw_add_task and the end of
++     * lv_draw_finalize_task_creation). Render workers scan the list concurrently
++     * and must never claim such a task; as a non-FINISHED state it still blocks
++     * overlapping later tasks in is_independent(). Released to WAITING (or left
++     * BLOCKED for layer-blend tasks) at the end of finalize. */
++    LV_DRAW_TASK_STATE_BUILDING,
+ } lv_draw_task_state_t;
+ 
+ struct _lv_layer_t  {
+diff -ruN lvgl-9.5.0/src/draw/lv_draw_label.c mine/src/draw/lv_draw_label.c
+--- lvgl-9.5.0/src/draw/lv_draw_label.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/lv_draw_label.c	2026-09-21 22:55:25.885168801 +0200
+@@ -480,7 +480,22 @@
+                 logical_char_pos -= (LABEL_RECOLOR_PAR_LENGTH + 1);
+             }
+ 
++            /* ESP32-S3-WatchFace LOCAL PATCH: time the per-character glyph-dsc
++             * lookup (slot 16 of g_lv_draw_type_us — a SUBSET of "label").
++             * ESP-only (esp_timer); elsewhere just do the lookup untimed. */
++#if defined(ESP_PLATFORM)
++            {
++                extern uint32_t g_lv_draw_type_us[20];
++                extern uint32_t g_lv_draw_type_cnt[20];
++                extern int64_t esp_timer_get_time(void);
++                uint32_t watch_t0 = (uint32_t)esp_timer_get_time();
++                lv_font_get_glyph_dsc(font, &glyph_dsc, letter, letter_next);
++                g_lv_draw_type_us[16] += (uint32_t)esp_timer_get_time() - watch_t0;
++                g_lv_draw_type_cnt[16]++;
++            }
++#else
+             lv_font_get_glyph_dsc(font, &glyph_dsc, letter, letter_next);
++#endif
+             letter_w = lv_text_is_marker(letter) ? 0 : glyph_dsc.adv_w;
+ 
+             /*Always set the bg_coordinates for placeholder drawing*/
+diff -ruN lvgl-9.5.0/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565_swapped.c mine/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565_swapped.c
+--- lvgl-9.5.0/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565_swapped.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565_swapped.c	2026-09-21 22:55:25.874739501 +0200
+@@ -349,12 +349,20 @@
+                 }
+ 
+                 for(; x <= w - 2; x += 2) {
+-                    uint16_t mask16 = *((uint16_t *)&mask[x]);
+-                    if(mask16 == 0xFFFF) {
++                    /* OpenWatchFace LOCAL PATCH: read the two mask bytes
++                     * individually, NOT as *(uint16_t*)&mask[x]. The mask is the A8
++                     * glyph/edge buffer; for icon glyphs it comes from LVGL's default
++                     * font draw-buf handler whose base/stride is byte-granular, so
++                     * &mask[x] is frequently ODD. An unaligned 16-bit load HARD-FAULTS
++                     * on Cortex-M33 (Tuya T5 / BK7258) while ESP Xtensa-RISCV tolerates
++                     * it -> crashed every menu the instant an icon glyph's full-opacity
++                     * mask blended. Byte reads are alignment-safe, same result. */
++                    uint8_t m0 = mask[x + 0], m1 = mask[x + 1];
++                    if(m0 == 0xFF && m1 == 0xFF) {
+                         dest_buf_u16[x + 0] = color16_swapped;
+                         dest_buf_u16[x + 1] = color16_swapped;
+                     }
+-                    else if(mask16 != 0) {
++                    else if(m0 != 0 || m1 != 0) {
+                         uint16_t px0 = lv_color_swap_16(dest_buf_u16[x + 0]); /* Swap destination */
+                         uint16_t px1 = lv_color_swap_16(dest_buf_u16[x + 1]); /* Swap destination */
+ 
+diff -ruN lvgl-9.5.0/src/draw/sw/lv_draw_sw.c mine/src/draw/sw/lv_draw_sw.c
+--- lvgl-9.5.0/src/draw/sw/lv_draw_sw.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/sw/lv_draw_sw.c	2026-09-21 22:55:25.874974601 +0200
+@@ -39,6 +39,12 @@
+  *********************/
+ #define DRAW_UNIT_ID_SW     1
+ 
++#if LV_USE_OS
++/* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): defined in lv_draw.c.
++ * Guards task claim/removal on the layers' draw-task lists. */
++extern lv_mutex_t lv_draw_watch_task_mutex;
++#endif
++
+ /**********************
+  *      TYPEDEFS
+  **********************/
+@@ -260,6 +266,11 @@
+      * Otherwise return taken_cnt;
+      */
+ 
++    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): workers claim
++     * tasks themselves under the same mutex — assignment must be exclusive
++     * with them or a thread's task_act could be double-assigned. */
++    lv_mutex_lock(&lv_draw_watch_task_mutex);
++
+     /*If at least one is busy, it's not all idle*/
+     bool all_idle = true;
+     for(i = 0; i < LV_DRAW_SW_DRAW_UNIT_CNT; i++) {
+@@ -282,6 +293,7 @@
+         /*If there is not available task don't try other threads as there won't be available
+          *tasks for then either*/
+         if(t == NULL) {
++            lv_mutex_unlock(&lv_draw_watch_task_mutex);
+             LV_PROFILER_DRAW_END;
+             if(all_idle) return LV_DRAW_UNIT_IDLE;  /*Couldn't start rendering*/
+             else return taken_cnt;
+@@ -302,6 +314,7 @@
+         if(thread_dsc->inited) lv_thread_sync_signal(&thread_dsc->sync);
+     }
+ 
++    lv_mutex_unlock(&lv_draw_watch_task_mutex);
+     LV_PROFILER_DRAW_END;
+     if(all_idle) return LV_DRAW_UNIT_IDLE;  /*Couldn't start rendering*/
+     else return taken_cnt;
+@@ -367,10 +380,58 @@
+ #if LV_USE_PARALLEL_DRAW_DEBUG
+         parallel_debug_draw(thread_dsc->task_act, thread_dsc->idx);
+ #endif
+-        thread_dsc->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
+-        thread_dsc->task_act = NULL;
+ 
+-        /*The draw unit is free now. Request a new dispatching as it can get a new task*/
++        /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch).
++         *
++         * Upstream a worker goes idle here and waits for the refr thread to
++         * assign its next task — every task round-trips through the refr
++         * thread, which on this watch shares a core with (and runs BELOW) a
++         * render worker. Measured: a worker sat idle ~half of each frame
++         * waiting for dispatch (IDLE0 48% during heavy scroll).
++         *
++         * Instead: under the shared task mutex, mark the finished task, then
++         * directly claim the next available task of the same layer for
++         * ourselves, and hand further available tasks to idle sibling
++         * threads. The refr thread is still woken (dispatch_request) but only
++         * for cleanup, layer blending and refresh progression — it is no
++         * longer on the critical path between two tasks.
++         *
++         * The layer pointer stays valid through this block: our just-finished
++         * task can only be cleaned up by lv_draw_dispatch_layer, which takes
++         * the same mutex. */
++        {
++            lv_layer_t * task_layer = thread_dsc->task_act->target_layer;
++            lv_draw_sw_unit_t * u_self = (lv_draw_sw_unit_t *)thread_dsc->draw_unit;
++
++            lv_mutex_lock(&lv_draw_watch_task_mutex);
++            thread_dsc->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
++            thread_dsc->task_act = NULL;
++
++            if(task_layer->draw_buf != NULL) {
++                lv_draw_task_t * t_self = lv_draw_get_next_available_task(task_layer, NULL, DRAW_UNIT_ID_SW);
++                if(t_self != NULL) {
++                    t_self->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
++                    thread_dsc->task_act = t_self;
++
++                    /*Feed idle siblings while we're at it — they'd otherwise
++                     *also wait for the refr thread.*/
++                    uint32_t s;
++                    for(s = 0; s < LV_DRAW_SW_DRAW_UNIT_CNT; s++) {
++                        lv_draw_sw_thread_dsc_t * sib = &u_self->thread_dscs[s];
++                        if(sib == thread_dsc || sib->task_act != NULL || !sib->inited || sib->exit_status) continue;
++                        lv_draw_task_t * t_sib = lv_draw_get_next_available_task(task_layer, NULL, DRAW_UNIT_ID_SW);
++                        if(t_sib == NULL) break;
++                        t_sib->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
++                        sib->task_act = t_sib;
++                        lv_thread_sync_signal(&sib->sync);
++                    }
++                }
++            }
++            lv_mutex_unlock(&lv_draw_watch_task_mutex);
++        }
++
++        /*Wake the refr thread for cleanup of finished tasks, layer blending
++         *and refresh progression (and dispatching if we found nothing).*/
+         lv_draw_dispatch_request();
+ 
+     }
+@@ -381,9 +442,25 @@
+ }
+ #endif
+ 
++/* ESP32-S3-WatchFace LOCAL PATCH: per-task-type render-time accounting, indexed
++ * by lv_draw_task_type_t. Read + reset from the sketch's serial profiler to see
++ * WHERE frame time goes (fill vs label vs image vs layer-blend). Updated from
++ * both render workers without locking — a lost sample under a race is fine for
++ * diagnostics. Costs two esp_timer reads per task; zero when nobody reads it.
++ * ESP-only: esp_timer.h is an ESP-IDF header. On other platforms (e.g. Tuya T5)
++ * the whole profiler compiles out. Gate every use on ESP_PLATFORM. */
++#if defined(ESP_PLATFORM)
++#include "esp_timer.h"
++uint32_t g_lv_draw_type_us[20];
++uint32_t g_lv_draw_type_cnt[20];
++#endif
++
+ static void execute_drawing(lv_draw_task_t * t)
+ {
+     LV_PROFILER_DRAW_BEGIN;
++#if defined(ESP_PLATFORM)
++    uint32_t watch_t0 = (uint32_t)esp_timer_get_time(); /* LOCAL PATCH */
++#endif
+     /*Render the draw task*/
+     switch(t->type) {
+         case LV_DRAW_TASK_TYPE_FILL:
+@@ -431,6 +508,15 @@
+             break;
+     }
+ 
++    /* LOCAL PATCH: accumulate render time per task type (see above) */
++#if defined(ESP_PLATFORM)
++    {
++        uint32_t watch_ty = (uint32_t)t->type;
++        if(watch_ty >= 20) watch_ty = 19;
++        g_lv_draw_type_us[watch_ty] += (uint32_t)esp_timer_get_time() - watch_t0;
++        g_lv_draw_type_cnt[watch_ty]++;
++    }
++#endif
+ 
+     LV_PROFILER_DRAW_END;
+ }
+diff -ruN lvgl-9.5.0/src/draw/sw/lv_draw_sw_letter.c mine/src/draw/sw/lv_draw_sw_letter.c
+--- lvgl-9.5.0/src/draw/sw/lv_draw_sw_letter.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/draw/sw/lv_draw_sw_letter.c	2026-09-21 22:55:25.875364101 +0200
+@@ -169,7 +169,23 @@
+                             lv_draw_sw_blend(t, &blend_dsc);
+                         }
+                         else {
++                            /* ESP32-S3-WatchFace LOCAL PATCH: split label time into glyph
++                             * fetch/unpack (slot 17) vs mask blend (slot 18). Both are
++                             * SUBSETS of the [draw] "label" total. Counters defined in
++                             * lv_draw_sw.c; esp_timer.h comes via lv_draw_sw.h includes.
++                             * ESP-only (esp_timer); elsewhere the real work runs untimed. */
++#if defined(ESP_PLATFORM)
++                            extern uint32_t g_lv_draw_type_us[20];
++                            extern uint32_t g_lv_draw_type_cnt[20];
++                            extern int64_t esp_timer_get_time(void);
++                            uint32_t watch_t0 = (uint32_t)esp_timer_get_time();
++#endif
+                             glyph_draw_dsc->glyph_data = lv_font_get_glyph_bitmap(glyph_draw_dsc->g, glyph_draw_dsc->_draw_buf);
++#if defined(ESP_PLATFORM)
++                            uint32_t watch_t1 = (uint32_t)esp_timer_get_time();
++                            g_lv_draw_type_us[17] += watch_t1 - watch_t0;
++                            g_lv_draw_type_cnt[17]++;
++#endif
+                             if(glyph_draw_dsc->glyph_data == NULL) {
+                                 LV_LOG_WARN("Couldn't get the bitmap of a glyph");
+                                 break;
+@@ -187,6 +203,10 @@
+                             blend_dsc.blend_area = glyph_draw_dsc->letter_coords;
+                             blend_dsc.mask_res = LV_DRAW_SW_MASK_RES_CHANGED;
+                             lv_draw_sw_blend(t, &blend_dsc);
++#if defined(ESP_PLATFORM)
++                            g_lv_draw_type_us[18] += (uint32_t)esp_timer_get_time() - watch_t1;
++                            g_lv_draw_type_cnt[18]++;
++#endif
+                         }
+                     }
+                     else {
+diff -ruN lvgl-9.5.0/src/font/fmt_txt/lv_font_fmt_txt.c mine/src/font/fmt_txt/lv_font_fmt_txt.c
+--- lvgl-9.5.0/src/font/fmt_txt/lv_font_fmt_txt.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/font/fmt_txt/lv_font_fmt_txt.c	2026-09-21 22:55:26.038286700 +0200
+@@ -75,6 +75,83 @@
+     .free_src_cb = builtin_font_free_src_cb,
+ };
+ 
++/* ESP32-S3-WatchFace LOCAL PATCH: decoded-glyph cache.
++ * The [draw] profiler showed the 4bpp->A8 unpack below at ~49 µs/glyph, run
++ * 63k times per 10 s of scrolling — 45% of ALL label render time — while the
++ * UI only uses a few hundred DISTINCT glyphs. Cache the unpacked A8 bitmaps
++ * (direct-mapped on (font, gid)) and serve repeats as a memcpy (~3 µs).
++ * Entries live in lv_malloc (PSRAM) — the copy-out streams sequentially, which
++ * the PSRAM cache handles well. Mutex-guarded: BOTH SW render workers fetch
++ * glyphs concurrently. Disabled (transparent fallthrough to the unpack) until
++ * lv_font_fmt_txt_glyph_cache_init() is called single-threaded from setup(). */
++#include "../../osal/lv_os.h"
++#include "../../stdlib/lv_mem.h"
++#include "../../stdlib/lv_string.h"
++#define WATCH_GCACHE_ENTRIES 512        /* power of 2; ~10 KB table in PSRAM */
++#define WATCH_GCACHE_MAX_BYTES 8192     /* don't cache giant glyphs */
++typedef struct {
++    const void * font;
++    uint32_t gid;
++    uint32_t bytes;
++    uint32_t cap;
++    uint8_t * data;
++} watch_gcache_entry_t;
++static watch_gcache_entry_t * watch_gcache;
++static lv_mutex_t watch_gcache_mtx;
++static volatile int watch_gcache_on;
++
++void lv_font_fmt_txt_glyph_cache_init(void)
++{
++    if(watch_gcache_on) return;
++    watch_gcache = lv_malloc_zeroed(sizeof(watch_gcache_entry_t) * WATCH_GCACHE_ENTRIES);
++    if(watch_gcache == NULL) return;
++    lv_mutex_init(&watch_gcache_mtx);
++    watch_gcache_on = 1;
++}
++
++static watch_gcache_entry_t * watch_gcache_slot(const void * font, uint32_t gid)
++{
++    uint32_t h = ((uint32_t)(uintptr_t)font >> 4) ^ (gid * 2654435761u);
++    return &watch_gcache[h & (WATCH_GCACHE_ENTRIES - 1)];
++}
++
++static bool watch_gcache_get(const void * font, uint32_t gid, uint8_t * dst, uint32_t bytes)
++{
++    if(!watch_gcache_on || bytes > WATCH_GCACHE_MAX_BYTES) return false;
++    watch_gcache_entry_t * e = watch_gcache_slot(font, gid);
++    bool hit = false;
++    lv_mutex_lock(&watch_gcache_mtx);
++    if(e->font == font && e->gid == gid && e->bytes == bytes && e->data != NULL) {
++        lv_memcpy(dst, e->data, bytes);
++        hit = true;
++    }
++    lv_mutex_unlock(&watch_gcache_mtx);
++    return hit;
++}
++
++static void watch_gcache_put(const void * font, uint32_t gid, const uint8_t * src, uint32_t bytes)
++{
++    if(!watch_gcache_on || bytes > WATCH_GCACHE_MAX_BYTES) return;
++    watch_gcache_entry_t * e = watch_gcache_slot(font, gid);
++    lv_mutex_lock(&watch_gcache_mtx);
++    if(e->cap < bytes) {
++        lv_free(e->data);
++        e->data = lv_malloc(bytes);
++        e->cap = (e->data != NULL) ? bytes : 0;
++    }
++    if(e->data != NULL) {
++        lv_memcpy(e->data, src, bytes);
++        e->font = font;
++        e->gid = gid;
++        e->bytes = bytes;
++    }
++    else {
++        e->font = NULL; /* alloc failed: poison the slot, keep running uncached */
++        e->cap = 0;
++    }
++    lv_mutex_unlock(&watch_gcache_mtx);
++}
++
+ /**********************
+  * GLOBAL PROTOTYPES
+  **********************/
+@@ -112,6 +189,13 @@
+         int32_t i = 0;
+         int32_t x, y;
+         uint32_t stride_out = lv_draw_buf_width_to_stride(gdsc->box_w, LV_COLOR_FORMAT_A8);
++
++        /* LOCAL PATCH: serve repeat glyphs from the decoded cache (see above) */
++        uint32_t watch_bytes = stride_out * gdsc->box_h;
++        if(watch_gcache_get(font, gid, bitmap_out, watch_bytes)) {
++            lv_draw_buf_flush_cache(draw_buf, NULL);
++            return draw_buf;
++        }
+         if(fdsc->bpp == 1) {
+             for(y = 0; y < gdsc->box_h; y ++) {
+                 uint16_t line_rem = stride_in != 0 ? stride_in : gdsc->box_w;
+@@ -198,6 +282,9 @@
+             }
+         }
+ 
++        /* LOCAL PATCH: remember the freshly unpacked glyph for next time */
++        watch_gcache_put(font, gid, bitmap_out, watch_bytes);
++
+         lv_draw_buf_flush_cache(draw_buf, NULL);
+         return draw_buf;
+     }
+diff -ruN lvgl-9.5.0/src/osal/lv_freertos.c mine/src/osal/lv_freertos.c
+--- lvgl-9.5.0/src/osal/lv_freertos.c	2026-02-18 17:09:37.000000000 +0100
++++ mine/src/osal/lv_freertos.c	2026-09-21 22:55:26.339520498 +0200
+@@ -15,7 +15,15 @@
+ #include "lv_os_private.h"
+ #if LV_USE_OS == LV_OS_FREERTOS
+ 
++/* LOCAL PATCH (ESP32-S3-WatchFace): ESP-IDF's FreeRTOS ships atomic.h under the
++ * freertos/ include prefix, not as a bare "atomic.h" on the include path, so the
++ * upstream `#include "atomic.h"` fails to resolve. Use the freertos/ path which is
++ * on the default include path for every chip (S3/C6/...). */
++#if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_ESP32)
++#include "freertos/atomic.h"
++#else
+ #include "atomic.h"
++#endif
+ 
+ #include "../tick/lv_tick.h"
+ #include "../misc/lv_log.h"
+@@ -58,7 +66,13 @@
+  *  STATIC VARIABLES
+  **********************/
+ 
+-#ifdef ESP_PLATFORM
++/* ESP32-S3-WatchFace LOCAL PATCH: SMP critical sections need a spinlock arg.
++ * Both ESP-IDF and the Tuya T5 (FreeRTOS-SMP-v2 on Cortex-M33, ARDUINO_CHIP_T5)
++ * use the SMP-style port where portENTER/EXIT_CRITICAL take a portMUX_TYPE*.
++ * The default LVGL build assumes the single-core no-arg form, which fails to
++ * compile on those ports ("too few arguments to vPortEnterCritical"). Treat the
++ * T5 like ESP: give it a static spinlock and pass it to the critical macros. */
++#if defined(ESP_PLATFORM) || defined(ARDUINO_CHIP_T5)
+     static portMUX_TYPE critSectionMux = portMUX_INITIALIZER_UNLOCKED;
+ #endif
+ 
+@@ -66,7 +80,9 @@
+  *      MACROS
+  **********************/
+ 
+-#ifdef ESP_PLATFORM
++#if defined(ESP_PLATFORM) || defined(ARDUINO_CHIP_T5)
++    /* SMP port (ESP-IDF / Tuya T5): task-level critical sections take a spinlock.
++     * The ISR-level macros stay no-arg here, same as upstream. See critSectionMux. */
+     #define _enter_critical()   taskENTER_CRITICAL(&critSectionMux);
+     #define _exit_critical()    taskEXIT_CRITICAL(&critSectionMux);
+     #define _enter_critical_isr() taskENTER_CRITICAL_FROM_ISR();
+@@ -90,13 +106,35 @@
+     pxThread->pTaskArg = xAttr;
+     pxThread->pvStartRoutine = pvStartRoutine;
+ 
+-    BaseType_t xTaskCreateStatus = xTaskCreate(
++    /* ESP32-S3-WatchFace LOCAL PATCH v2: distribute LVGL's SW render threads
++     * across BOTH cores. v1 pinned every LVGL thread to core 0 — right when
++     * there was ONE draw unit (the UI loop owns core 1), but with
++     * LV_DRAW_SW_DRAW_UNIT_CNT 2 it stacked both workers on core 0, where they
++     * serialize against each other + the BT stack while core 1 idles ~50%
++     * during scrolls (seen on the [cpu] profiler). Alternate instead: 1st
++     * worker -> core 0, 2nd -> core 1. The dispatcher (loopTask, core 1) only
++     * needs CPU between draw tasks, so brief preemption by the higher-prio
++     * worker is harmless.
++     * NOTE: global LVGL-library edit; re-apply after any LVGL update.
++     *
++     * Tuya T5: 2 SMP FreeRTOS cores (+1 non-RTOS CP core). band_split renders two
++     * clip-halves on two worker threads, but ONLY parallelizes if those threads run on
++     * DIFFERENT cores. tskNO_AFFINITY let the SMP scheduler park both on one core -> the
++     * two halves serialized and DRAW_UNIT_CNT 2 gave no gain (the symptom we chased). So
++     * pin the workers to alternating cores 0/1, same as the ESP path. (Valid because the
++     * AP is 2-core; core IDs 0 and 1 both exist. If this ever runs on a 1-core SMP build
++     * core 1 would be invalid — not a config we ship for the T5.) */
++    static BaseType_t xNextCore = 0;
++    BaseType_t xPinCore = xNextCore;
++    xNextCore ^= 1;
++    BaseType_t xTaskCreateStatus = xTaskCreatePinnedToCore(
+                                        prvRunThread,
+                                        name,
+                                        (configSTACK_DEPTH_TYPE)(usStackSize / sizeof(StackType_t)),
+                                        (void *)pxThread,
+                                        tskIDLE_PRIORITY + xSchedPriority,
+-                                       &pxThread->xTaskHandle);
++                                       &pxThread->xTaskHandle,
++                                       xPinCore);
+ 
+     /* Ensure that the FreeRTOS task was successfully created. */
+     if(xTaskCreateStatus != pdPASS) {

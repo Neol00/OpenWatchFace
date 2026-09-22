@@ -1,0 +1,696 @@
+diff -ruN gfx-1.6.5/src/databus/Arduino_ESP32QSPI.cpp mine/src/databus/Arduino_ESP32QSPI.cpp
+--- gfx-1.6.5/src/databus/Arduino_ESP32QSPI.cpp	2026-02-07 14:09:00.000000000 +0100
++++ mine/src/databus/Arduino_ESP32QSPI.cpp	2026-09-21 23:38:17.789219250 +0200
+@@ -50,7 +50,10 @@
+         .data5_io_num = -1,
+         .data6_io_num = -1,
+         .data7_io_num = -1,
+-        .max_transfer_sz = (ESP32QSPI_MAX_PIXELS_AT_ONCE * 16) + 8,
++        // LOCAL PATCH (ESP32-S3-WatchFace): was (MAX_PIXELS_AT_ONCE*16)+8. The async
++        // tile write queues 32 KB segments (SPI hw max is 2^18 bits/transaction), so
++        // the driver must size its DMA descriptors for that.
++        .max_transfer_sz = 32768 + 8,
+         .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
+ #if (!defined(ESP_ARDUINO_VERSION_MAJOR)) || (ESP_ARDUINO_VERSION_MAJOR < 3)
+     // skip this
+@@ -81,9 +84,14 @@
+       .input_delay_ns = 0,
+       .spics_io_num = -1, // avoid use system CS control
+       .flags = SPI_DEVICE_HALFDUPLEX,
+-      .queue_size = 1,
+-      .pre_cb = nullptr,
+-      .post_cb = nullptr};
++      // LOCAL PATCH (ESP32-S3-WatchFace): 1 -> 2 so writePixels() can keep one DMA
++      // transaction in flight while the CPU converts the next chunk (pipelined flush);
++      // -> 6 so writePixelsBeAsync() can queue up to ASYNC_MAX_SEG tile segments.
++      .queue_size = 6,
++      // LOCAL PATCH (ESP32-S3-WatchFace): CS + completion for the async tile write.
++      // No-ops for every transaction whose .user is NULL (all the sync paths).
++      .pre_cb = Arduino_ESP32QSPI::_async_pre_cb,
++      .post_cb = Arduino_ESP32QSPI::_async_post_cb};
+   esp_err_t ret = spi_bus_add_device(ESP32QSPI_SPI_HOST, &devcfg, &_handle);
+   if (ret != ESP_OK)
+   {
+@@ -91,12 +99,17 @@
+     return false;
+   }
+ 
+-  if (!_is_shared_interface)
+-  {
+-    spi_device_acquire_bus(_handle, portMAX_DELAY);
+-  }
++  // LOCAL PATCH (ESP32-S3-WatchFace): do NOT permanently acquire the bus.
++  // spi_device_acquire_bus() forbids the queued/interrupt API (spi_device_queue_trans)
++  // for its whole duration — only polling transactions are allowed while the bus is
++  // held. Our pipelined writePixels() uses the queued API, so the permanent acquire
++  // would break it. The CO5300 is the ONLY device on SPI2_HOST (touch/RTC/IMU/PMU are
++  // all on I2C), so there's nothing to arbitrate against — the acquire was a no-cost
++  // optimization we can simply drop. Polling transactions still work fine without it.
++  // (The original: `if (!_is_shared_interface) spi_device_acquire_bus(_handle, portMAX_DELAY);`)
+ 
+   memset(&_spi_tran_ext, 0, sizeof(_spi_tran_ext));
++  memset(&_spi_tran_ext2, 0, sizeof(_spi_tran_ext2));
+   _spi_tran = (spi_transaction_t *)&_spi_tran_ext;
+ 
+   _buffer = (uint8_t *)heap_caps_aligned_alloc(16, ESP32QSPI_MAX_PIXELS_AT_ONCE * 2, MALLOC_CAP_DMA);
+@@ -319,53 +332,204 @@
+   CS_HIGH();
+ }
+ 
++// LOCAL PATCH (ESP32-S3-WatchFace): PIPELINED flush.
++// The original here was fully serial per chunk: convert RGB565->panel bytes into one
++// DMA buffer, then spi_device_polling_start/end (CPU spins until the transfer is done),
++// repeat. On this command-driven CO5300 the QSPI push is the bottleneck and that spin
++// was pure idle wait. Now we PING-PONG the two pre-allocated DMA buffers and use the
++// queued (interrupt) API: queue chunk N's transfer (returns immediately, DMA runs in
++// the background), convert chunk N+1 into the OTHER buffer while N transmits, then
++// reap N's result before reusing its buffer. So the per-chunk CPU conversion overlaps
++// the previous chunk's transmission instead of waiting for it. Single CS bracket and
++// the same per-chunk flags/cmd/addr as before, so the panel sees an identical write.
++// Each in-flight chunk needs its own transaction struct (_spi_tran_ext / _spi_tran_ext2)
++// and its own DMA buffer (_buffer32 / _2nd_buffer32) — both must stay alive until that
++// chunk's get_trans_result returns.
+ void Arduino_ESP32QSPI::writePixels(uint16_t *data, uint32_t len)
+ {
+-
+   CS_LOW();
++
++  spi_transaction_ext_t *trans[2] = {&_spi_tran_ext, &_spi_tran_ext2};
++  uint32_t *bufs[2] = {_buffer32, _2nd_buffer32};
++
++  uint8_t slot = 0;          // which buffer/struct to fill+queue this iteration
++  bool in_flight = false;    // is there a previously-queued transaction to reap?
++  bool first_send = true;
+   uint32_t l, l2;
+   uint16_t p1, p2;
+-  bool first_send = true;
++
+   while (len)
+   {
+     l = (len > ESP32QSPI_MAX_PIXELS_AT_ONCE) ? ESP32QSPI_MAX_PIXELS_AT_ONCE : len;
+ 
++    spi_transaction_ext_t *t = trans[slot];
++    uint32_t *buf = bufs[slot];
++
+     if (first_send)
+     {
+-      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO;
+-      _spi_tran_ext.base.cmd = 0x32;
+-      _spi_tran_ext.base.addr = 0x003C00;
++      t->base.flags = SPI_TRANS_MODE_QIO;
++      t->base.cmd = 0x32;
++      t->base.addr = 0x003C00;
+       first_send = false;
+     }
+     else
+     {
+-      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+-                                 SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
++      t->base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
++                      SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+     }
++
++    // Convert this chunk into the slot's DMA buffer (CPU work; overlaps the OTHER
++    // slot's in-flight DMA transfer queued on the previous iteration).
+     l2 = l >> 1;
+     for (uint32_t i = 0; i < l2; ++i)
+     {
+       p1 = *data++;
+       p2 = *data++;
+-      MSB_32_16_16_SET(_buffer32[i], p1, p2);
++      MSB_32_16_16_SET(buf[i], p1, p2);
+     }
+     if (l & 1)
+     {
+       p1 = *data++;
+-      MSB_16_SET(_buffer16[l - 1], p1);
++      MSB_16_SET(((uint16_t *)buf)[l - 1], p1);
+     }
+ 
+-    _spi_tran_ext.base.tx_buffer = _buffer32;
+-    _spi_tran_ext.base.length = l << 4;
++    t->base.tx_buffer = buf;
++    t->base.length = l << 4;
+ 
+-    POLL_START();
+-    POLL_END();
++    // Hand this chunk to the DMA engine; returns immediately (does NOT wait).
++    spi_device_queue_trans(_handle, (spi_transaction_t *)t, portMAX_DELAY);
++
++    // Now reap the PREVIOUS chunk (queued last iteration), if any. By the time we
++    // get here its transfer has been running while we did the conversion above, so
++    // this wait is short-to-zero — that overlap is the whole win.
++    if (in_flight)
++    {
++      spi_transaction_t *done;
++      spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++    }
++    in_flight = true;
++    slot ^= 1;                 // ping-pong to the other buffer/struct
+ 
+     len -= l;
+   }
++
++  // Drain the last queued transaction before dropping CS.
++  if (in_flight)
++  {
++    spi_transaction_t *done;
++    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++  }
++
+   CS_HIGH();
+ }
+ 
++// LOCAL PATCH (ESP32-S3-WatchFace): ASYNC tile write — see header. Unlike
++// writePixels() above there is NO per-chunk CPU work at all: the buffer is already
++// in panel byte order, so the whole area goes out as <=ASYNC_MAX_SEG large queued
++// DMA transactions and this returns as soon as they're queued (~µs). The caller's
++// CPU time is then free (LVGL renders the next tile) while the wire drains.
++// CS and the completion callback are driven from _async_pre_cb/_async_post_cb.
++bool Arduino_ESP32QSPI::writePixelsBeAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg)
++{
++  // 32760 = largest multiple of 4 bytes under the 2^18-bit hw transaction cap.
++  const uint32_t SEG = 32760;
++  if (!len)
++  {
++    if (done_cb)
++    {
++      done_cb(done_arg);
++    }
++    return true;
++  }
++  uint32_t nseg = (len + SEG - 1) / SEG;
++  if (nseg > (uint32_t)ASYNC_MAX_SEG)
++  {
++    return false; // too big for one bracket — caller uses the sync path
++  }
++
++  waitAsync(); // only one async write may be in flight
++  _async_done_cb = done_cb;
++  _async_done_arg = done_arg;
++
++  for (uint32_t i = 0; i < nseg; i++)
++  {
++    spi_transaction_ext_t *t = &_async_tran[i];
++    AsyncSeg *s = &_async_seg[i];
++    s->bus = this;
++    s->first = (i == 0);
++    s->last = (i == nseg - 1);
++
++    uint32_t off = i * SEG;
++    uint32_t l = len - off;
++    if (l > SEG)
++    {
++      l = SEG;
++    }
++
++    memset(t, 0, sizeof(*t));
++    if (i == 0)
++    {
++      // first segment carries the write-continue command, like writePixels()
++      t->base.flags = SPI_TRANS_MODE_QIO;
++      t->base.cmd = 0x32;
++      t->base.addr = 0x003C00;
++    }
++    else
++    {
++      t->base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
++                      SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
++    }
++    t->base.tx_buffer = data + off;
++    t->base.length = l << 3;
++    t->base.user = s;
++
++    if (spi_device_queue_trans(_handle, (spi_transaction_t *)t, portMAX_DELAY) != ESP_OK)
++    {
++      waitAsync(); // reap whatever did queue, leave the bus clean
++      return false;
++    }
++    _async_pending++;
++  }
++  return true;
++}
++
++void Arduino_ESP32QSPI::waitAsync()
++{
++  while (_async_pending)
++  {
++    spi_transaction_t *done;
++    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++    _async_pending--;
++  }
++}
++
++// Both callbacks run in the SPI interrupt for EVERY transaction on this device;
++// sync transactions have .user == NULL and fall straight through. CS is written
++// via the raw port registers (NOT CS_LOW/CS_HIGH — CS_LOW drains the async queue
++// and must never run inside this ISR).
++void Arduino_ESP32QSPI::_async_pre_cb(spi_transaction_t *t)
++{
++  AsyncSeg *s = (AsyncSeg *)t->user;
++  if (s && s->first)
++  {
++    *(s->bus->_csPortClr) = s->bus->_csPinMask;
++  }
++}
++
++void Arduino_ESP32QSPI::_async_post_cb(spi_transaction_t *t)
++{
++  AsyncSeg *s = (AsyncSeg *)t->user;
++  if (s && s->last)
++  {
++    Arduino_ESP32QSPI *b = s->bus;
++    *(b->_csPortSet) = b->_csPinMask;
++    if (b->_async_done_cb)
++    {
++      b->_async_done_cb(b->_async_done_arg);
++    }
++  }
++}
++
+ void Arduino_ESP32QSPI::batchOperation(const uint8_t *operations, size_t len)
+ {
+   for (size_t i = 0; i < len; ++i)
+@@ -684,6 +848,10 @@
+ 
+ GFX_INLINE void Arduino_ESP32QSPI::CS_LOW(void)
+ {
++  // LOCAL PATCH (ESP32-S3-WatchFace): every sync bus operation starts with CS_LOW,
++  // so this is the single choke point that keeps commands (addr window, brightness,
++  // sleep) from interleaving with an in-flight async tile write.
++  waitAsync();
+   *_csPortClr = _csPinMask;
+ }
+ 
+diff -ruN gfx-1.6.5/src/databus/Arduino_ESP32QSPI.h mine/src/databus/Arduino_ESP32QSPI.h
+--- gfx-1.6.5/src/databus/Arduino_ESP32QSPI.h	2026-02-07 14:09:00.000000000 +0100
++++ mine/src/databus/Arduino_ESP32QSPI.h	2026-09-21 23:38:17.790595550 +0200
+@@ -54,6 +54,17 @@
+   void writeIndexedPixelsDouble(uint8_t *data, uint16_t *idx, uint32_t len) override;
+   void writeYCbCrPixels(uint8_t *yData, uint8_t *cbData, uint8_t *crData, uint16_t w, uint16_t h) override;
+ 
++  // LOCAL PATCH (ESP32-S3-WatchFace): ASYNC whole-area pixel write. `data` must be
++  // DMA-capable (internal SRAM) and ALREADY in panel byte order (big-endian RGB565).
++  // Queues the whole area as a few large DMA transactions and returns immediately;
++  // `done_cb(done_arg)` fires from the SPI transfer-done ISR after the LAST segment
++  // (keep it trivial — it's interrupt context). Returns false (nothing sent) if the
++  // area needs more than ASYNC_MAX_SEG segments — caller should fall back to the
++  // sync writePixels() path. Any sync bus call transparently waits out an in-flight
++  // async write first (drain hook in CS_LOW), so commands can't interleave a tile.
++  bool writePixelsBeAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg);
++  void waitAsync(); // block until no async write is in flight (reaps queued results)
++
+ protected:
+ private:
+   GFX_INLINE void CS_HIGH(void);
+@@ -61,6 +72,26 @@
+   GFX_INLINE void POLL_START();
+   GFX_INLINE void POLL_END();
+ 
++  // LOCAL PATCH (ESP32-S3-WatchFace): async write plumbing. The S3's SPI peripheral
++  // caps one transaction at 2^18 bits (32 KB), so a tile is split into up to
++  // ASYNC_MAX_SEG queued segments sharing ONE CS bracket: the pre/post transaction
++  // callbacks drive CS (and fire done_cb) only on the segments flagged first/last.
++  // Sync paths leave trans.user NULL so the callbacks ignore them.
++  struct AsyncSeg
++  {
++    Arduino_ESP32QSPI *bus;
++    bool first;
++    bool last;
++  };
++  static void _async_pre_cb(spi_transaction_t *t);
++  static void _async_post_cb(spi_transaction_t *t);
++  static const int ASYNC_MAX_SEG = 4;
++  spi_transaction_ext_t _async_tran[ASYNC_MAX_SEG];
++  AsyncSeg _async_seg[ASYNC_MAX_SEG];
++  volatile uint8_t _async_pending = 0; // queued-but-unreaped async transactions
++  void (*_async_done_cb)(void *) = nullptr;
++  void *_async_done_arg = nullptr;
++
+   int8_t _cs, _sck, _mosi, _miso, _quadwp, _quadhd;
+   bool _is_shared_interface;
+ 
+@@ -72,6 +103,12 @@
+   spi_transaction_ext_t _spi_tran_ext;
+   spi_transaction_t *_spi_tran;
+ 
++  // LOCAL PATCH (ESP32-S3-WatchFace): a SECOND transaction struct so writePixels()
++  // can pipeline — keep transaction A in flight (DMA) while filling buffer B for
++  // transaction B. Each queued transaction's struct must stay alive until its
++  // get_trans_result returns, so the two chunks-in-flight need their own structs.
++  spi_transaction_ext_t _spi_tran_ext2;
++
+   union
+   {
+     uint8_t *_buffer;
+diff -ruN gfx-1.6.5/src/databus/Arduino_ESP32SPIDMA.cpp mine/src/databus/Arduino_ESP32SPIDMA.cpp
+--- gfx-1.6.5/src/databus/Arduino_ESP32SPIDMA.cpp	2026-02-07 14:09:00.000000000 +0100
++++ mine/src/databus/Arduino_ESP32SPIDMA.cpp	2026-09-21 23:38:17.792538950 +0200
+@@ -2,6 +2,15 @@
+ 
+ #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)
+ 
++// LOCAL (OpenWatchFace): the SoC's per-transaction SPI DMA length cap, needed to size
++// async segments (see writePixelsAsync). On the S3 the length register is 18 bits ->
++// 32 KB per transaction, SMALLER than the 48 KB bus max_transfer_sz; a segment above
++// it is rejected by spi_master's check_trans_valid ("txdata transfer > hardware max
++// supported len") at queue time.
++#if __has_include("hal/spi_ll.h")
++#include "hal/spi_ll.h"
++#endif
++
+ /**
+  * @brief Arduino_ESP32SPIDMA
+  *
+@@ -136,14 +145,26 @@
+       .data5_io_num = -1,
+       .data6_io_num = -1,
+       .data7_io_num = -1,
+-      .max_transfer_sz = (ESP32SPIDMA_MAX_PIXELS_AT_ONCE * 16) + 8,
++      // LOCAL (OpenWatchFace): big enough for a whole async tile in ONE DMA transfer
++      // (172 x up to ~120 lines x 2 B = ~41 KB). The stock value (ESP32SPIDMA_MAX_PIXELS
++      // *16+8 ~= 16 KB) forced multi-segment, and multi-segment async tiles rendered as
++      // a stale/black band the height of one buffer; one transfer per tile avoids it.
++      .max_transfer_sz = 48 * 1024,
+       .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
+       .intr_flags = 0};
+-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
+-  esp_err_t ret = spi_bus_initialize((spi_host_device_t)_spi_num, &buscfg, ESP32SPIDMA_DMA_CHANNEL);
++  // LOCAL FIX (OpenWatchFace): resolve the IDF host by IDENTITY, exactly like the
++  // Arduino core (esp32-hal-spi.c: `host = (num == FSPI) ? SPI2_HOST : SPI3_HOST`).
++  // The stock arithmetic `_spi_num - 1` is WRONG on the C6: Arduino FSPI == 0 there,
++  // and IDF SPI1_HOST == 0 is the FLASH controller — so `(spi_host_device_t)0` grabbed
++  // the flash bus (already initialized WITH the flash device attached), giving the
++  // "SPI bus already initialized" abort and then a crash when freeing it. FSPI must map
++  // to SPI2_HOST, HSPI to SPI3_HOST, regardless of the Arduino enum's numeric value.
++#ifdef SPI3_HOST
++  spi_host_device_t _spidma_host = (_spi_num == FSPI) ? SPI2_HOST : SPI3_HOST;
+ #else
+-  esp_err_t ret = spi_bus_initialize((spi_host_device_t)(_spi_num - 1), &buscfg, ESP32SPIDMA_DMA_CHANNEL);
++  spi_host_device_t _spidma_host = SPI2_HOST;  // C6/C3/H2: single general-purpose SPI host
+ #endif
++  esp_err_t ret = spi_bus_initialize(_spidma_host, &buscfg, ESP32SPIDMA_DMA_CHANNEL);
+   if (ret != ESP_OK)
+   {
+     ESP_ERROR_CHECK(ret);
+@@ -162,24 +183,27 @@
+       .input_delay_ns = 0,
+       .spics_io_num = -1, // avoid use system CS control
+       .flags = (_miso < 0) ? (uint32_t)SPI_DEVICE_NO_DUMMY : 0,
+-      .queue_size = 1,
+-      .pre_cb = nullptr,
+-      .post_cb = nullptr};
+-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
+-  ret = spi_bus_add_device((spi_host_device_t)_spi_num, &devcfg, &_handle);
+-#else
+-  ret = spi_bus_add_device((spi_host_device_t)(_spi_num - 1), &devcfg, &_handle);
+-#endif
++      // LOCAL ADDITION (OpenWatchFace C6-1.47): queue_size>1 so writePixelsAsync() can
++      // hold several DMA tile segments in flight; pre/post callbacks drive CS + the
++      // flush-ready callback for the async path. Both no-op for sync transactions
++      // (.user == NULL), so all the normal blocking paths are unchanged.
++      .queue_size = ASYNC_MAX_SEG,
++      .pre_cb = Arduino_ESP32SPIDMA::_async_pre_cb,
++      .post_cb = Arduino_ESP32SPIDMA::_async_post_cb};
++  ret = spi_bus_add_device(_spidma_host, &devcfg, &_handle); // LOCAL FIX: resolved host (see above)
+   if (ret != ESP_OK)
+   {
+     ESP_ERROR_CHECK(ret);
+     return false;
+   }
+ 
+-  if (!_is_shared_interface)
+-  {
+-    spi_device_acquire_bus(_handle, portMAX_DELAY);
+-  }
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): do NOT permanently acquire the bus, even
++  // in the non-shared case. spi_device_acquire_bus() forbids the queued/interrupt API
++  // (spi_device_queue_trans) for its whole duration — and writePixelsAsync() uses that
++  // queued API. The IDF spi_master arbitrates per-transaction between this LCD device
++  // and the microSD device that shares this host, so the permanent acquire isn't
++  // needed for correctness; dropping it is what lets the async flush + a 2nd device
++  // (SD) coexist. (Original: if (!_is_shared_interface) spi_device_acquire_bus(...);)
+ 
+   memset(&_spi_tran, 0, sizeof(_spi_tran));
+ 
+@@ -206,7 +230,14 @@
+   _data_buf_bit_idx = 0;
+   _buffer[0] = 0;
+ 
+-  if (_is_shared_interface)
++  // LOCAL (OpenWatchFace C6): acquire the IDF bus across the WHOLE CS bracket while sync_only
++  // (SD coexists on this host). The display drives DC/CS via raw GPIO across MANY transactions
++  // per bracket; without holding the bus, the IDF lets a microSD transaction interleave between
++  // them -> both CS asserted -> garbled panel. Holding the bus makes the IDF block SD until
++  // endWrite releases. Tracked so endWrite releases iff we acquired. (Normal async mode does NOT
++  // acquire — incompatible with the queued DMA API.)
++  _bus_acquired = (_is_shared_interface || _sync_only);
++  if (_bus_acquired)
+   {
+     spi_device_acquire_bus(_handle, portMAX_DELAY);
+   }
+@@ -229,9 +260,10 @@
+     flush_data_buf();
+   }
+ 
+-  if (_is_shared_interface)
++  if (_bus_acquired)
+   {
+     spi_device_release_bus(_handle);
++    _bus_acquired = false;
+   }
+ 
+   CS_HIGH();
+@@ -1026,4 +1058,150 @@
+   spi_device_polling_end(_handle, portMAX_DELAY);
+ }
+ 
++// ====================================================================
++// LOCAL ADDITION (OpenWatchFace C6-1.47): ASYNC tile write.
++// The caller (my_disp_flush) has already set the address window with sync polling
++// transactions and left DC HIGH (data) + the device's CS still HIGH. We take CS LOW
++// in the pre_cb of the first segment, stream the (already panel-byte-order, DMA-capable)
++// pixel buffer as up to ASYNC_MAX_SEG queued DMA transactions, and return immediately.
++// The wire drains under DMA while LVGL renders the next tile; the last segment's post_cb
++// raises CS and calls done_cb(done_arg) (lv_disp_flush_ready) from ISR context.
++// ====================================================================
++bool Arduino_ESP32SPIDMA::writePixelsAsync(const uint8_t *data, uint32_t len,
++                                           void (*done_cb)(void *), void *done_arg)
++{
++  // HYBRID: while SD I/O owns the shared host, refuse async so the caller flushes synchronously
++  // (a held bus / blocking transaction can't corrupt against the SD device). See set_sync_only.
++  if (_sync_only)
++  {
++    return false;
++  }
++  if (!len)
++  {
++    if (done_cb)
++    {
++      done_cb(done_arg);
++    }
++    return true;
++  }
++
++  // One DMA transaction per tile when possible: SEG matches the bus max_transfer_sz
++  // (48 KB), so a full partial tile goes out as a SINGLE queued transfer where the
++  // silicon allows it. Multi-segment async tiles once rendered as a stale band;
++  // keeping segments few avoids that and is faster (fewer IRQs).
++  //
++  // BUT the SoC also has a PER-TRANSACTION cap (the SPI DMA length register), and on
++  // some chips it is SMALLER than 48 KB — the ESP32-S3's is 18 bits = 32 KB. A segment
++  // above that cap is REJECTED by spi_master at queue time ("txdata transfer >
++  // hardware max supported len"), which made every full-screen tile on the S3 fail
++  // over to the blocking path after paying for the swap + addr window (and a swap
++  // back). So clamp SEG to the hardware cap; a 240x320 full-screen tile then goes out
++  // as five 32 KB segments in the one CS bracket, all queued up-front — still one
++  // waitAsync per tile. Kept a multiple of 2 for whole RGB565 pixels.
++  uint32_t SEG = 48 * 1024; // bytes (== bus max_transfer_sz)
++#ifdef SPI_LL_DMA_MAX_BIT_LEN
++  const uint32_t HW_SEG = (SPI_LL_DMA_MAX_BIT_LEN / 8) & ~1u;
++  if (SEG > HW_SEG)
++  {
++    SEG = HW_SEG;
++  }
++#endif
++  uint32_t nseg = (len + SEG - 1) / SEG;
++  if (nseg > (uint32_t)ASYNC_MAX_SEG)
++  {
++    return false; // too big for one CS bracket — caller uses the blocking path
++  }
++
++  waitAsync(); // only one async tile may be in flight at a time
++  _async_done_cb = done_cb;
++  _async_done_arg = done_arg;
++
++  for (uint32_t i = 0; i < nseg; i++)
++  {
++    spi_transaction_t *t = &_async_tran[i];
++    AsyncSeg *s = &_async_seg[i];
++    s->bus = this;
++    s->first = (i == 0);
++    s->last = (i == nseg - 1);
++
++    uint32_t off = i * SEG;
++    uint32_t l = len - off;
++    if (l > SEG)
++    {
++      l = SEG;
++    }
++
++    memset(t, 0, sizeof(*t));
++    t->tx_buffer = data + off;
++    t->length = l << 3; // bits
++    t->user = s;
++
++    if (spi_device_queue_trans(_handle, t, portMAX_DELAY) != ESP_OK)
++    {
++      waitAsync(); // reap whatever queued, leave the bus clean
++      return false;
++    }
++    _async_pending++;
++  }
++  return true;
++}
++
++// LOCAL ADDITION (OpenWatchFace C6-1.47): one dummy byte on THIS device with every CS on the
++// bus HIGH, so the IDF's device-switch reconfig (SD 20 MHz -> LCD 80 MHz) happens during a
++// transaction neither the panel nor the SD card is listening to. See header comment.
++void Arduino_ESP32SPIDMA::resyncBus(void)
++{
++  _spi_tran.length = 8;
++  _spi_tran.tx_data[0] = 0x00;
++  _spi_tran.flags = SPI_TRANS_USE_TXDATA;
++  POLL_START();
++  POLL_END();
++}
++
++// LOCAL ADDITION (OpenWatchFace C6-1.47): raise the panel's raw-GPIO CS. See header comment.
++void Arduino_ESP32SPIDMA::forceCsIdle(void)
++{
++  CS_HIGH();
++}
++
++void Arduino_ESP32SPIDMA::waitAsync()
++{
++  while (_async_pending)
++  {
++    spi_transaction_t *done;
++    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
++    _async_pending--;
++  }
++}
++
++// Both callbacks run in the SPI interrupt for EVERY transaction on this device; sync
++// transactions have .user == NULL and fall straight through. CS is written via the raw
++// port registers (NOT CS_LOW/CS_HIGH — those are fine here but we keep it register-direct
++// to stay ISR-safe and match the QSPI async path).
++void Arduino_ESP32SPIDMA::_async_pre_cb(spi_transaction_t *t)
++{
++  AsyncSeg *s = (AsyncSeg *)t->user;
++  if (s && s->first && s->bus->_cs != GFX_NOT_DEFINED)
++  {
++    *(s->bus->_csPortClr) = s->bus->_csPinMask; // CS LOW
++  }
++}
++
++void Arduino_ESP32SPIDMA::_async_post_cb(spi_transaction_t *t)
++{
++  AsyncSeg *s = (AsyncSeg *)t->user;
++  if (s && s->last)
++  {
++    Arduino_ESP32SPIDMA *b = s->bus;
++    if (b->_cs != GFX_NOT_DEFINED)
++    {
++      *(b->_csPortSet) = b->_csPinMask; // CS HIGH
++    }
++    if (b->_async_done_cb)
++    {
++      b->_async_done_cb(b->_async_done_arg);
++    }
++  }
++}
++
+ #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)
+diff -ruN gfx-1.6.5/src/databus/Arduino_ESP32SPIDMA.h mine/src/databus/Arduino_ESP32SPIDMA.h
+--- gfx-1.6.5/src/databus/Arduino_ESP32SPIDMA.h	2026-02-07 14:09:00.000000000 +0100
++++ mine/src/databus/Arduino_ESP32SPIDMA.h	2026-09-21 23:38:17.793700250 +0200
+@@ -48,6 +48,47 @@
+   void writeIndexedPixelsDouble(uint8_t *data, uint16_t *idx, uint32_t len) override;
+   void writeYCbCrPixels(uint8_t *yData, uint8_t *cbData, uint8_t *crData, uint16_t w, uint16_t h) override;
+ 
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): ASYNC tile write for the JD9853 flush.
++  // Queues the pixel data as <=ASYNC_MAX_SEG DMA transactions and returns as soon as
++  // they're queued (~us) — the CPU is then free to let LVGL render the next tile while
++  // the wire drains. `data` MUST already be in panel byte order (the LVGL flush swaps
++  // it) and live in DMA-capable RAM. CS is taken LOW here and raised from the post_cb
++  // ISR, which then calls done_cb(done_arg) (i.e. lv_disp_flush_ready). The caller must
++  // have set the address window (sync) immediately before. DC stays HIGH (data).
++  // Returns false if the area is too big for ASYNC_MAX_SEG segments -> caller falls
++  // back to the blocking draw path. NOTE: requires the device NOT hold the bus via
++  // spi_device_acquire_bus (begin() drops the permanent acquire), because the queued
++  // API is incompatible with a held bus.
++  bool writePixelsAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg);
++  void waitAsync(); // block until no async write is in flight (reaps queued results)
++
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): HYBRID async/sync mode. The microSD shares this
++  // SPI host; the async path (queued DMA + raw-GPIO CS) corrupts the panel when the SD device
++  // coexists on the bus. While SD I/O is in progress the SD layer sets sync_only(true): then
++  // writePixelsAsync() returns false so the LVGL flush takes its BLOCKING path (one full
++  // synchronous transaction, no queued DMA in flight), keeping the bus single-owner. Cleared
++  // (false) when SD is idle to restore the async FPS win. Caller drains in-flight DMA before
++  // setting true. */
++  void set_sync_only(bool on) { _sync_only = on; }
++  bool sync_only(void) const { return _sync_only; }
++
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): re-latch this device's bus config after ANOTHER
++  // device (the microSD) used the shared host. The IDF spi_master reconfigures the bus
++  // registers (clock divider 20->80 MHz, timing) at the START of the first transaction after
++  // a device switch — but this display's CS is RAW GPIO, pulled LOW in beginWrite() BEFORE
++  // that first transaction, so a reconfig glitch on SCLK is clocked into the panel and shifts
++  // its command stream (=> corrupted CASET/RASET => sliced/garbled lines). This sends ONE
++  // dummy byte on this device while every CS on the bus is HIGH (panel and SD both ignore it),
++  // so the reconfig happens during a transaction nobody hears; the next real CS bracket then
++  // starts with the bus already configured for the display. Call after each SD bus release.
++  void resyncBus(void);
++
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): force the panel's raw-GPIO CS HIGH. Belt-and-
++  // braces before SD bus use: if ANY code path ever left the panel CS low, every SD byte
++  // would also be clocked into the panel (ESP-IDF sdspi_share rule #1: all other devices'
++  // CS must be deasserted during SD traffic). Idempotent, ~ns cost.
++  void forceCsIdle(void);
++
+ protected:
+   void flush_data_buf();
+   GFX_INLINE void WRITE8BIT(uint8_t d);
+@@ -92,6 +133,30 @@
+   };
+ 
+   uint16_t _data_buf_bit_idx = 0;
++
++  // LOCAL ADDITION (OpenWatchFace C6-1.47): async tile write state. Up to
++  // ASYNC_MAX_SEG queued DMA segments sharing ONE CS bracket; pre_cb drops CS on the
++  // first segment, post_cb raises it on the last + fires the done callback. .user ==
++  // NULL on every sync transaction so the callbacks no-op for the normal paths.
++  struct AsyncSeg
++  {
++    Arduino_ESP32SPIDMA *bus;
++    bool first;
++    bool last;
++  };
++  static void _async_pre_cb(spi_transaction_t *t);
++  static void _async_post_cb(spi_transaction_t *t);
++  // A full-height C6 tile (172 x BOARD_PARTIAL_BUF_LINES px) at 2 bytes/px, split into
++  // ESP32SPIDMA_MAX_PIXELS_AT_ONCE*2-byte (2 KB) segments: 172*70*2 = 24080 B / 2048
++  // ~= 12 segments worst case. 16 gives headroom; the array cost is tiny.
++  static const int ASYNC_MAX_SEG = 16;
++  spi_transaction_t _async_tran[ASYNC_MAX_SEG];
++  AsyncSeg _async_seg[ASYNC_MAX_SEG];
++  volatile uint8_t _async_pending = 0; // queued-but-unreaped async transactions
++  volatile bool _sync_only = false;    // HYBRID: true while SD I/O owns the bus -> no async
++  bool _bus_acquired = false;          // did beginWrite take spi_device_acquire_bus? (release in endWrite)
++  void (*_async_done_cb)(void *) = nullptr;
++  void *_async_done_arg = nullptr;
+ };
+ 
+ #endif // #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32C5)
